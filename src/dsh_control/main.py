@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -35,13 +36,22 @@ log = logging.getLogger("dsh_control")
 
 
 def _default_static_dir() -> Path:
-    # 镜像内 /app/frontend/dist；开发态回退到仓库根的 frontend/dist
+    # 查找顺序：DSHC_STATIC_DIR > 当前工作目录 > 包自身往上。
+    # 与 cli 里找 migrations 同一个道理：镜像内包被装进 site-packages，只看
+    # __file__ 的父目录永远找不到 /app/frontend/dist，前端会静默不挂，
+    # 症状是 "/" 返回 JSON 而不是页面，很容易被误判成"前端没构建"。
+    env = os.environ.get("DSHC_STATIC_DIR", "").strip()
+    if env:
+        return Path(env)
+    cwd_cand = Path.cwd() / "frontend" / "dist"
+    if cwd_cand.is_dir():
+        return cwd_cand
     here = Path(__file__).resolve()
     for parent in here.parents:
         cand = parent / "frontend" / "dist"
         if cand.is_dir():
             return cand
-    return here.parents[2] / "frontend" / "dist"
+    return cwd_cand
 
 
 async def fail_interrupted_jobs(db: Db) -> int:
