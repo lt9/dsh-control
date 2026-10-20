@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from dsh_control.integrations.base import ExecResult
-from tests.conftest import XRW, wait_job
+from tests.conftest import create_instance, wait_job
 
 IMG_TAG = "dsh-test:v9"
 
@@ -20,7 +20,7 @@ async def test_missing_image_fails_before_any_external_write(env):
     env.providers.executor.handlers.append((
         "docker image inspect",
         ExecResult(0, "[image] MISSING\ndsh-other:v1 10MB\n", "")))
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
@@ -39,7 +39,7 @@ async def test_missing_image_fails_before_any_external_write(env):
 
 async def test_missing_dsh_image_config_fails_in_plan(env):
     env.settings.dsh_image = ""
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
@@ -55,7 +55,7 @@ async def test_image_and_public_config_land_in_instance_env(env):
     <名字> <宿主机端口> + DATA_ROOT/LAN_IP 两个环境变量；镜像与公网两条走实例自己的
     .env，deploy.sh 只认 .env。旧断言"两个脚本都带 DSH_IMAGE 环境变量"是我们凭空
     想象的接口——脚本根本不读，真机上直接报「用法：<小写名字> <宿主机端口>」。"""
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     cmds = env.providers.executor.commands

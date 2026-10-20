@@ -171,7 +171,9 @@ export const api = {
     const raw = await http<unknown>(`/instances${s ? `?${s}` : ""}`);
     return toList(raw).map(toRow);
   },
-  create: (body: { host_id?: number }) =>
+  /** 确认卡先取号：下一台叫什么、挂在哪个域名上（服务端说了算）。 */
+  nextSlug: () => http<{ slug: string; dns_name: string }>("/instances/next-slug"),
+  create: (body: { host_id?: number; confirm: string }) =>
     http<{ instance_id: number; dns_name: string; job_id: number }>("/instances",
       { method: "POST", json: body }),
   instance: (id: number | string) => http<InstanceDetail>(`/instances/${id}`),

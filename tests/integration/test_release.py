@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest  # noqa: F401
 
-from tests.conftest import XRW, wait_job
+from tests.conftest import XRW, create_instance, wait_job
 
 
 async def deploy(env) -> dict:
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     return body
@@ -104,7 +104,7 @@ async def test_release_twice_409_and_restart_after_release_409(env):
 
 async def test_release_from_pending_ok_and_concurrent_job_blocked(env):
     # pending 状态也在可释放集合（部署失败留下的半成品要能拆）
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     # 部署进行中再点重启：实例已是 deploying，重启 409
     r2 = await env.client.post(f"/api/instances/{body['instance_id']}/restart",
@@ -116,7 +116,7 @@ async def test_release_from_pending_ok_and_concurrent_job_blocked(env):
 async def test_release_noop_instance_deletes_nothing_with_fake_ids(noop_env):
     """noop 开通的实例释放：三层没有真实 id（空），步骤必须 skipped、
     一条删除请求都不发；只有 container_stop 真执行。"""
-    r = await noop_env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(noop_env.client)
     body = r.json()
     await wait_job(noop_env.app, body["job_id"])
     r = await noop_env.client.post(f"/api/instances/{body['instance_id']}/release",
@@ -139,7 +139,7 @@ async def test_release_refuses_synthetic_ids(env):
     """库里若被污染成 noop 占位值（"manual" / 0），释放也绝不发删除请求。"""
     from dsh_control.db import repo
 
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     async with env.db.session() as s:
@@ -230,7 +230,7 @@ async def test_deploy_rollback_removes_upstream_and_clears_ids(env):
     # reload 失败 → 步骤 50 失败触发回滚）。故意不选第 60 步——那边契约是
     # "保留现场不回滚"（deploy.py 第 60 步开头 rollback_actions.clear()）。
     env.providers.ng.fail_reload = True
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     iid = body["instance_id"]

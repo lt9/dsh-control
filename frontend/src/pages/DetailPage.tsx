@@ -205,7 +205,10 @@ export default function DetailPage() {
               {cfgItems.length === 0 ? <p className="mut small">没有配置快照。</p> : (
                 <dl className="kv">
                   {cfgItems.map((it) => <div key={it.key} style={{ display: "contents" }}>
-                    <dt>{it.label}</dt><dd className="mono">{it.value}</dd>
+                    <dt>{it.label}</dt>
+                    <dd className="mono">{String(it.value ?? "") === ""
+                      ? <span className="mut">（这条快照里没记值——旧快照没回填生效值）</span>
+                      : it.value}</dd>
                   </div>)}
                 </dl>
               )}

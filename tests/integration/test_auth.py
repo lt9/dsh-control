@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import OP_KEY, XRW
+from tests.conftest import OP_KEY, XRW, create_instance
 
 
 async def test_healthz_public(env):
@@ -55,7 +55,7 @@ async def test_write_requires_xrw(env):
     r = await env.client.post("/api/instances", json={})
     assert r.status_code == 403
     assert r.json()["detail"]["error"] == "missing_x_requested_with"
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     assert r.status_code == 200
 
 

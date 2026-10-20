@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import XRW, wait_job
+from tests.conftest import XRW, create_instance, wait_job
 
 STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_create",
                     "container_deploy", "config_backfill", "token_capture",
@@ -10,10 +10,41 @@ STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_crea
 
 
 async def create(env, body=None):
-    r = await env.client.post("/api/instances", json=body if body is not None else {},
+    slug = (await env.client.get("/api/instances/next-slug")).json()["slug"]
+    body = {"confirm": slug, **({} if body is None else body)}
+    r = await env.client.post("/api/instances", json=body,
                               headers=XRW)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+async def test_create_requires_echoed_slug(env):
+    """没回显域名就 POST：422，而且库里一个实例都不许有。
+
+    前端的"打字确认"被真双击穿透过一次（2026-10-21 现网凭空开出 dsh-03，
+    DNS/隧道/反代/容器全建了）。确认必须落到服务端，这条钉住它。"""
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"] == "confirm_mismatch"
+    assert (await env.client.get("/api/instances")).json()["items"] == []
+
+
+async def test_create_rejects_stale_slug(env):
+    """确认卡上的名字和真要建的不一致：拒绝，而不是"建成别的"。"""
+    r = await env.client.post("/api/instances", json={"confirm": "dsh-09"}, headers=XRW)
+    assert r.status_code == 422
+    assert (await env.client.get("/api/instances")).json()["items"] == []
+    # 空白宽容，但不允许错字
+    r = await env.client.post("/api/instances", json={"confirm": " dsh-01 "}, headers=XRW)
+    assert r.status_code == 200
+
+
+async def test_next_slug_tracks_existing_instances(env):
+    """取号接口是确认卡唯一的名字来源，必须跟着库里已有的 slug 走。"""
+    assert (await env.client.get("/api/instances/next-slug")).json()["slug"] == "dsh-01"
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    assert (await env.client.get("/api/instances/next-slug")).json()["slug"] == "dsh-02"
 
 
 async def test_deploy_full_flow_with_derived_names(env):
@@ -202,7 +233,7 @@ async def test_missing_frps_upstream_host_fails_in_plan(env):
 async def test_failed_deploy_can_be_retried_and_resumes(env):
     """开通失败必须有路可走：修好成因后重跑是**续建**，不重建已经对的东西。"""
     env.settings.frps_upstream_host = ""
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     iid = body["instance_id"]
     await wait_job(env.app, body["job_id"])
@@ -224,7 +255,7 @@ async def test_failed_deploy_can_be_retried_and_resumes(env):
 
 async def test_deploy_retry_refused_from_running(env):
     """running 不等于"开通失败"，重跑开通必须拒——那是 restart 的语义。"""
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     r2 = await env.client.post(f"/api/instances/{body['instance_id']}/deploy", headers=XRW)
@@ -238,7 +269,7 @@ async def test_replace_refused_when_drift_would_wash_a_live_site(env):
     env.providers.ng.drift = [{"server_name": "someone-else.example.test",
                                "header_host": "$host:$proxy_port", "probe_status": 401,
                                "dsh_proven": True, "verdict": "db_dirty"}]
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
@@ -279,7 +310,7 @@ async def test_retry_after_reload_failure_does_not_duplicate_config_snapshot(env
     from dsh_control.db.models import InstanceConfig
 
     env.providers.ng.fail_reload = True
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     iid = body["instance_id"]
     await wait_job(env.app, body["job_id"])
@@ -511,7 +542,7 @@ async def test_created_row_already_carries_kit_container_name(env):
     一次重启或抓 token 都指向一个不存在的容器。"""
     from dsh_control.db import repo
 
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     assert r.status_code == 200
     async with env.db.session() as s:
         inst = await repo.get_instance(s, r.json()["instance_id"])

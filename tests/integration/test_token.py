@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 
-from tests.conftest import XRW, wait_job
+from tests.conftest import XRW, create_instance, wait_job
 
 
 async def deploy(env) -> dict:
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     return body
@@ -104,7 +104,7 @@ async def test_token_not_found_returns_502(env):
 
 async def test_list_and_detail_leak_no_full_token(env):
     """列表连 mask 都不给；详情只给 mask。全值只在 /token reveal 里。"""
-    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    r = await create_instance(env.client)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     blob_list = (await env.client.get("/api/instances")).text

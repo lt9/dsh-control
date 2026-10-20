@@ -225,6 +225,15 @@ async def create_instance(
         slugs = await repo.all_slugs(s)
         slug = slug_mod.next_slug(slugs, settings.dns_prefix)
         dns_name = f"{slug}.{settings.dns_zone}"
+        # 防误建：调用方必须把它要建的名字回显上来（确认卡上显示的那个）。
+          # 只在前端设卡等于没设——2026-10-21 现网"连点两次"被真双击穿透，
+          # 凭空开出一台公网实例（DNS/隧道/反代/容器全建了）。顺带挡住另一种
+          # 尴尬：确认卡算出的名字已被别人抢先占用，那就拒绝，而不是"建成别的"。
+        if (body.confirm if body else None) is None or (body.confirm or "").strip() != slug:
+            raise HTTPException(status_code=422, detail={
+                "ok": False, "error": "confirm_mismatch",
+                "message": f"没有创建任何东西：要建的实例是 {slug}，"
+                           "请把这个名字原样填进确认框再提交。"})
         inst = Instance(slug=slug, host_id=host.id,
                         # 容器名由 kit 决定（dsh-<slug>），创建时就按同一条规则写，
                         # 别留一个"要等第 10 步来纠正"的错值（2026-10-21 现网
@@ -242,6 +251,18 @@ async def create_instance(
                              data={"slug": slug, "host": host.name})
     state.runner.spawn(job.id)
     return {"instance_id": inst.id, "dns_name": dns_name, "job_id": job.id}
+
+
+@router.get("/instances/next-slug")
+async def next_slug(request: Request) -> dict[str, Any]:
+    """确认卡用：先问清"下一台叫什么"。创建时要把这个名字回显（见 confirm）。
+
+    必须声明在 /instances/{instance_id} 之前，否则被路径参数路由吃掉。"""
+    st = _state(request)
+    zone = st.settings.dns_zone or ""
+    async with st.db.session() as s:
+        slug = slug_mod.next_slug(await repo.all_slugs(s), st.settings.dns_prefix)
+    return {"slug": slug, "dns_name": f"{slug}.{zone}" if zone else slug}
 
 
 @router.get("/instances/{instance_id}")

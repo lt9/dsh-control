@@ -16,6 +16,7 @@ export default function NewPage() {
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
   const [armed, setArmed] = useState(false);
+  const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   // 域名后缀首选站点配置（overview.dns_zone 等字段，防御式读），退而求其次从既有实例反推。
@@ -26,21 +27,20 @@ export default function NewPage() {
     const withDns = (rows.data ?? []).map((r) => r.dns_name).find(Boolean);
     return withDns?.includes(".") ? withDns.slice(withDns.indexOf(".")) : null;
   }, [ov.data, rows.data]);
-  const nextSlug = useMemo(() => {
-    let max = 0;
-    for (const r of rows.data ?? []) {
-      const m = /^dsh-(\d+)$/.exec(r.slug);
-      if (m) max = Math.max(max, Number(m[1]));
-    }
-    return `dsh-${String(max + 1).padStart(2, "0")}`;
-  }, [rows.data]);
+  // 域名以前是前端自己数既有实例猜的（max+1）：与服务端各算一套，
+  // 并发或改名时就会错位，确认卡上写的和真建出来的可能不是同一个。
+  // 现在问服务端要（GET /instances/next-slug），创建时还要把它回显回去。
+  const plan = useAsync(() => api.nextSlug(), []);
+  const nextSlug = plan.data?.slug ?? null;
+  const dnsName = plan.data?.dns_name ?? null;
   const hostList = (hosts.data ?? []).filter((h) => h.enabled !== false);
   const picked = hostList.find((h) => h.id === hostId) ?? null;
 
   const start = async () => {
     setBusy(true); setError(null);
     try {
-      const r = await api.create(hostId == null ? {} : { host_id: hostId });
+      if (!nextSlug) throw new Error("还没拿到要创建的域名，刷新页面重试");
+      const r = await api.create({ ...(hostId == null ? {} : { host_id: hostId }), confirm: nextSlug });
       nav(`/jobs/${r.job_id}?instance=${r.instance_id}&kind=deploy`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -63,7 +63,9 @@ export default function NewPage() {
             <dl className="kv">
               <dt>域名</dt>
               <dd>
-                <span className="mono" style={{ fontSize: 15 }}>{nextSlug}{zone ?? ""}</span>
+                <span className="mono" style={{ fontSize: 15 }}>
+                  {dnsName ?? (nextSlug ? nextSlug + (zone ?? "") : "正在取号…")}
+                </span>
                 <span className="auto-tag">自动生成</span>
                 {!zone && <div className="mut small">后缀由服务器统一配置，部署时补全</div>}
               </dd>
@@ -101,20 +103,42 @@ export default function NewPage() {
               </div>
             )}
             <div className="confirm-foot">
-              <button type="button" className="btn btn-primary btn-lg" disabled={busy}
-                onClick={() => {
-                  // 二次确认：这一步会新建 DNS／隧道／反代并在机器上起容器，
-                  // 一戳就开工单太危险（页面上没有"取消"，误触就是真部署）。
-                  if (!armed) { setArmed(true); window.setTimeout(() => setArmed(false), 8000); return; }
-                  void start();
-                }}>
-                {busy ? "已提交，正在装船…" : armed ? "再点一次：确认开始部署" : "开始部署"}
-              </button>
-              <span className="mut small">
-                {armed ? "确认：会新建 DNS、隧道、反代站点并起容器。8 秒内不再点就作废。"
-                       : "十步开通，随时可回台账看进度"}
-              </span>
+              {/* 二次确认必须是"键盘动作"，不能是"第二次点击"。
+                  上一版数点击次数，被真双击 / 自动化连发 mouseReleased+mouseClicked
+                  直接穿过去，2026-10-21 现网误建了一台 dsh-03（已走释放流程回收）。
+                  这一步会在云上建 DNS、开隧道、加反代站点并起容器，必须打到
+                  输入框里的域名与卡片上显示的一致才允许提交。 */}
+              {!armed ? (
+                <>
+                  <button type="button" className="btn btn-primary btn-lg" disabled={busy || !nextSlug}
+                    onClick={() => { setArmed(true); setTyped(""); }}>
+                    {busy ? "已提交，正在装船…" : nextSlug ? "开始部署" : "正在取号…"}
+                  </button>
+                  <span className="mut small">十步开通，随时可回台账看进度</span>
+                </>
+              ) : (
+                <>
+                  <input className="input" type="text" value={typed} autoFocus
+                    aria-label={`输入 ${nextSlug ?? "域名"} 以确认新建`}
+                    placeholder={`输入 ${nextSlug ?? "域名"} 确认`}
+                    onChange={(e) => setTyped(e.target.value)} />
+                  <button type="button" className="btn btn-primary btn-lg"
+                    disabled={busy || typed.trim() !== nextSlug} onClick={() => void start()}>
+                    {busy ? "已提交，正在装船…" : "确认新建"}
+                  </button>
+                  <button type="button" className="btn btn-ghost"
+                    onClick={() => { setArmed(false); setTyped(""); }}>
+                    返回改主意
+                  </button>
+                </>
+              )}
             </div>
+            {armed && (
+              <p className="mut small" role="note">
+                确认：会在云上新建 DNS、隧道、反代站点并在机器上起容器。请把上面卡片里的域名
+                打进输入框才允许提交——点两下不算确认。
+              </p>
+            )}
           </div>
         </div>
       </div>

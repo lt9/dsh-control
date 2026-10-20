@@ -365,6 +365,13 @@ def make_settings(**over) -> Settings:
     return Settings(**base)
 
 
+async def create_instance(client, extra: dict | None = None, headers: dict | None = None):
+    """创建实例现在要回显域名（防误建），测试统一走这里：先取号再提交。"""
+    slug = (await client.get("/api/instances/next-slug")).json()["slug"]
+    body = {"confirm": slug, **(extra or {})}
+    return await client.post("/api/instances", json=body, headers=headers or XRW)
+
+
 async def seed_host(db, *, name="nas-1", ssh_host="192.0.2.10", ssh_port=22,
                     ssh_user="ops", data_root="/hdd1/dsh-data",
                     kit_path="/srv/dsh-family", frpc_client_id="ops.c.nas1@1",
