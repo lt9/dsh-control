@@ -99,6 +99,15 @@ class FakeFrp:
             return Tunnel(proxy_id=0, name=name, client_id=client_id,
                           server_id=server_id, local_ip=local_ip,
                           local_port=local_port, remote_port=remote_port)
+        # 与真实 frp 面板同德性：同名隧道已存在但指向不一致时拒绝改动。
+        # 现网 2026-10-21 的续建就是被这条保护挡住的（探测器挑了新端口）。
+        same = await self.find_by_name(name, client_id)
+        if same is not None and (same.local_ip, same.local_port, same.remote_port) != (
+                local_ip, local_port, remote_port):
+            raise IntegrationError(
+                f"隧道 {name} 已存在但端口不一致（面板: {same.local_ip}:{same.local_port}"
+                f"→:{same.remote_port}，期望: {local_ip}:{local_port}→:{remote_port}）；"
+                "拒绝改动既有隧道")
         if remote_port in self.taken:
             raise IntegrationError(f"端口 {remote_port} 已占用")
         self._n += 1

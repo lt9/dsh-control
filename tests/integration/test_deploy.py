@@ -365,3 +365,59 @@ async def test_failed_retry_keeps_previous_attempts_registrations(env):
     assert env.providers.dns.records and env.providers.frp.tunnels and env.providers.ng.sites
     logs = (await env.client.get(f"/api/jobs/{r.json()['job_id']}/logs?after=0")).json()["items"]
     assert any("外部登记 id 保持不动" in it["line"] for it in logs), "要说明为什么没清"
+
+
+async def _leftover_tunnel(env, port: int = 4894):
+    """把「上一次尝试建好的隧道」摆回面板：名字是我们的，端口被它占着。"""
+    from sqlalchemy import select
+
+    from dsh_control.db.models import Host
+    from dsh_control.integrations.base import Tunnel
+
+    async with env.db.session() as s:
+        host = (await s.scalars(select(Host).order_by(Host.id))).first()
+    t = Tunnel(proxy_id=777, name="dsh_01", client_id=host.frpc_client_id,
+               server_id="default", local_ip=host.ssh_host, local_port=port,
+               remote_port=port)
+    env.providers.frp.tunnels[777] = t
+    env.providers.frp.taken.add(port)
+    return t
+
+
+async def test_retry_reuses_our_existing_tunnel_and_its_port(env):
+    """续建认得自己的隧道：沿用它的端口，不重复建，也不被「拒绝改动既有隧道」挡死。"""
+    from dsh_control.db import repo
+
+    await _leftover_tunnel(env)
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "succeeded", job["error"]
+    assert not [ln for ln in env.journal if ln.startswith("frp.ensure")], "复用了还新建"
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    net = d["network"]
+    assert net["frp_proxy_id"] == 777 and net["frp_remote_port"] == 4894
+    evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    assert any(e["kind"] == "frp_reused" for e in evs)
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, body["instance_id"])
+        assert inst.frp_proxy_id == 777
+
+
+async def test_rollback_of_retry_leaves_reused_tunnel_alone(env):
+    """复用来的隧道不是这次建的：后续步骤失败触发回滚时，它既不能被删，
+    登记 id 也不能被抹（抹了就成了没人认领的孤儿隧道）。"""
+    from dsh_control.db import repo
+
+    await _leftover_tunnel(env)
+    env.providers.ng.fail_reload = True          # 第 50 步炸，触发回滚
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    iid = body["instance_id"]
+    assert 777 in env.providers.frp.tunnels, "回滚删掉了复用的隧道"
+    assert env.providers.ng.sites == {} and env.providers.dns.records == {}
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        assert inst.frp_proxy_id == 777, "复用的登记被抹掉了，隧道从此没人认领"
+        assert inst.frp_remote_port == 4894
+        assert inst.dns_record_id == "", "这次真的建过的 DNS 才该被抹"

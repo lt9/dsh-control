@@ -133,6 +133,30 @@ async def _pick_frp_port(ctx: JobCtx) -> int:
         raise StepFailed(str(exc)) from exc
 
 
+async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, Any | None]:
+    """续建先认出自己的隧道，再考虑挑新端口；返回 (端口, 复用到的隧道)。
+
+    端口探测器只知道"4894 被占了"，不知道占着它的就是我们自己上次建的那条隧道，
+    于是每次续建都往上加一个端口，接着被 ensure 的「隧道已存在但端口不一致，拒绝
+    改动既有隧道」挡死（2026-10-21 现网：4893 别人在用、4894 是我们自己的 dsh_01、
+    4895 是新挑的）。指向别的机器的隧道一律拒绝复用，那种才是真冲突。
+    """
+    if _manual(ctx, "frp"):
+        return await _pick_frp_port(ctx), None
+    prior = await ctx.frp().find_by_name(names.tunnel, host.frpc_client_id)
+    if prior is None:
+        return await _pick_frp_port(ctx), None
+    lip = str(prior.local_ip or "")
+    if lip and lip != host.ssh_host:
+        raise StepFailed(
+            f"隧道 {names.tunnel} 已存在且指向 {lip}:{prior.local_port}，与本机 "
+            f"{host.ssh_host} 不符——那是别的服务，不复用也不改")
+    await ctx.log("info", f"隧道 {names.tunnel} 是先前给这台实例建的"
+                          f"（proxy_id={prior.proxy_id}，remotePort={prior.remote_port}），"
+                          "沿用它的端口，不再新挑")
+    return int(prior.remote_port or 0), prior
+
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -316,7 +340,7 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 40 frp_create：先探测端口再建隧道；失败删刚建的
     async with ctx.step(40, "frp_create", "创建 frp 隧道") as st:
-        port = await _pick_frp_port(ctx)
+        port, prior = await _reuse_or_pick_port(ctx, names, host)
         if _manual(ctx, "frp"):
             st.state = "skipped"
             await ctx.frp().ensure(
@@ -335,7 +359,9 @@ async def run_deploy(ctx: JobCtx) -> None:
             inst.container_port = port
             await ctx.s.commit()
         else:
-            tunnel = await ctx.frp().ensure(
+            # 复用到上次建的隧道就不新建：ensure 见到端口不一致会拒改既有隧道，
+            # 那是它对别人的保护，我们自己本来就不该走到那一步。
+            tunnel = prior if prior is not None else await ctx.frp().ensure(
                 name=names.tunnel, client_id=host.frpc_client_id,
                 server_id="default", local_ip=host.ssh_host,
                 local_port=port, remote_port=port,
@@ -364,22 +390,27 @@ async def run_deploy(ctx: JobCtx) -> None:
                     return got if got is not None else await ctx.frp().find_by_name(
                         n, client_id)
 
-                ctx.rollback_actions.append(
-                    ("frp_delete", _rollback_del(
-                        ctx, inst, "frp 隧道",
-                        lambda pid=tunnel.proxy_id, n=names.tunnel: idempotent_delete(
-                            ctx.log, "frp 隧道", n,
-                            lambda: ctx.frp().delete(pid, expect_name=n),
-                            frp_still_there),
-                        ("frp_proxy_id", "frp_remote_port")))
+                if prior is None:  # 复用来的隧道不是这次建的，回滚没资格删
+                    ctx.rollback_actions.append(
+                        ("frp_delete", _rollback_del(
+                            ctx, inst, "frp 隧道",
+                            lambda pid=tunnel.proxy_id, n=names.tunnel: idempotent_delete(
+                                ctx.log, "frp 隧道", n,
+                                lambda: ctx.frp().delete(pid, expect_name=n),
+                                frp_still_there),
+                            ("frp_proxy_id", "frp_remote_port")))
                 )
                 inst.frp_proxy_id = tunnel.proxy_id
                 inst.frp_remote_port = tunnel.remote_port or port
                 # 容器发布端口与隧道 remotePort 同号，全局唯一
                 inst.container_port = port
+                if prior is not None:
+                    # 挂回来的既有隧道：本次回滚一律不许抹它的登记
+                    ctx.kept_fields.update({"frp_proxy_id", "frp_remote_port"})
                 await ctx.s.commit()
-                await ctx.event("frp_created",
-                                f"隧道 {tunnel.name} 远程端口 {inst.frp_remote_port}",
+                await ctx.event("frp_reused" if prior is not None else "frp_created",
+                                f"{'复用隧道' if prior is not None else '隧道'} "
+                                f"{tunnel.name} 远程端口 {inst.frp_remote_port}",
                                 {"proxy_id": tunnel.proxy_id, "name": tunnel.name,
                                  "remote_port": inst.frp_remote_port})
 
