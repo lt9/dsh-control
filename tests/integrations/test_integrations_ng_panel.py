@@ -70,12 +70,14 @@ LOCATION_FIXTURE = {
 class FakeNg:
     """假面板：默认按 fixture 长；growth=True 时写完才“长出”对象（模拟真面板）。"""
 
-    def __init__(self, *, server=None, upstream=None, backends=None, locations=None,
-                 flaky_token=False, growth=False, check_fails=False):
-        self.server = server
+    def __init__(self, *, server=None, servers=None, upstream=None, backends=None,
+                 locations=None, flaky_token=False, growth=False, check_fails=False):
+        self.servers = list(servers) if servers is not None \
+            else ([server] if server else [])
+        self.server = self.servers[0] if self.servers else None
         self.upstream = upstream
         self.backends = backends or []
-        self.locations = locations or []
+        self.locations = list(locations or [])
         self.flaky_token = flaky_token
         self.growth = growth
         self.check_fails = check_fails
@@ -107,8 +109,9 @@ class FakeNg:
             return httpx.Response(200, json={"success": False, "status": "401",
                                              "msg": "header中token不正确或已过期"})
         if path == "/api/server/getPage":
-            rows = [self.server] if self.server and params.get("keywords", "") in \
-                json.dumps(self.server, ensure_ascii=False) else []
+            kw = params.get("keywords", "")
+            rows = [s for s in self.servers
+                    if kw in json.dumps(s, ensure_ascii=False)]
             return ok({"count": len(rows), "curr": 1, "limit": 100, "records": rows})
         if path == "/api/upstream/getPage":
             rows = [self.upstream] if self.upstream else []
@@ -116,7 +119,9 @@ class FakeNg:
         if path == "/api/upstream/getServerByUpstreamId":
             return ok(self.backends)
         if path == "/api/server/getLocationByServerId":
-            return ok(self.locations)
+            sid = params.get("serverId", "")
+            return ok([l for l in self.locations
+                       if str(l.get("serverId")) == str(sid)])
         if path == "/api/nginx/check":
             self.writes.append((path, params))
             if self.check_fails:
@@ -137,12 +142,16 @@ class FakeNg:
                                           port=int(params.get("port") or 0))]
                 elif path.endswith("/api/server/insertOrUpdate"):
                     self.server = dict(SITE_FIXTURE)
+                    self.servers = [self.server]
                 elif path.endswith("/insertOrUpdateLocation"):
-                    self.locations = [dict(
-                        LOCATION_FIXTURE,
-                        upstreamId=params.get("upstreamId", ""),
-                        headerHost=params.get("headerHost", "$host"),
-                        websocket=int(params.get("websocket", 1)))]
+                    # 真面板语义：带 id 更新（收到的字段落库），不带 id 新建
+                    lid = params.get("id")
+                    hit = next((l for l in self.locations
+                                if lid and str(l.get("id")) == str(lid)), None)
+                    if hit is not None:
+                        hit.update(params)
+                    else:
+                        self.locations.append(dict(LOCATION_FIXTURE, **params))
             return ok({})
         return httpx.Response(200, json={"success": False, "status": "404", "msg": "no route"})
 
@@ -430,3 +439,166 @@ def test_ensure_site_passes_token_header_on_writes():
     for r in api.requests:
         if r.url.path.startswith("/api/"):
             assert r.headers.get("token")
+
+
+# -------------------------------------------- patch_location（单字段精修全量回填）
+
+CUSTOM_LOC = dict(LOCATION_FIXTURE, descr="hand-kept", rootPath="/srv/custom",
+                  rootPage="index.html", returnPath=1)
+FOREIGN_SITE = dict(SITE_FIXTURE, id="1310000000000000010",
+                    serverName="legacy-app.example.com")
+
+
+def test_patch_location_backfills_whole_record_never_partial():
+    api = FakeNg(server=dict(SITE_FIXTURE), locations=[dict(CUSTOM_LOC)], growth=True)
+    back = run(api.panel().patch_location(SITE, changes={"websocket": 0}))
+    p = write_for(api, "/server/insertOrUpdateLocation")
+    assert p["id"] == LOCATION_FIXTURE["id"] and p["serverId"] == SITE_FIXTURE["id"]
+    # 自定义参数原样带回，一条没洗掉——半量 payload 是不许存在的形状
+    assert p["descr"] == "hand-kept" and p["rootPath"] == "/srv/custom"
+    assert p["rootPage"] == "index.html" and p["returnPath"] == "1"
+    assert p["upstreamId"] == LOCATION_FIXTURE["upstreamId"]
+    assert p["headerHost"] == "$host" and p["type"] == str(LOCATION_FIXTURE["type"])
+    assert "value" not in p                      # 库里 null → 缺省，不许显式洗成空串
+    assert p["websocket"] == "0"                 # 唯一被改动的字段
+    assert set(p) <= LOCATION_PARAM_FIELDS
+    assert str(back["websocket"]) == "0"         # 返回值来自回读，不来自写响应
+
+
+def test_patch_foreign_refused_by_default_with_zero_requests():
+    api = FakeNg(server=dict(FOREIGN_SITE),
+                 locations=[dict(CUSTOM_LOC, serverId=FOREIGN_SITE["id"])])
+    with pytest.raises(NotManaged) as ei:
+        run(api.panel().patch_location("legacy-app.example.com",
+                                       changes={"websocket": 0}))
+    assert ei.value.code == "ng_foreign_site_refused"
+    assert api.requests == []                    # 守卫当场拒，连 token 都不取
+
+
+def test_patch_foreign_allowed_only_explicitly_and_audited():
+    rec = DryRunRecorder()
+    api = FakeNg(server=dict(FOREIGN_SITE),
+                 locations=[dict(CUSTOM_LOC, serverId=FOREIGN_SITE["id"])])
+    run(api.panel(dry_run=True, recorder=rec).patch_location(
+        "legacy-app.example.com", changes={"descr": "user-own"}, allow_foreign=True))
+    assert api.writes == []                                # dry-run 一个写都不发
+    assert any("#foreign" in e.action for e in rec.entries)
+    # 真写路径：放行，且 foreign 通道必须留审计痕
+    api2 = FakeNg(server=dict(FOREIGN_SITE),
+                  locations=[dict(CUSTOM_LOC, serverId=FOREIGN_SITE["id"])],
+                  growth=True)
+    rec2 = DryRunRecorder()
+    run(api2.panel(recorder=rec2).patch_location(
+        "legacy-app.example.com", changes={"descr": "user-own"}, allow_foreign=True))
+    assert [p for p, _ in api2.writes] == ["/api/server/insertOrUpdateLocation"]
+    assert any("#foreign" in e.action and "allow_foreign" in e.note
+               for e in rec2.entries)
+
+
+@pytest.mark.parametrize("changes,code", [
+    ({"proxyPass": "http://x"}, "location_fields_not_allowed"),
+    ({"id": "9"}, "location_field_readonly"),
+    ({"serverId": "9"}, "location_field_readonly"),
+    ({}, "empty_changes"),
+    ({"headerHost": "$host:$proxy_port"}, "header_host_port"),
+])
+def test_patch_refused_before_any_request(changes, code):
+    api = FakeNg(server=dict(SITE_FIXTURE), locations=[dict(CUSTOM_LOC)])
+    with pytest.raises(IntegrationError) as ei:
+        run(api.panel().patch_location(SITE, changes=changes))
+    assert ei.value.code == code
+    assert api.requests == []                    # 本地拒绝：零请求
+
+
+def test_patch_dirty_db_header_host_still_guarded():
+    dirty = dict(CUSTOM_LOC, headerHost="$host:$proxy_port")
+    api = FakeNg(server=dict(SITE_FIXTURE), locations=[dirty])
+    with pytest.raises(IntegrationError) as ei:  # 想借 patch 只改别的、留着脏 Host？不行
+        run(api.panel().patch_location(SITE, changes={"websocket": 0}))
+    assert ei.value.code == "header_host_port"
+    assert api.writes == []
+
+
+def test_patch_missing_location_refuses_and_writes_nothing():
+    api = FakeNg(server=dict(SITE_FIXTURE), locations=[])
+    with pytest.raises(IntegrationError) as ei:
+        run(api.panel().patch_location(SITE, changes={"websocket": 0}))
+    assert ei.value.code == "ng_location_missing"
+    assert "path='/'" in str(ei.value)           # 说清面板现回有哪些 path
+    assert api.writes == []
+
+
+def test_patch_verify_mismatch_raises_with_current_value():
+    api = FakeNg(server=dict(SITE_FIXTURE), locations=[dict(CUSTOM_LOC)])  # 无 growth
+    with pytest.raises(IntegrationError) as ei:
+        run(api.panel().patch_location(SITE, changes={"websocket": 0}))
+    assert ei.value.code == "ng_verify_failed"
+    assert "websocket" in str(ei.value) and "现值" in str(ei.value)
+    assert [p for p, _ in api.writes] == ["/api/server/insertOrUpdateLocation"]
+
+
+# ------------------------------------------ drift_scan（replace 前库盘核对，纯只读）
+
+def _srv(i, name, *, enable=True):
+    return dict(SITE_FIXTURE, id=str(1310000000000000000 + i),
+                serverName=name, enable=enable)
+
+
+def _loc(sid, header_host, *, i):
+    return dict(LOCATION_FIXTURE, id=str(1310000000000009000 + i),
+                serverId=str(sid), headerHost=header_host)
+
+
+PROBE_CODES = {
+    "dsh-clean.example.com": 401,
+    "legacy-db-dirty.example.com": 401,
+    "dsh-disk-dirty.example.com": 403,
+    "legacy-both-dirty.example.com": 403,
+    "plain-not-dsh.example.com": 404,
+}
+
+
+def _probe_client(seen):
+    def handle(request):
+        host = request.url.host
+        seen.append((host, request.url.path, request.headers.get("origin")))
+        if host == "dsh-unreachable.example.com":
+            raise httpx.ConnectError("no route to host")
+        return httpx.Response(PROBE_CODES[host], text="x")
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+def test_drift_scan_classifies_every_site_and_writes_nothing():
+    servers = [_srv(11, "dsh-clean.example.com"),
+               _srv(12, "legacy-db-dirty.example.com"),
+               _srv(13, "dsh-disk-dirty.example.com"),
+               _srv(14, "legacy-both-dirty.example.com"),
+               _srv(15, "dsh-unreachable.example.com"),
+               _srv(16, "plain-not-dsh.example.com"),
+               _srv(17, "dsh-disabled.example.com", enable=False),
+               _srv(18, "dsh-no-loc.example.com")]
+    locations = [_loc(1310000000000000011, "$host", i=1),
+                 _loc(1310000000000000012, "$host:$proxy_port", i=2),
+                 _loc(1310000000000000013, "$host", i=3),
+                 _loc(1310000000000000014, "$host:$server_port", i=4),
+                 _loc(1310000000000000015, "$host", i=5),
+                 _loc(1310000000000000016, "$host", i=6)]
+    seen: list[tuple[str, str, str]] = []
+    api = FakeNg(servers=servers, locations=locations)
+    rows = run(api.panel().drift_scan(probe_client=_probe_client(seen)))
+    assert {r["server_name"]: r["verdict"] for r in rows} == {
+        "dsh-clean.example.com": "consistent",
+        "legacy-db-dirty.example.com": "db_dirty",      # 库脏盘净：replace 会洗脏
+        "dsh-disk-dirty.example.com": "disk_dirty",     # 盘被手改脏，replace 能救
+        "legacy-both-dirty.example.com": "consistent",  # 两边同脏：replace 不变东西
+        "dsh-unreachable.example.com": "unreachable",   # 连不上 ≠ 脏 ≠ 干净
+        "plain-not-dsh.example.com": "not_dsh_backend",
+        "dsh-no-loc.example.com": "no_location",
+    }                                                   # enable=0 的站根本不出现
+    assert {r["header_host"] for r in rows
+            if r["server_name"] == "legacy-db-dirty.example.com"} == {"$host:$proxy_port"}
+    assert seen and all(path == "/api/healthz" and origin == f"https://{host}"
+                        for host, path, origin in seen)
+    assert api.writes == []                             # 全程纯只读
+    assert not [p for p in api.paths if "insertOrUpdate" in p or p.endswith("/delete")
+                or p.startswith("/api/nginx")]

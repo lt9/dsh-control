@@ -34,6 +34,19 @@
 「已一致就不发写请求」，半成品状态（站点在、location 缺）重跑只补 location
 一个写请求。``find_site`` 会展开读 location，``location_id=None`` 即半成品。
 
+单字段精修 ``patch_location``：面板写接口收的是整条实体，"只发改动字段"的半量
+请求会把 location 上的自定义参数（descr/rootPath/…）按面板默认值洗掉——所以
+先 ``getLocationByServerId`` 读回整条原样回填、只盖 changes 点名的字段，写后
+回读逐字段核对。非本控制台前缀的站点默认拒绝（ng_foreign_site_refused），
+用户自己名下老站点须显式 ``allow_foreign=True`` 才放行，且写请求带 foreign
+标记进 recorder/审计。
+
+``drift_scan``（纯只读）：replace 是全面板按库重建，库盘不一致会被打回坏值；
+控制台没有 SSH 读不了磁盘，用 DSH 准入墙当探针（``https://<站点>/api/healthz``
+带 Origin：401/200=Host 干净、403=Host 带端口）量磁盘生效值，与库里
+header_host 对表，分 db_dirty / disk_dirty / consistent / unreachable /
+not_dsh_backend / no_location，给「跑 replace 之前」提供真凭据。
+
 安全边界：ensure/delete 只认第一标签以 ``dsh-`` / ``dshctl`` 开头的 FQDN
 （实例域名规范 ``dsh-<标签>.<zone>`` 与主控台自己的 ``dshctl``），删除必须逐字
 对上 ``expect_name``，否则 NotManaged。这台面板上跑着别人的一堆站点，
@@ -83,6 +96,15 @@ def _guard_header_host(header_host: str) -> None:
 
 def _first_label(server_name: str) -> str:
     return server_name.split(".", 1)[0].lower()
+
+
+def _norm(value: object) -> str:
+    """回读比对归一：面板回包 int/str/bool 混用（websocket 是 int，id 是 str）。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
 
 
 class NgPanel:
@@ -536,6 +558,202 @@ class NgPanel:
             )
         await self._api("/api/upstream/delete", {"id": upstream_id},
                         write=True, action="upstream.delete")
+
+    # ------------------------------------------------- 单字段精修（全量回填）
+
+    async def patch_location(
+        self,
+        server_name: str,
+        *,
+        path: str = "/",
+        changes: dict[str, Any] | None = None,
+        allow_foreign: bool = False,
+    ) -> dict[str, Any]:
+        """改某条 location 的个别字段——**全量回填，只覆盖点名字段**。
+
+        为什么必须全量：面板的 insertOrUpdateLocation 收的是整条实体，"只发
+        改动字段"的半量 payload 会把它没带的字段按面板默认值处理——等于把别人
+        location 上的自定义参数（descr/rootPath/returnUrl……）洗掉。所以这里
+        先把 getLocationByServerId 读回的整条记录原样回填，再盖 changes。
+
+        守卫（一个都不松）：
+        - changes 越出 ``LOCATION_PARAM_FIELDS`` 白名单 → 本地拒写，零请求；
+          ``id``/``serverId`` 只读（身份字段不许借道改）。
+        - 合并后的 headerHost 仍过 ``_guard_header_host``：库里本来就带端口的
+          脏记录，必须同一次把 headerHost 修成干净值才放行（拒写消息会说明）。
+        - 站点前缀不是本控制台的：``allow_foreign=False`` 直接拒
+          （ng_foreign_site_refused）；``True`` 才放行——这是用户自己名下老站点
+          的唯一通道，写请求带 foreign 标记进 recorder/审计，且仅在显式传参时
+          可达，默认永远走不到。
+        - 写后回读：changes 每个字段逐一对得上才算成功，否则 ng_verify_failed
+          并列出期望值与现值。dry-run 一个写请求都不发（读照常）。
+
+        返回：回读到的整条 location 记录（dry-run 返回将要发送的 payload）。
+        """
+        changes = dict(changes or {})
+        own = _first_label(server_name).startswith(self.site_prefixes)
+        if not own and not allow_foreign:
+            raise NotManaged(
+                f"拒绝对站点 {server_name!r} 的 location 做修改：第一标签不是本控制台"
+                f"前缀（{'/'.join(self.site_prefixes)}）。确属用户自己名下的老站点，"
+                "才允许显式传 allow_foreign=True 走 foreign 通道",
+                code="ng_foreign_site_refused",
+            )
+        if not changes:
+            raise IntegrationError("patch_location 需要至少一个改动字段",
+                                   code="empty_changes")
+        unknown = sorted(set(changes) - LOCATION_PARAM_FIELDS)
+        if unknown:
+            raise IntegrationError(
+                f"location 参数含白名单外字段 {unknown}，拒绝发送",
+                code="location_fields_not_allowed",
+            )
+        borrowed = sorted({"id", "serverId"} & set(changes))
+        if borrowed:
+            raise IntegrationError(
+                f"{borrowed} 是身份字段，patch 不许改（换 location 请删建，换站请走建站）",
+                code="location_field_readonly",
+            )
+        if "headerHost" in changes:
+            # 点名的就是 headerHost：本地当场拒脏值，连读都不发（零请求）
+            _guard_header_host(str(changes["headerHost"]))
+
+        rec = await self._server_rec(server_name)
+        if rec is None:
+            raise IntegrationError(f"站点 {server_name!r} 在面板里不存在",
+                                   code="ng_site_missing")
+        server_id = int(rec["id"])
+        locations = await self._locations(server_id)
+        loc = next((l for l in locations if l.get("path") == path), None)
+        if loc is None:
+            saw = "; ".join(repr(l.get("path")) for l in locations) or "一条都没有"
+            raise IntegrationError(
+                f"站点 {server_name}(server_id={server_id}) 里没有 path={path!r} 的 "
+                f"location（面板现回 {saw}），无从回填整条记录，拒写",
+                code="ng_location_missing",
+            )
+
+        # 全量回填：读回什么带什么（None/缺字段不发——面板 updateById 对缺省字段
+        # 保持原值，反而显式空串会把人家自定义的东西洗掉）
+        payload: dict[str, Any] = {
+            key: loc[key] for key in LOCATION_PARAM_FIELDS
+            if key not in ("id", "serverId")
+            and key in loc and loc[key] is not None
+        }
+        payload["serverId"] = server_id
+        payload["id"] = loc["id"]
+        payload.update(changes)
+        _guard_header_host(str(payload.get("headerHost", "$host")))
+
+        action = ("server.insertOrUpdateLocation" if own
+                  else "server.insertOrUpdateLocation#foreign")
+        await self._api("/api/server/insertOrUpdateLocation", payload,
+                        write=True, action=action)
+        if not own and not self.dry_run and self.recorder is not None:
+            # foreign 通道的真实写也要留审计痕（dry-run 时 _api 已记过）
+            self.recorder.record(
+                "ng", action, method="GET",
+                target=self.base_url + "/api/server/insertOrUpdateLocation",
+                payload=dict(payload), note="allow_foreign 通道：非本控制台前缀站点")
+        if self.dry_run:
+            return payload
+
+        verify_path = str(changes.get("path", path))
+        back = next((l for l in await self._locations(server_id)
+                     if l.get("path") == verify_path), None)
+        if back is None:
+            raise IntegrationError(
+                f"location 写后回读不到 path={verify_path!r}"
+                f"（站点 {server_name} server_id={server_id}，id={loc.get('id')}）",
+                code="ng_verify_failed")
+        diffs = [
+            f"{key}: 期望 {want!r} 面板现值 {back.get(key)!r}"
+            for key, want in changes.items()
+            if _norm(back.get(key)) != _norm(want)
+        ]
+        if diffs:
+            raise IntegrationError(
+                f"location 写后回读不一致（站点 {server_name} id={loc.get('id')}）："
+                + "；".join(diffs),
+                code="ng_verify_failed")
+        return dict(back)
+
+    # ------------------------------------------------ 库盘一致性黑盒体检（只读）
+
+    async def drift_scan(
+        self,
+        *,
+        probe_client: httpx.AsyncClient | None = None,
+        timeout: float = 6.0,
+    ) -> list[dict[str, Any]]:
+        """replace 之前的体检：**库里的 header_host vs 磁盘的真实生效值**。
+
+        replace 是全面板按库重建，库里任何与磁盘不一致的值都会打回磁盘
+        （例：库里还是 $host:$proxy_port 的脏值 → 重建把好站点洗脏）。控制台
+        没有 VPS 的 SSH 读不到 conf 文件，所以磁盘侧用黑盒探测：
+        ``GET https://<serverName>/api/healthz`` 带 ``Origin: https://<serverName>``
+        ——DSH 准入墙的行为已两次实测：后端收到的 Host 干净 → 401/200；
+        Host 带端口 → 403 forbidden。
+
+        判定（逐站点一条，含一致的，供编排层打表）：
+        - ``consistent``：库与盘同一状态（同干净或同脏——同脏 replace 不改东西）；
+        - ``db_dirty``：库里带端口而磁盘干净 → **replace 会把干净站点洗脏，
+          必须先修库（patch_location）再 replace**；
+        - ``disk_dirty``：库干净磁盘脏（人手改过文件）→ replace 会纠正回干净；
+        - ``unreachable``：探测连不上/超时/DNS 没生效——不下结论，绝不当脏或干净；
+        - ``not_dsh_backend``：探测回了别的状态码（非 401/200/403），说明后端不是
+          DSH（或没有 /api/healthz），无法用这个黑盒判定；
+        - ``no_location``：站点没有可判定的 location（半成品/纯静态），跳过判定。
+
+        enable=0 的站点面板不发布 conf，直接跳过。全程只读：一个写请求都不发。
+        """
+        sites = await self._get_page("/api/server/getPage")
+        owns_probe = probe_client is None
+        client = probe_client or httpx.AsyncClient(timeout=timeout)
+        results: list[dict[str, Any]] = []
+        try:
+            for rec in sites:
+                name = str(rec.get("serverName") or "")
+                if not name or str(rec.get("enable")).lower() not in ("true", "1"):
+                    continue
+                server_id = int(rec["id"])
+                locations = await self._locations(server_id)
+                loc = next((l for l in locations if l.get("path") == "/"),
+                           None) or (locations[0] if locations else None)
+                db_host = str((loc or {}).get("headerHost") or "")
+                row: dict[str, Any] = {"server_name": name,
+                                       "header_host": db_host,
+                                       "probe_status": None}
+                if loc is None or not db_host:
+                    row["verdict"] = "no_location"
+                    results.append(row)
+                    continue
+                try:
+                    resp = await client.get(
+                        f"https://{name}/api/healthz",
+                        headers={"Origin": f"https://{name}"})
+                    row["probe_status"] = resp.status_code
+                except (httpx.HTTPError, OSError):
+                    row["verdict"] = "unreachable"   # 连不上≠脏≠干净
+                    results.append(row)
+                    continue
+                code = resp.status_code
+                if code not in (200, 401, 403):
+                    row["verdict"] = "not_dsh_backend"
+                else:
+                    db_dirty = any(pat in db_host for pat in _FORBIDDEN_HOST_PATTERNS)
+                    disk_clean = code in (200, 401)
+                    if db_dirty and disk_clean:
+                        row["verdict"] = "db_dirty"      # replace 会洗脏，先修库
+                    elif not db_dirty and not disk_clean:
+                        row["verdict"] = "disk_dirty"    # 手改的盘，replace 能救
+                    else:
+                        row["verdict"] = "consistent"
+                results.append(row)
+        finally:
+            if owns_probe:
+                await client.aclose()
+        return results
 
     async def reload(self) -> None:
         """生效开关，三步（面板自身源码核定的 API 面语义）：
