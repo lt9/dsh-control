@@ -50,14 +50,26 @@ async def test_missing_dsh_image_config_fails_in_plan(env):
                    for ln in env.journal)
 
 
-async def test_dsh_image_passed_to_both_kit_scripts(env):
+async def test_image_and_public_config_land_in_instance_env(env):
+    """kit 的真实接口（现网实测纠正）：new-instance.sh 只吃位置参数
+    <名字> <宿主机端口> + DATA_ROOT/LAN_IP 两个环境变量；镜像与公网两条走实例自己的
+    .env，deploy.sh 只认 .env。旧断言"两个脚本都带 DSH_IMAGE 环境变量"是我们凭空
+    想象的接口——脚本根本不读，真机上直接报「用法：<小写名字> <宿主机端口>」。"""
     r = await env.client.post("/api/instances", json={}, headers=XRW)
     body = r.json()
     await wait_job(env.app, body["job_id"])
     cmds = env.providers.executor.commands
-    with_img = [c for c in cmds if f"DSH_IMAGE='{IMG_TAG}'" in c]
-    assert any("new-instance.sh" in c for c in with_img)
-    assert any("deploy.sh" in c for c in with_img)
+    newc = next(c for c in cmds if "./scripts/new-instance.sh" in c)
+    assert "new-instance.sh dsh-01 4893" in newc, newc        # 端口走位置参数
+    assert "DATA_ROOT=/hdd1/dsh-data" in newc                  # 数据根目录交给 kit
+    assert "CONTAINER_PORT=" not in newc                       # 不再发明环境变量
+    assert "DOCUMENTS_DIRECTORY=" not in newc
+    patch = next(c for c in cmds if "TRUSTED_HOSTS" in c and "sed -i" in c)
+    assert f"DSH_IMAGE={IMG_TAG}" in patch, patch              # 镜像落到实例 .env
+    assert "PUBLIC_URL=https://dsh-01.example.test" in patch    # 一键登录地址的来源
+    assert "dsh-01.example.test" in patch                       # 白名单追加公网域名
+    dep = next(c for c in cmds if "./scripts/deploy.sh" in c)
+    assert "deploy.sh dsh-01" in dep and "DSH_IMAGE" not in dep
     # plan 步骤日志要说明用哪个准备好的版本
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
     logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs",

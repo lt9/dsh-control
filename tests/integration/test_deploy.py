@@ -39,8 +39,9 @@ async def test_deploy_full_flow_with_derived_names(env):
     assert "frp.ensure dsh_01 remote=4893 local=192.0.2.10" in journal
     # NG 回源必须用站点声明的 frps_upstream_host（198.51.100.9），不是 ingress_ip
     assert "ng.ensure dsh-01.example.test DSH_01 198.51.100.9:4893" in journal
-    assert "new-instance.sh 'dsh-01'" in journal
-    assert "deploy.sh 'dsh-01'" in journal
+    # kit 的接口：new-instance.sh <名字> <宿主机端口>，端口是第 2 个位置参数
+    assert "new-instance.sh dsh-01 4893" in journal
+    assert "deploy.sh dsh-01" in journal
     assert "verify.sh 'dsh-01'" in journal
 
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()

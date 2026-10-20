@@ -8,6 +8,7 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from sqlalchemy import select
@@ -400,20 +401,50 @@ async def run_deploy(ctx: JobCtx) -> None:
     # 契约：此步失败「保留现场，标 error」——从这里开始不再回滚已建对象。
     async with ctx.step(60, "container_deploy", "主机上部署容器（kit 脚本）"):
         ctx.rollback_actions.clear()
-        env = (
-            f"DSH_IMAGE='{image}' "
-            f"PUBLIC_URL='{public_url}' TRUSTED_HOSTS='{dns_name}' "
-            f"CONTAINER_PORT='{inst.container_port}' DOCUMENTS_DIRECTORY='{data_dir}'"
-        )
         kit = host.kit_path
+        inst_dir = f"{kit}/instances/{slug}"
+        env_file = f"{inst_dir}/.env"
+        port = int(inst.container_port or 0)
+        # kit 的接口是**位置参数**：new-instance.sh <名字> <宿主机端口>；它只认
+        # DATA_ROOT / LAN_IP 两个环境变量，别的一概不读。此前我们把端口塞进
+        # CONTAINER_PORT 环境变量，脚本当场报「用法：… <宿主机端口>」（现网实测）。
+        # 目录已存在就不再重建：续建要沿用上次建好的实例目录（幂等续跑）。
         r = await ctx.ssh(
-            f"cd '{kit}' && {env} ./scripts/new-instance.sh '{slug}'", timeout=600
-        )
+            f"if [ -d {shlex.quote(inst_dir)} ]; then "
+            f"echo '[kit] 实例目录已存在，续建沿用'; "
+            f"else cd {shlex.quote(kit)} && DATA_ROOT={shlex.quote(host.data_root)} "
+            f"./scripts/new-instance.sh {shlex.quote(slug)} {port}; fi", timeout=600)
         if not r.ok:
             raise StepFailed(f"new-instance.sh 失败: {r.tail()}")
+        for line in (r.stdout or "").splitlines():
+            if line.strip():
+                await ctx.log("info", f"[kit] {line.strip()}"[:200])
+        # 公网那两条 kit 不管（它只预填局域网白名单）：TRUSTED_HOSTS 少了域名，
+        # DSH 准入墙会把 /api 判 403；PUBLIC_URL 缺了，容器日志里打的一键登录地址
+        # 就是局域网地址，抓到的 token 拼出的链接对外没用。镜像也在这里落到 .env。
+        patch = "\n".join([
+            "set -e",
+            f"f={shlex.quote(env_file)}",
+            'th="$(sed -n "s/^TRUSTED_HOSTS=//p" "$f" | tail -1)"',
+            f'case ",$th," in ",{dns_name},"*) : ;;',
+            f'*) sed -i "s|^TRUSTED_HOSTS=.*|TRUSTED_HOSTS=$th,{dns_name}|" "$f" ;;',
+            "esac",
+            (f'if grep -q "^PUBLIC_URL=" "$f"; then '
+             f'sed -i "s|^PUBLIC_URL=.*|PUBLIC_URL={public_url}|" "$f"; '
+             f'else printf "PUBLIC_URL=%s\\n" {shlex.quote(public_url)} >> "$f"; fi'),
+            (f'if grep -q "^DSH_IMAGE=" "$f"; then '
+             f'sed -i "s|^DSH_IMAGE=.*|DSH_IMAGE={image}|" "$f"; '
+             f'else printf "DSH_IMAGE=%s\\n" {shlex.quote(image)} >> "$f"; fi'),
+            'grep -E "^(HOST_PORT|TRUSTED_HOSTS|PUBLIC_URL|DSH_IMAGE|DATA_DIR)=" "$f"',
+        ])
+        r = await ctx.ssh(f"sh -c {shlex.quote(patch)}", timeout=120)
+        if not r.ok:
+            raise StepFailed(f"给实例 .env 追加公网配置失败: {r.tail()}")
+        for line in (r.stdout or "").splitlines():
+            if line.strip():
+                await ctx.log("info", f"[env] {line.strip()}"[:200])
         r = await ctx.ssh(
-            f"cd '{kit}' && {env} ./scripts/deploy.sh '{slug}'", timeout=900
-        )
+            f"cd {shlex.quote(kit)} && ./scripts/deploy.sh {shlex.quote(slug)}", timeout=900)
         if not r.ok:
             raise StepFailed(f"deploy.sh 失败: {r.tail()}")
         rt = ctx.runtime()
