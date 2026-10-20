@@ -217,14 +217,18 @@ class JobCtx:
     # ---- SSH
 
     async def ssh(self, command: str, *, timeout: float = 300,
-                  stdin: str | None = None) -> ExecResult:
+                  stdin: str | None = None, quiet: bool = False) -> ExecResult:
         """stdin 是给密钥用的：不进 command，因此不进日志、不进目标机的 ps。"""
         ep = self.endpoint()
         buf: list[tuple[str, str]] = []
+        # quiet：这条命令的 stdout 不进任务日志。自检类命令（读整份配置来判定）
+        # 输出上千行，灌进日志就把真正的部署过程埋了——页面要"点对点看进度"，
+        # 日志就得只讲发生了什么（判定结果自己写一行结论）。
         result = await self.executor().run(
             host=ep.host, port=ep.port, user=ep.user,
             private_key_pem=ep.private_key_pem, command=command,
-            timeout=timeout, line_sink=self.buffered_sink(buf), stdin=stdin,
+            timeout=timeout, stdin=stdin,
+            line_sink=None if quiet else self.buffered_sink(buf),
         )
         await self.flush_lines(buf)
         await self.log("info", f"$ {redact_text(command)}  -> exit {result.code}")

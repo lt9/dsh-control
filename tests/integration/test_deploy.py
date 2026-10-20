@@ -516,3 +516,25 @@ async def test_created_row_already_carries_kit_container_name(env):
         inst = await repo.get_instance(s, r.json()["instance_id"])
         assert inst.container_name == f"dsh-{inst.slug}"
         assert inst.container_name != inst.slug
+
+
+async def test_safety_gate_does_not_flood_job_log(env):
+    """自检读的是整份配置（上千行），不许把它灌进任务日志——页面要"点对点看进度"，
+    日志被 dump 淹了，部署过程就没人看得见。"""
+    from dsh_control.integrations.base import ExecResult
+
+    big = ("config:\n  providers:\n    local:\n"
+           "      baseURL: https://llm.example.test:8000/v1\n"
+           + "".join(f"# 填充行 {i}\n" for i in range(1200))
+           + "".join(f"- id: {p}\n  disabled: true\n"
+                     for p in ("llm-deepseek", "llm-deepseek-account", "deepseek-account",
+                               "session-log-deepseek", "plugin-package-inventory-deepseek",
+                               "authorization"))
+           + "- id: web-deepseek-api\n")
+    env.providers.executor.handlers.insert(0, ("dump-config", ExecResult(0, big, "")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    assert (await env.client.get(f"/api/jobs/{body['job_id']}")).json()["state"] == "succeeded"
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
+    assert not any("填充行" in it["line"] for it in logs), "配置正文不许进日志"
+    assert any("安全门" in it["line"] for it in logs), "但判定结论必须留一行"

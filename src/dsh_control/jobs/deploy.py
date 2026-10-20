@@ -635,7 +635,7 @@ async def run_deploy(ctx: JobCtx) -> None:
         gate = await ctx.ssh(
             f"docker exec {shlex.quote(inst.container_name or names.container)} sh -c "
             + shlex.quote('cd "${DSH_HOME:-/data}" && dsh web --dump-config'),
-            timeout=180)
+            timeout=180, quiet=True)  # 整份配置不进日志，只写一行结论
         bad = config_violations(gate.stdout or "", base_url=ctx.settings.llm_base_url)
         if bad:
             raise StepFailed("安全门不通过（花钱/外传这两条不外包给脚本）：\n  - "
