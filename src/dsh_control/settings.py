@@ -14,12 +14,18 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 少数配置项的 env 名不是「DSHC_ + 字段名大写」（lead 定的对外名），显式登记：
+# 字段 -> 环境变量首选名。docs/SITE-CONFIG.md 与此保持一致。
+ENV_NAMES: dict[str, str] = {"dsh_image": "DSHC_IMAGE"}
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="DSHC_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_prefix="DSHC_", env_file=".env", env_file_encoding="utf-8",
+        extra="ignore", populate_by_name=True
     )
 
     # ---- 必填（无站点默认值）
@@ -48,7 +54,10 @@ class Settings(BaseSettings):
     wildcard_cert_name: str = ""      # DSHC_WILDCARD_CERT_NAME：NG 建站用的现成通配证书名
 
     # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
-    dsh_image: str = ""               # DSHC_IMAGE：默认部署镜像，如 dsh-family:v1.2.3
+    # 默认部署镜像标签（准备好的版本，如 registry.local/dsh:stable）
+    dsh_image: str = Field(default="",
+                           validation_alias=AliasChoices("DSHC_IMAGE", "DSHC_DSH_IMAGE",
+                                                         "dsh_image"))
 
     # ---- provider 注册表选择（site.toml [providers]；noop = 该层人工做，步骤标 skipped）
     provider_dns: str = "noop"        # aliyun | noop
@@ -78,9 +87,10 @@ class Settings(BaseSettings):
         """站点事实缺失时的统一报错，不带着空值往下走。"""
         value = getattr(self, field, "")
         if not value:
+            env_name = ENV_NAMES.get(field, f"DSHC_{field.upper()}")
             raise RuntimeError(
                 f"缺少站点配置 {field}：先 cli seed --site deploy/site.toml，"
-                f"或设置环境变量 DSHC_{field.upper()}"
+                f"或设置环境变量 {env_name}"
             )
         return str(value)
 

@@ -38,7 +38,7 @@ ng = "nginxwebui"                     # nginxwebui | noop
 
 [[credentials]]
 kind = "aliyun_ak"
-name = "pipboy-dns"
+name = "prod-dns"
 env = { access_key_id = "DSHC_ALIYUN_AK", access_key_secret = "DSHC_ALIYUN_SK" }
 
 [[credentials]]

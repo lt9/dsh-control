@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from ..db import repo
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
+from ..domain.frp_port import pick_free_port
 from ..domain.slug import derive, dns_rr
 from .capture import capture_token
-from ..domain.frp_port import pick_free_port
 from .runner import JobCtx, StepFailed
 
 
@@ -71,7 +71,10 @@ async def run_deploy(ctx: JobCtx) -> None:
         # NG 回源地址必须站点显式声明（DSHC_FRPS_UPSTREAM_HOST / site.toml）：
         # 代码里不许猜、不许回落 ingress_ip——云上无 NAT 回环，公网 IP 在入口机上不通。
         frps_host = ctx.settings.require("frps_upstream_host")
+        image = ctx.settings.require("dsh_image")
         await ctx.log("info", f"slug={slug} 域名={dns_name} 容器={names.container}")
+        await ctx.log("info", f"镜像（准备好的版本，开通阶段永不构建）：{image}"
+                              "——20 步会在目标主机上核验它在位")
         await ctx.log("info", f"NG 将以 {frps_host} 回源（frps 监听地址，"
                               "需 NG 容器视角可达；本站若 NG 为 host 网络通常填 127.0.0.1）")
         if _manual(ctx, "dns"):
@@ -102,10 +105,28 @@ async def run_deploy(ctx: JobCtx) -> None:
         )
         if not r.ok:
             raise StepFailed(f"主机预检失败: {r.tail()}")
+        # 镜像在位检查：开通常驻「准备好的版本」（DSHC_IMAGE），不在就现在拦下，
+        # 别等 DNS/隧道/站点都建好了才发现没镜像可跑。
+        img_fmt = "docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'"
+        r_img = await ctx.ssh(
+            f"docker image inspect '{image}' >/dev/null 2>&1 "
+            f"&& echo '[image] PRESENT' || echo '[image] MISSING'; "
+            f"{img_fmt} | grep -i dsh || true")
+        for line in (r_img.stdout or "").splitlines():
+            if line.strip():
+                await ctx.log("info", f"[image] {line.strip()}")
+        if "[image] MISSING" in (r_img.stdout or ""):
+            have = "; ".join(
+                ln.strip() for ln in (r_img.stdout or "").splitlines()
+                if ln.strip() and "[image]" not in ln) or "（无 dsh 相关镜像）"
+            raise StepFailed(
+                f"{host.name} 上没有镜像 {image}。先搬运过去："
+                f"cli images ship --tag {image} --from <有此镜像的主机> "
+                f"--to {host.name}（该机现有 dsh 镜像：{have}）")
         rendered = default_rendered(
             slug=slug, public_url=public_url, trusted_hosts=[dns_name],
             container_port=0, frp_remote_port=0, data_dir=data_dir,
-            image_tag="dsh-family:local",
+            image_tag=image,
         )
         await repo.add_config_snapshot(ctx.s, inst.id, CONFIG_VERSION, rendered)
 
@@ -268,6 +289,7 @@ async def run_deploy(ctx: JobCtx) -> None:
     async with ctx.step(60, "container_deploy", "主机上部署容器（kit 脚本）"):
         ctx.rollback_actions.clear()
         env = (
+            f"DSH_IMAGE='{image}' "
             f"PUBLIC_URL='{public_url}' TRUSTED_HOSTS='{dns_name}' "
             f"CONTAINER_PORT='{inst.container_port}' DOCUMENTS_DIRECTORY='{data_dir}'"
         )

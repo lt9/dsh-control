@@ -96,6 +96,20 @@ async def run_expose(
     summary: dict[str, Any] = {"hostname": hostname, "rr": rr,
                                "dns": "?", "frp": "?", "ng": "?", "probe": "?"}
 
+    def manual_layer(name: str) -> bool:
+        return bool(getattr(getattr(providers, name), "manual_required", False))
+
+    async def drain_manual(name: str) -> None:
+        """noop 层的结构化人工指令必须原样打出来，否则运维不知道要做什么。"""
+        prov = getattr(providers, name)
+        drain = getattr(prov, "drain_manual_actions", None)
+        if drain is None:
+            return
+        for act in drain():
+            await log("warn", act.line())
+            for ins in act.instructions:
+                await log("warn", f"    {ins}")
+
     async def persist(s: Any, saved: dict[str, Any], **updates: Any) -> None:
         clean = {k: v for k, v in updates.items() if not _synthetic_id(v)}
         saved.update(clean)
@@ -125,11 +139,15 @@ async def run_expose(
                 await persist(s, saved, dns_record_id=existing.record_id)
         else:
             rec = await providers.dns.create(rr, ingress_ip, ttl=600)
+            await drain_manual("dns")
             back = None if _synthetic_id(rec.record_id) else await providers.dns.find(rr)
             rid = (back.record_id if back else rec.record_id)
-            summary["dns"] = "dry-run" if dry_run else "created"
+            summary["dns"] = ("dry-run" if dry_run else
+                              "manual_pending" if _synthetic_id(rid) else "created")
             await log("info", f"DNS {'[dry-run] ' if dry_run else ''}A {rr} -> {ingress_ip}"
-                              f"（RecordId={rid or '（dry-run 合成）'}）")
+                              f"（RecordId={rid or '（dry-run 合成）'}）"
+                              + ("——此层是 noop，按上面指令人工建，id 不落库"
+                                 if _synthetic_id(rid) and not dry_run else ""))
             await persist(s, saved, dns_record_id=rid)
 
         # ---- 2 frp ----
@@ -144,13 +162,17 @@ async def run_expose(
         else:
             port = await pick_free_port(
                 s, providers.frp, settings,
+                skip_probe=manual_layer("frp"),
                 extra_taken=[saved.get("frp_remote_port")],
                 log=lambda m: log("info", m))
             t = await providers.frp.ensure(
                 name=CONSOLE_TUNNEL, client_id=host.frpc_client_id,
                 server_id="default", local_ip=host.ssh_host,
                 local_port=settings.listen_port, remote_port=port)
-            summary["frp"] = "dry-run" if dry_run else "created"
+            await drain_manual("frp")
+            summary["frp"] = ("dry-run" if dry_run else
+                              "manual_pending" if _synthetic_id(t.proxy_id)
+                              else "created")
             await log("info", f"frp {'[dry-run] ' if dry_run else ''}隧道 {CONSOLE_TUNNEL}："
                               f"{host.ssh_host}:{settings.listen_port} -> "
                               f"公网端口 {port}（proxy_id={t.proxy_id or '（dry-run 合成）'}）")
@@ -173,7 +195,10 @@ async def run_expose(
                 upstream_server=f"{frps_host}:{port}", listen_port=443,
                 cert_name=cert, header_host="$host", websocket=True)
             await providers.ng.reload()   # ensure_site 不会自动 reload（对接要点 1）
-            summary["ng"] = "dry-run" if dry_run else "created"
+            await drain_manual("ng")
+            summary["ng"] = ("dry-run" if dry_run else
+                             "manual_pending" if _synthetic_id(site.server_id)
+                             else "created")
             await log("info", f"NG {'[dry-run] ' if dry_run else ''}站点 {hostname}："
                               f"upstream {CONSOLE_UPSTREAM} = {frps_host}:{port}，"
                               "headerHost=$host + websocket，reload 完成"

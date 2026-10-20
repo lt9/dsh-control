@@ -145,7 +145,7 @@ def test_find_exact_rr():
     assert run(api.dns().find("nothing-here")) is None
 
 
-@pytest.mark.parametrize("bad", ["www", "dshsub1", "deep.child", "dsh", ""])
+@pytest.mark.parametrize("bad", ["www", "legacy-door", "deep.child", "dsh", ""])
 def test_create_rejects_non_whitelisted_rr_without_request(bad):
     api = FakeAliyun()
     with pytest.raises(NotManaged):

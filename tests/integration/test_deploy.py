@@ -165,11 +165,11 @@ async def test_patch_notes_only(env):
     await wait_job(env.app, body["job_id"])
     iid = body["instance_id"]
     r = await env.client.patch(f"/api/instances/{iid}",
-                               json={"owner_label": "老婆用", "note": "先开着"},
+                               json={"owner_label": "家人用", "note": "先开着"},
                                headers=XRW)
     assert r.status_code == 200
     d = r.json()
-    assert d["owner_label"] == "老婆用" and d["note"] == "先开着"
+    assert d["owner_label"] == "家人用" and d["note"] == "先开着"
     # slug / 域名不可改
     assert d["slug"] == "dsh-01"
     r = await env.client.patch(f"/api/instances/{iid}", json={"note": "x"})

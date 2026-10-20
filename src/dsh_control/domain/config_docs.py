@@ -49,9 +49,16 @@ _ITEMS: list[dict[str, Any]] = [
                 "这个目录连同容器、镜像一律保留，绝不删除。",
     },
     {
+        # 展示条目：镜像的来龙去脉（值与 IMAGE_TAG 同源，都是站点配置的默认版本）
+        "key": "image",
+        "label": "镜像",
+        "help": "镜像是事先构建好传到那台机器上的，控制台不构建；"
+                "换版本是以后的能力，现在固定用站点配置的默认版本",
+    },
+    {
         "key": "IMAGE_TAG",
         "label": "镜像标签",
-        "help": "被管主机上 dsh-family 套件构建出的本地镜像，默认 dsh-family:local。"
+        "help": "部署时选定的镜像标签；来自站点配置 DSHC_IMAGE（准备好的版本，开通阶段不构建）。"
                 "换版本走部署，不在这里改。",
     },
     {
@@ -102,6 +109,7 @@ def default_rendered(*, slug: str, public_url: str, trusted_hosts: list[str],
         "DOCUMENTS_DIRECTORY": data_dir,
         "DATA_DIR": data_dir,
         "IMAGE_TAG": image_tag,
+        "image": image_tag,
         "RESTART_POLICY": "unless-stopped",
         "TZ": "Asia/Shanghai",
         "SLUG": slug,

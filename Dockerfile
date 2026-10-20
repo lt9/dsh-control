@@ -42,8 +42,7 @@ RUN pip install --no-cache-dir \
     "pydantic-settings>=2.6,<3" \
     "httpx>=0.27,<1" \
     "sse-starlette>=2.1,<3" \
-    "cryptography>=43,<46" \
-    "paramiko>=3.5,<4"
+    "cryptography>=43,<46"
 
 COPY pyproject.toml README.md ./
 COPY src ./src

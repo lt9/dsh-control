@@ -85,7 +85,7 @@ hosts              被管主机
   id, name UNIQUE, ssh_host, ssh_port, ssh_user, ssh_credential_id,   # 逻辑指向 credentials.id，无外键
   docker_context, kit_path,                 # dsh-family 仓库在被管机上的路径
   data_root,                                # 实例数据根目录（必须落在机械盘）
-  frpc_client_id,                           # frp-panel 里的客户端 id，例 tuan.c.TuanCloud@1
+  frpc_client_id,                           # frp-panel 里的客户端 id，例 office-frpc@1
   enabled bool, note, created_at, updated_at
 
 instances          DSH 实例（一个容器 = 一个人）
@@ -171,28 +171,65 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 
 ```json
 {
-  "id": 1, "slug": "dshsub2", "owner_label": "老婆", "host": {"id":1,"name":"nas-8"},
+  "id": 1, "slug": "dsh-02", "owner_label": "家人", "host": {"id":1,"name":"nas-8"},
   "state": "running", "desired_state": "running",
   "dsh_version": "1.x.y", "image_tag": "dsh-family:local", "image_id": "5023c780",
   "config_version": "v1",
   "config": {"items": [{"key":"documentsDirectory","value":"/data","label":"工作区根目录",
                        "help":"DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配"}]},
-  "network": {"dns_name":"dshsub2.pipboy.cn","public_url":"https://dshsub2.pipboy.cn",
-              "frp_remote_port":4893,"frp_proxy_id":575,"dns_record_id":"2112...","container_ip":"172.27.0.3"},
+  "network": {"dns_name":"dsh-02.example.com","public_url":"https://dsh-02.example.com",
+              "frp_remote_port":4893,"frp_proxy_id":575,"dns_record_id":"2112...","container_ip":"192.0.2.5"},
   "runtime": {"docker_state":"running","health":"healthy","restart_count":0,
               "cpu_pct":0.4,"mem_usage_bytes":280000000,"mem_limit_bytes":4294967296,
               "captured_at":"2026-10-20T21:40:00+08:00"},
-  "access": {"has_token": true, "token_masked": "M1jq…IV0", "url": "https://dshsub2.pipboy.cn/?token=…",
+  "access": {"has_token": true, "token_masked": "M1jq…IV0",
              "captured_at":"2026-10-20T21:37:36+08:00"},
   "last_error": null, "released_at": null, "actions": {"restart": true, "release": true}
 }
 ```
 
-`access.url` 与 `access.token` 是完整值：详情页就是要给运维用的一键地址。它们**只**在详情
-与 `/token` 两个接口出现，列表接口绝不返回。
+`access` 只有 `has_token` / `token_masked` / `captured_at` 三个字段，**没有任何完整值**。
+完整 token 与含 token 的一键地址只在 reveal 动作 `GET /api/instances/{id}/token` 里出现，
+详情页进页面和每次刷新都调它现取——用户要的「详情页永远是最新的登录密钥」由这条满足，
+而不是把密钥摊在每次详情响应里。列表接口连 mask 都不给。
+把完整值放进详情等于多一处泄露面：详情会被缓存、被日志抓到、被随手截图分享，
+而 reveal 是一次有意的动作，还要求 `X-Requested-With` 头。
 
 `config.items[].help` 就是详情弹窗里那个「？」的文案来源，写在代码里的静态字典
 （`domain/config_docs.py`），首期不做在线编辑；配置版本 `v1` 定义也在代码里，UI 不暴露编辑。
+
+### 4.1 错误响应机器码清单（前端照表映射，别靠猜）
+
+所有本 API 主动返回的错误统一形态：HTTP 状态码 + JSON
+`{"ok": false, "error": "<机器码>", ...可选补充字段}`。
+机器码是唯一稳定契约，文案前端自己组织。
+
+| 机器码 | HTTP | 触发场景 | 建议人话 |
+|---|---|---|---|
+| `bad_key` | 401 | 登录时运维密钥不对 | 密钥不对，再试一次 |
+| `unauthenticated` | 401 | 未登录 / cookie 过期，访问任何需鉴权接口 | 登录过期了，重新登录 |
+| `not_initialized` | 500 | 库里还没有 operator_key（没跑 `cli init`） | 系统未初始化，联系运维跑 init |
+| `rate_limited` | 429 | 登录按 IP 限流命中 | 试得太快，等一分钟再试 |
+| `missing_x_requested_with` | 403 | 写请求没带 `X-Requested-With` 头 | 页面脚本异常，刷新重试 |
+| `not_found` | 404 | 实例/任务 id 不存在（含静态资源兜底） | 找不到了，回列表看看 |
+| `host_not_found` | 404 | `/token` reveal 时实例所在主机不存在 | 主机登记丢了 |
+| `token_not_found` | 502 | reveal 时容器里抓不到最新 token | 刚从容器日志抓不到新地址，先确认容器在跑再重试 |
+| `no_enabled_host` | 422 | 新建实例但 hosts 里无可用主机（自动选机） | 没有能用的主机，先 seed/启用主机 |
+| `host_not_available` | 422 | 指定 host_id 但该机禁用或数据盘不可用 | 这台机现在不能接单 |
+| `site_not_seeded` | 422 | 缺站点级配置（域名 zone/入口 IP 等）就尝试部署 | 站点还没 seed，先 `cli seed --site …` |
+| `cannot_restart_from_<state>` | 409 | 从 released 等非 running/error 状态发起重启 | 当前状态不能重启 |
+| `confirm_mismatch` | 422 | 释放确认词与 slug 不一致 | 确认词不对，输入框里输入实例名 |
+| `already_released` | 409 | 重复释放 | 已经释放过了 |
+
+不在表里但会遇到的两种：
+
+- **请求体校验失败**：FastAPI 原生 422，`detail` 是数组不是 `{ok:false}` 形态——
+  本系统所有请求体字段都是可选/宽松的，正常 UI 流不会触发；碰到即 bug。
+- **任务失败**不在此表：job 的失败看 `GET /api/jobs/{id}` 的 `error`
+  （已脱敏文本），不是 HTTP 错误响应。
+
+> 没有 `dry_run` / `not_managed` 这类 HTTP 码：dry-run 与 noop 只存在于 CLI
+> （`cli expose --dry-run` / providers=noop），API 层永远真执行。
 
 ## 5. 外部集成适配器（全部已实测，签名照抄）
 
@@ -214,7 +251,7 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 
 ### 5.2 frp-panel `integrations/frp_panel.py`
 
-Base：`http://8.134.168.14:9000`（VPS，`frp-panel`，无文档，以下均已实测）。
+Base：`http://203.0.113.10:9000`（VPS，`frp-panel`，无文档，以下均已实测）。
 登录：`POST /api/v1/auth/login {username,password}` → cookie `frp-panel-cookie`（JWT，
 httpOnly）；另有 `x-set-authorization` 头可用。响应统一 `{code,msg,body}`，`code!=200` 抛错。
 
@@ -230,25 +267,25 @@ httpOnly）；另有 `x-set-authorization` 头可用。响应统一 `{code,msg,b
 `{name, type:"tcp", transport:{bandwidthLimit:""}, loadBalancer:{group:""}, healthCheck:{type:"",
 intervalSeconds:0}, localIP, localPort, plugin:null, remotePort}`。
 本控制台建的隧道 `name` 固定 `dshctl_<slug>`，服务端 `server_id=default`，
-客户端取 `hosts.frpc_client_id`（`dshsub1` 现挂在 `tuan.c.TuanCloud@1`，因为它用内网 IP 直连 NAS）。
+客户端取 `hosts.frpc_client_id`（`legacy-door` 现挂在 `office-frpc@1`，因为它用内网 IP 直连 NAS）。
 **现有隧道一条都不许改。**
 
 ### 5.3 阿里云解析 `integrations/aliyun_dns.py`
 
 RPC 签名 v1（HMAC-SHA1），endpoint `alidns.aliyuncs.com`。只用三个 Action：
 `DescribeDomainRecords`（查，含按 RR 精确查）、`AddDomainRecord`、`DeleteDomainRecord`。
-硬白名单：`DomainName` 必须等于 `DSHC_DNS_ZONE`（默认 `pipboy.cn`），`RR` 必须以
+硬白名单：`DomainName` 必须等于 `DSHC_DNS_ZONE`（默认 `example.com`），`RR` 必须以
 `DSHC_DNS_PREFIX`（默认 `dsh-`）或 `dshctl` 开头，否则拒绝。`RR` 只能是**一级**子域
-（不含点），因为现成证书 `CN=*.pipboy.cn`、SAN 只有 `*.pipboy.cn` 与 `pipboy.cn`，
-通配符只覆盖一层；`wife.dsh.pipboy.cn` 这种两级名字会撞上证书不覆盖。本控制台**不申请
+（不含点），因为现成证书 `CN=*.example.com`、SAN 只有 `*.example.com` 与 `example.com`，
+通配符只覆盖一层；`wife.dsh.example.com` 这种两级名字会撞上证书不覆盖。本控制台**不申请
 自己的证书**，只复用 NG 里 acme.sh 自动续期的那张通配证书。记录固定 `Type=A`、
-`Value=DSHC_INGRESS_IP`（默认 `8.134.168.14`）、`TTL=600`。删除只按 `RecordId`，且该 id
-必须是库里登记过的。已实测：`pipboy.cn` 共 74 条，`dshsub1 A → 8.134.168.14`
+`Value=DSHC_INGRESS_IP`（默认 `203.0.113.10`）、`TTL=600`。删除只按 `RecordId`，且该 id
+必须是库里登记过的。已实测：`example.com` 共 74 条，`legacy-door A → 203.0.113.10`
 `RecordId=2112523148163198976`。
 
 ### 5.4 nginxWebUI `integrations/ng_panel.py`
 
-Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*` 要 `token` 头
+Base：`http://203.0.113.10:18180`，账号在 `credentials(ng_panel)`。`/api/*` 要 `token` 头
 （登录接口换取），文档在 jar 的 `static/doc/*.html`：`ServerApiController`、`UpstreamApiController`。
 **没有 LocationApiController**，location 靠 `ServerApiController` 的嵌套字段下发。
 
@@ -262,7 +299,7 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 
 ### 5.5 首发验证顺序
 
-控制台自身就是第一个实例：`dshctl.pipboy.cn`。部署时按 DNS → frp → NG → 探活的顺序创建，
+控制台自身就是第一个实例：`dshctl.example.com`。部署时按 DNS → frp → NG → 探活的顺序创建，
 每一步都先 dry_run 打印将要发出的请求，再真做，做完立刻回读核对（`list_configs` 里能查到
 自己的隧道、`DescribeDomainRecords` 里能查到自己的记录）。**这是唯一允许对 frp/NG/DNS
 写数据的场景，作用域只有这一条新对象。**
@@ -289,8 +326,8 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 
 `slug` 就是域名标签，同时当释放时的二次确认词，三处必须一致：
 
-- 形态：`dsh-NN`（两位零填充，`dsh-01`、`dsh-02`…），完整域名 `dsh-NN.pipboy.cn`。
-  只能是**一级**子域：现成证书 `CN=*.pipboy.cn`、SAN 只有 `*.pipboy.cn` 与 `pipboy.cn`，
+- 形态：`dsh-NN`（两位零填充，`dsh-01`、`dsh-02`…），完整域名 `dsh-NN.example.com`。
+  只能是**一级**子域：现成证书 `CN=*.example.com`、SAN 只有 `*.example.com` 与 `example.com`，
   通配符只覆盖一层，两级名字会证书不覆盖。本控制台**不申请自己的证书**，只复用 NG 里
   acme.sh 自动续期那张。
 - **不允许用户输入或修改标签**。新建流程里标签由服务端按 `dsh-` + 现有实例最大序号 + 1
@@ -302,7 +339,7 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
   点铅笔就地改，改它不影响域名、容器名或任何外部对象。
 - 派生名一律从 slug 出：容器名 `dsh-NN`、隧道名 `dsh_NN`（点换下划线）、NG upstream
   `DSH_NN`、NG 站点 `server_name` 用完整域名。
-- 历史遗留的 `dshsub1` 不参与推导也不改名，它由人工拆除（docs/SEED.md §2）。
+- 历史遗留的 `legacy-door` 不参与推导也不改名，它由人工拆除（站点私有手册（不随仓库发布） §2）。
 
 #### 6.1.2 镜像是准备好的，不是现场构建的
 
@@ -336,8 +373,8 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 单容器 `dsh-control`：FastAPI 直接 serve 前端构建产物（`frontend/dist` 打进镜像），
 一个进程同时给 API 和静态页，避免跨域与第二个服务。监听 `DSHC_LISTEN_PORT=13300`。
 
-- 连 PG：加入 `tierai-prod_default` 网络，`DSHC_DATABASE_URL=postgresql+asyncpg://tierai:…@172.19.0.6:5432/dsh_control`
-- 出公网：`dshctl.pipboy.cn` → NG → frps → `192.168.3.109:13300`
+- 连 PG：加入 `tierai-prod_default` 网络，`DSHC_DATABASE_URL=postgresql+asyncpg://tierai:…@198.51.100.6:5432/dsh_control`
+- 出公网：`dshctl.example.com` → NG → frps → `192.0.2.10:13300`
 - 迁到 .8：换一份 `.env`（PG 地址、监听端口、frpc 客户端、数据根目录）重起即可，
   代码里不允许出现任何写死的机器地址，全部走环境变量或 `hosts` 表。
 
@@ -348,10 +385,10 @@ DSHC_DATABASE_URL            必填
 DSHC_SESSION_SECRET          必填，cookie 签名密钥
 DSHC_LISTEN_HOST/PORT        0.0.0.0 / 13300
 DSHC_SESSION_DAYS            默认 7
-DSHC_INGRESS_IP              8.134.168.14
-DSHC_DNS_ZONE                pipboy.cn
+DSHC_INGRESS_IP              203.0.113.10
+DSHC_DNS_ZONE                example.com
 DSHC_DNS_PREFIX              dsh-
-DSHC_PUBLIC_BASE             https://dshctl.pipboy.cn
+DSHC_PUBLIC_BASE             https://dshctl.example.com
 DSHC_BACKUP_WINDOW           03:20-04:00
 DSHC_RESTART_COOLDOWN        600
 DSHC_POLL_INTERVAL           30

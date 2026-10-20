@@ -1,4 +1,4 @@
-"""命令行：init / seed / migrate / serve。
+"""命令行：init / seed / migrate / expose / images / serve。
 
 - `init`：只做两件事——跑迁移建表 + 生成运维密钥（打印一次，库里存明文可读回）。
   **零站点数据**（docs/SITE-CONFIG.md：数据全走 seed）。
@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy import select
 
 from .db import repo
-from .db.models import Host
+from .db.models import Credential, Host
 from .db.session import Db, make_db
 from .jobs.runner import redact_text
 from .settings import get_settings
@@ -195,6 +195,101 @@ def cmd_seed(site_path: str) -> None:
     print(f"seed 完成：hosts={n_host}, credentials={n_cred}（密钥值一律不打印）")
 
 
+# ---------------------------------------------------------------- providers 装配
+
+def _make_db(settings):
+    return make_db(settings.require("database_url"))
+
+
+async def _aload_providers(db, settings):
+    """cli 侧与 main.lifespan 同款装配：库里的 credentials 全量交给 registry。
+
+    只能在命令自己那一个事件循环里 await。之前这里是 `_providers_from_db()`：
+    内部先 `asyncio.run` 一次，把 asyncpg 连接绑到第一个循环上然后循环就关了，
+    命令随后又 `asyncio.run` 用同一个 engine，于是 `Future attached to a
+    different loop` + `Event loop is closed`——一跑 expose 就炸。
+    """
+    from .integrations import registry
+
+    async with db.session() as s:
+        creds = (await s.scalars(select(Credential))).all()
+    return registry.build_providers(
+        settings, [{"kind": c.kind, "name": c.name, "secret": c.secret or {}}
+                   for c in creds])
+
+
+# ---------------------------------------------------------------- expose
+
+def cmd_expose(dry_run: bool = False) -> None:
+    """给主控台自己的公网入口开三处外部对象（幂等，只创建不删除）。"""
+    from .console import run_expose
+
+    settings = get_settings()
+    if dry_run:
+        settings.dry_run = True
+    db = _make_db(settings)
+
+    async def _go():
+        async def log(level: str, msg: str) -> None:
+            print(f"[{level}] {msg}")
+        providers = None
+        try:
+            providers = await _aload_providers(db, settings)
+            return await run_expose(db, providers, settings, dry_run=dry_run, log=log)
+        finally:
+            if providers is not None:
+                close = getattr(providers, "aclose", None)
+                if close is not None:
+                    await close()
+            await db.engine.dispose()
+
+    try:
+        asyncio.run(_go())
+    except RuntimeError as exc:
+        raise SystemExit(f"expose 中止：{exc}") from exc
+
+
+# ---------------------------------------------------------------- images
+
+def cmd_images(args: argparse.Namespace) -> None:
+    """镜像排障/搬运（契约 §6.1.2：镜像是准备好的，不是现场构建的）。"""
+    from .images import image_ls, ship_image
+
+    settings = get_settings()
+    db = _make_db(settings)
+
+    async def _go():
+        providers = None
+        try:
+            providers = await _aload_providers(db, settings)
+            if args.images_cmd == "ls":
+                return await image_ls(db, providers, args.host)
+            return await ship_image(db, providers, tag=args.tag,
+                                    src_ref=args.src, dst_ref=args.dst)
+        finally:
+            if providers is not None:
+                close = getattr(providers, "aclose", None)
+                if close is not None:
+                    await close()
+            await db.engine.dispose()
+
+    try:
+        out = asyncio.run(_go())
+    except RuntimeError as exc:
+        raise SystemExit(f"images {args.images_cmd} 失败：{exc}") from exc
+    if args.images_cmd == "ls":
+        if not out:
+            print("该机没有 dsh 相关镜像（cli images ship 可以从别处搬）")
+        for row in out:
+            print(f"{row['tag']:48s} {row['size']}")
+    else:
+        mb = out["bytes"] / 1e6
+        print(f"搬运完成：{out['tag']}  {out['src']} -> {out['dst']}  "
+              f"{out['bytes']} 字节（{mb:.1f} MB），耗时 {out['seconds']}s")
+        if out.get("loaded"):
+            print(out["loaded"])
+
+
 # ---------------------------------------------------------------- serve
 
 def cmd_serve() -> None:
@@ -216,6 +311,18 @@ def main(argv: list[str] | None = None) -> None:
     p_seed = sub.add_parser("seed", help="读站点描述文件灌 hosts/credentials")
     p_seed.add_argument("--site", required=True, help="deploy/site.toml 路径")
     sub.add_parser("migrate", help="只跑 alembic upgrade head")
+    p_exp = sub.add_parser("expose",
+                           help="给主控台公网入口开 DNS/frp/NG（幂等，只创建不删除）")
+    p_exp.add_argument("--dry-run", action="store_true",
+                       help="打印将要发的每个写请求（走 recorder），一个都不发")
+    p_img = sub.add_parser("images", help="镜像在位查看与两机之间流式搬运")
+    subi = p_img.add_subparsers(dest="images_cmd", required=True)
+    p_ls = subi.add_parser("ls", help="列某主机的 dsh 相关镜像标签与大小")
+    p_ls.add_argument("--host", required=True, help="hosts.name 或 ssh_host")
+    p_sh = subi.add_parser("ship", help="docker save | docker load 内存流式搬运")
+    p_sh.add_argument("--tag", required=True, help="镜像标签（准备好的版本）")
+    p_sh.add_argument("--from", dest="src", required=True, help="源主机")
+    p_sh.add_argument("--to", dest="dst", required=True, help="目标主机")
     sub.add_parser("serve", help="启动 API + 静态页")
     args = parser.parse_args(argv)
 
@@ -225,6 +332,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_seed(args.site)
     elif args.cmd == "migrate":
         cmd_migrate(get_settings().require("database_url"))
+    elif args.cmd == "expose":
+        cmd_expose(dry_run=args.dry_run)
+    elif args.cmd == "images":
+        cmd_images(args)
     elif args.cmd == "serve":
         cmd_serve()
 

@@ -130,8 +130,11 @@ async def session(request: Request) -> dict[str, Any]:
 
 @router.get("/overview")
 async def overview(request: Request) -> dict[str, Any]:
-    async with _state(request).db.session() as s:
-        return await repo.instance_counts(s)
+    st = _state(request)
+    async with st.db.session() as s:
+        counts = await repo.instance_counts(s)
+    # 前端确认卡要把 dsh-01 显示成 dsh-01.<zone> 完整域名（空系统也显示得出来）
+    return {**counts, "dns_zone": st.settings.dns_zone}
 
 
 @router.get("/hosts")

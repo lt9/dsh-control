@@ -275,6 +275,7 @@ def make_settings(**over) -> Settings:
         "public_base": "https://console.example.test",
         "provider_dns": "aliyun", "provider_frp": "frp_panel", "provider_ng": "nginxwebui",
         "frp_port_start": 4893,
+        "dsh_image": "dsh-test:v9",
         "wait_healthy_seconds": 1,
         "poll_interval": 1,
     }
