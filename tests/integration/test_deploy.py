@@ -696,3 +696,19 @@ async def test_probe_still_reports_degraded_after_retries(env, monkeypatch):
     evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
     degraded = next(e for e in evs if e["kind"] == "probe_degraded")
     assert "上游不通" in degraded["message"] or "上游不通" in str(degraded["data"])
+
+
+async def test_job_payload_carries_instance_linkage(env):
+    """工单 API 必须自带实例关联：手敲 URL 打开工单页时没有 ?instance=，
+    没有这三个字段，前端就不知道那台已经回收，还会把死掉的一键地址当成能用。"""
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    j = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert j["instance_id"] == body["instance_id"], j
+    assert j["instance_slug"] == "dsh-01", j
+    assert j["instance_state"] == "running", j
+    r = await env.client.post(f"/api/instances/{body['instance_id']}/release",
+                              json={"confirm": "dsh-01"}, headers=XRW)
+    await wait_job(env.app, r.json()["job_id"])
+    j2 = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert j2["instance_state"] == "released", j2

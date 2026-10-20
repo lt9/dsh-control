@@ -69,11 +69,33 @@ def test_unreachable_mux_only():
 
 
 def test_unexpected_statuses():
-    probe, _ = probe_for(mux_status=200)
-    assert run(probe.check(BASE)).verdict == "unexpected"
     probe, _ = probe_for(home_status=502, mux_status=401)
     res = run(probe.check(BASE))
     assert res.verdict == "unexpected" and not res.ok
+
+
+def test_unprotected_mux_is_dangerous_not_unexpected():
+    """没带 token 却能打通受保护接口 = 准入墙没生效，不能只当"回包奇怪"。"""
+    probe, _ = probe_for(mux_status=200)
+    res = run(probe.check(BASE))
+    assert (res.ok, res.verdict) == (False, "auth_open"), res
+    assert "准入墙" in res.hint
+
+
+def test_home_401_counts_as_alive():
+    """DSH 开着准入墙时首页本来就 401。现网两次开通的最后一步都被判成
+    unexpected（工单写着 status=401 verdict=unexpected，事后公网实测正常），
+    标准错了就会天天假警报。"""
+    probe, _ = probe_for(home_status=401, mux_status=401)
+    res = run(probe.check(BASE))
+    assert (res.ok, res.verdict) == (True, "protected"), res
+    assert "一键地址" in res.hint
+
+
+def test_home_403_is_host_mismatch():
+    probe, _ = probe_for(home_status=403, mux_status=401)
+    res = run(probe.check(BASE))
+    assert (res.ok, res.verdict) == (False, "host_origin_mismatch"), res
 
 
 def test_bad_base_url_rejected():

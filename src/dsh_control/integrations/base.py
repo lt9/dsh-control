@@ -177,7 +177,10 @@ class DshRuntime(Protocol):
 class ProbeResult:
     ok: bool
     status_code: int
-    verdict: Literal["ok", "host_origin_mismatch", "unreachable", "unexpected"]
+    # protected = 首页也要登录（准入墙生效），这是 DSH 的正常状态；
+    # auth_open = 没带 token 的受保护接口竟然放行，属于危险状态。
+    verdict: Literal["ok", "protected", "host_origin_mismatch", "auth_open",
+                     "unreachable", "unexpected"]
     hint: str = ""
 
 

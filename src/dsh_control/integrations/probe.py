@@ -89,17 +89,42 @@ class HttpPublicProbe:
                      f"NG 上游地址填的是不是隧道真正监听的那一个",
             )
 
-        if mux.status_code == 401:
-            if 200 <= home.status_code < 300:
-                return ProbeResult(ok=True, status_code=mux.status_code, verdict="ok")
+        # DSH 开着准入墙：不带 token 时连首页都是 401（这是设计行为）。
+        # 之前把"首页 2xx"当成唯一活着的证据，结果两次开通的最后一步都被判成
+        # unexpected（工单上写着 status=401 verdict=unexpected，事后公网实测一切
+        # 正常）——标准错了就会天天假警报，真出事反而没人看。
+        if home.status_code == 403:
             return ProbeResult(
-                ok=False, status_code=home.status_code, verdict="unexpected",
-                hint=f"/api/remote.mux 正常（401 拦在没登录），但首页是 HTTP "
-                     f"{home.status_code}，看一眼容器状态",
+                ok=False, status_code=403, verdict="host_origin_mismatch", hint=_FIX_HINT,
             )
         if mux.status_code == 403:
             return ProbeResult(
                 ok=False, status_code=403, verdict="host_origin_mismatch", hint=_FIX_HINT,
+            )
+        if 200 <= mux.status_code < 300:
+            # 没带 token 却能打通受保护接口 = 准入墙没生效，绝不能当"开通成功"
+            return ProbeResult(
+                ok=False, status_code=mux.status_code, verdict="auth_open",
+                hint=f"{_MUX_PATH} 没带 token 却返回 {mux.status_code}：准入墙没生效，"
+                     "先别把这台当已开通交付",
+            )
+        if mux.status_code == 401:
+            if 200 <= home.status_code < 300:
+                return ProbeResult(
+                    ok=True, status_code=mux.status_code, verdict="ok",
+                    hint=f"首页 {home.status_code}、{_MUX_PATH} 401（拦在没登录，"
+                         "反代 Host 头形状正确）",
+                )
+            if home.status_code == 401:
+                return ProbeResult(
+                    ok=True, status_code=mux.status_code, verdict="protected",
+                    hint="首页和接口都拦在登录墙外（401）：站点活着，"
+                         "带 token 的一键地址才是入口",
+                )
+            return ProbeResult(
+                ok=False, status_code=home.status_code, verdict="unexpected",
+                hint=f"{_MUX_PATH} 正常（401 拦在没登录），但首页是 HTTP "
+                     f"{home.status_code}，看一眼容器状态",
             )
         return ProbeResult(
             ok=False, status_code=mux.status_code, verdict="unexpected",

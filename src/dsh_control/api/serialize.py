@@ -107,10 +107,16 @@ async def instance_detail(
     }
 
 
-def job_payload(job, steps) -> dict[str, Any]:
+def job_payload(job, steps, instance=None) -> dict[str, Any]:
+    """工单详情。instance 由路由单独查一次传进来（本项目不写 JOIN）——
+    没有这三个字段，手敲 URL 打开的工单页就不知道那台实例已经回收，
+    还会把死掉的一键地址当成能用的东西摆着。"""
     return {
         "id": job.id,
         "kind": job.kind,
+        "instance_id": job.instance_id,
+        "instance_slug": instance.slug if instance else None,
+        "instance_state": instance.state if instance else None,
         "state": job.state,
         "error": job.error,
         "started_at": iso(job.started_at),

@@ -410,7 +410,8 @@ async def job_detail(request: Request, job_id: int) -> dict[str, Any]:
         if job is None:
             raise HTTPException(status_code=404, detail={"ok": False, "error": "not_found"})
         steps = await repo.list_steps(s, job_id)
-        return serialize.job_payload(job, steps)
+        inst = await repo.get_instance(s, job.instance_id) if job.instance_id else None
+        return serialize.job_payload(job, steps, inst)
 
 
 @router.get("/jobs/{job_id}/logs")

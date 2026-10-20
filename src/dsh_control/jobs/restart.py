@@ -13,6 +13,14 @@ from ..db import repo
 from .capture import capture_token
 from .runner import JobCtx, StepFailed
 
+_PROBE_MEANING = {
+    "ok": "公网通了，反代 Host 头形状正确",
+    "protected": "公网通了，首页也要登录（准入墙生效）",
+    "host_origin_mismatch": "Host 与 Origin 又不相等（反代把端口拼进了 Host）",
+    "auth_open": "没带 token 的受保护接口被放行（准入墙没生效）",
+    "unreachable": "公网连不上（DNS/反代/frp/容器逐层查）",
+    "unexpected": "回包不像 DSH（确认门后面是谁）",
+}
 
 async def run_restart(ctx: JobCtx) -> None:
     inst = ctx.instance
@@ -68,7 +76,7 @@ async def run_restart(ctx: JobCtx) -> None:
         return
     async with ctx.step(40, "probe_public", "公网探活") as st:
         res = await ctx.probe().check(inst.public_url)
-        st.detail = f"status={res.status_code} verdict={res.verdict}"
+        st.detail = (f"{_PROBE_MEANING.get(res.verdict, res.verdict)}" f"（status={res.status_code}）" + (f"：{res.hint}" if res.hint else ""))
         await ctx.s.commit()
         if res.verdict == "host_origin_mismatch":
             hint = res.hint or "检查 nginxWebUI 该站 location 的 Header Host 是否为 $host"

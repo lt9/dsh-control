@@ -9,10 +9,12 @@ export default function JobPage() {
   const { id } = useParams();
   const nav = useNavigate();
   const [q] = useSearchParams();
-  const instanceId = q.get("instance") ? Number(q.get("instance")) : null;
-  const kind = (q.get("kind") as keyof typeof JOB_META) || "deploy";
   const feed = useJobFeed(id ? Number(id) : null);
   const job = feed.job;
+  // 手敲 URL 进工单页时没有 ?instance= &kind=，工单自己必须认得这台实例——
+  // 否则 DonePanel 不渲染，已回收的实例也就无从显示"地址已失效"的提示。
+  const instanceId = q.get("instance") ? Number(q.get("instance")) : (job?.instance_id ?? null);
+  const kind = ((q.get("kind") ?? job?.kind) as keyof typeof JOB_META) || "deploy";
   const done = job?.state === "succeeded" || job?.state === "failed";
   const meta = JOB_STATE_META[job?.state ?? "pending"];
 

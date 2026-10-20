@@ -244,6 +244,15 @@ async def _port_map(ctx: JobCtx, container: str) -> tuple[int, int]:
     return (0, 0)
 
 
+_PROBE_MEANING = {
+    "ok": "公网通了，反代 Host 头形状正确",
+    "protected": "公网通了，首页也要登录（准入墙生效）",
+    "host_origin_mismatch": "Host 与 Origin 又不相等（反代把端口拼进了 Host）",
+    "auth_open": "没带 token 的受保护接口被放行（准入墙没生效）",
+    "unreachable": "公网连不上（DNS/反代/frp/容器逐层查）",
+    "unexpected": "回包不像 DSH（确认门后面是谁）",
+}
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -722,7 +731,7 @@ async def run_deploy(ctx: JobCtx) -> None:
                 await ctx.log("info", f"公网探活第 {attempt} 次没过"
                                       f"（{res.verdict}），{int(_PROBE_GAP)}s 后重试")
                 await asyncio.sleep(_PROBE_GAP)
-        st.detail = f"status={res.status_code} verdict={res.verdict}（共探 {tries} 次）"
+        st.detail = (f"{_PROBE_MEANING.get(res.verdict, res.verdict)}" f"（共探 {tries} 次，status={res.status_code}）" + (f"：{res.hint}" if res.hint else ""))
         if res.verdict == "host_origin_mismatch":
             st.detail += "\n提示：反代 location 的 Header Host 必须是 $host（不能带端口）"
         await ctx.s.commit()

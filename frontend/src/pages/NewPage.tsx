@@ -15,6 +15,13 @@ export default function NewPage() {
   const ov = useAsync(() => api.overview(), []);
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
+  // 输入框收 slug（dsh-04）也收卡片上显示的那个完整域名（dsh-04.pipboy.cn）：
+  // 上一版只认 slug，页面却写着"把域名打进输入框"，不懂技术的人打到第一步就卡住。
+  const matchesTarget = (v: string) => {
+    const s = v.trim().toLowerCase();
+    if (!s || !nextSlug) return false;
+    return s === nextSlug.toLowerCase() || s === (dnsName ?? "").toLowerCase();
+  };
   const [armed, setArmed] = useState(false);
   const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -120,10 +127,10 @@ export default function NewPage() {
                 <>
                   <input className="input" type="text" value={typed} autoFocus
                     aria-label={`输入 ${nextSlug ?? "域名"} 以确认新建`}
-                    placeholder={`输入 ${nextSlug ?? "域名"} 确认`}
+                    placeholder={`输入 ${nextSlug ?? "域名"}（或完整域名）确认`}
                     onChange={(e) => setTyped(e.target.value)} />
                   <button type="button" className="btn btn-primary btn-lg"
-                    disabled={busy || typed.trim() !== nextSlug} onClick={() => void start()}>
+                    disabled={busy || !matchesTarget(typed)} onClick={() => void start()}>
                     {busy ? "已提交，正在装船…" : "确认新建"}
                   </button>
                   <button type="button" className="btn btn-ghost"
@@ -136,7 +143,7 @@ export default function NewPage() {
             {armed && (
               <p className="mut small" role="note">
                 确认：会在云上新建 DNS、隧道、反代站点并在机器上起容器。请把上面卡片里的域名
-                打进输入框才允许提交——点两下不算确认。
+                或完整域名原样打进输入框才允许提交——点两下不算确认。
               </p>
             )}
           </div>
