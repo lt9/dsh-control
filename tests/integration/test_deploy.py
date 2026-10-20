@@ -582,3 +582,50 @@ async def test_config_snapshot_labels_estimates_when_env_unreadable(env):
     assert str(kv["CONFIG_SOURCE"]).startswith("估算")
     logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
     assert any("估算" in it["line"] for it in logs)
+
+
+class _QueueProbe:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+
+    async def check(self, base_url, *, expect="dsh"):
+        self.calls += 1
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
+
+
+async def test_probe_retries_before_calling_it_degraded(env, monkeypatch):
+    """容器刚起来那几秒首页可能还回 401：单次探活会把"还没准备好"读成"坏了"
+    （现网 dsh-02 就是 401/unexpected，事后从公网实测一切正常）。"""
+    from dsh_control import jobs
+    from dsh_control.integrations.base import ProbeResult
+
+    monkeypatch.setattr(jobs.deploy, "_PROBE_GAP", 0)
+    bad = ProbeResult(False, 401, "unexpected", hint="首页 401")
+    env.providers.probe = _QueueProbe([bad, bad, ProbeResult(True, 401, "ok")])
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    st = next(s for s in job["steps"] if s["key"] == "probe_public")
+    assert "共探 3 次" in st["detail"], st["detail"]
+    evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    assert not any(e["kind"] == "probe_degraded" for e in evs), "重试过了就不算降级"
+
+
+async def test_probe_still_reports_degraded_after_retries(env, monkeypatch):
+    """真坏了也不许把开通判死（容器已起、外部对象已建，第 60 步之后不回滚），
+    但必须把"公网这条路没验证通过"喊出来，不能悄悄放行。"""
+    from dsh_control import jobs
+    from dsh_control.integrations.base import ProbeResult
+
+    monkeypatch.setattr(jobs.deploy, "_PROBE_GAP", 0)
+    env.providers.probe = _QueueProbe([ProbeResult(False, 502, "unexpected", hint="上游不通")])
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "succeeded"
+    st = next(s for s in job["steps"] if s["key"] == "probe_public")
+    assert f"共探 {jobs.deploy._PROBE_TRIES} 次" in st["detail"]
+    evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    degraded = next(e for e in evs if e["kind"] == "probe_degraded")
+    assert "上游不通" in degraded["message"] or "上游不通" in str(degraded["data"])

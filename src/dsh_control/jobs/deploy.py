@@ -8,6 +8,7 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -182,6 +183,13 @@ async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, 
                           f"（proxy_id={prior.proxy_id}，remotePort={prior.remote_port}），"
                           "沿用它的端口，不再新挑")
     return int(prior.remote_port or 0), prior
+
+
+# 公网探活的重试口径：容器刚起来的几秒里首页可能还回 401（静态壳未就绪），
+# DNS 也可能刚建还没生效。单次探活会把"还没准备好"读成"路径坏了"——现网
+# dsh-02 就是 status=401 verdict=unexpected，事后从公网实测一切正常。
+_PROBE_TRIES = 5
+_PROBE_GAP = 6.0
 
 
 async def _env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
@@ -662,8 +670,18 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 80 probe_public：首页 200 + 无 token 打 remote.mux 期望 401
     async with ctx.step(80, "probe_public", "公网探活") as st:
-        res = await ctx.probe().check(public_url)
-        st.detail = f"status={res.status_code} verdict={res.verdict}"
+        res = None
+        tries = 0
+        for attempt in range(1, _PROBE_TRIES + 1):
+            tries = attempt
+            res = await ctx.probe().check(public_url)
+            if res.ok:
+                break
+            if attempt < _PROBE_TRIES:
+                await ctx.log("info", f"公网探活第 {attempt} 次没过"
+                                      f"（{res.verdict}），{int(_PROBE_GAP)}s 后重试")
+                await asyncio.sleep(_PROBE_GAP)
+        st.detail = f"status={res.status_code} verdict={res.verdict}（共探 {tries} 次）"
         if res.verdict == "host_origin_mismatch":
             st.detail += "\n提示：反代 location 的 Header Host 必须是 $host（不能带端口）"
         await ctx.s.commit()
