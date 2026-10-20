@@ -181,15 +181,22 @@ async def run_expose(
 
         # ---- 3 NG ----
         site = await providers.ng.find_site(hostname)
-        if site is not None and not _synthetic_id(site.server_id):
+        if (site is not None and not _synthetic_id(site.server_id)
+                and site.location_id):
             summary["ng"] = "exists"
-            await log("info", f"NG 已存在：站点 {hostname} server_id={site.server_id}，跳过")
+            # 库里齐也可能 conf.d 缺文件（正是首轮事故的形状）：
+            # reload() 是 check→replace(按库重建)→nginx -s reload，幂等保物化。
+            await providers.ng.reload()
+            await log("info", f"NG 已存在：站点 {hostname} server_id={site.server_id} "
+                              f"location_id={site.location_id}，conf 已按库重建并重载")
             await persist(s, saved, ng_server_id=site.server_id,
                           ng_location_id=site.location_id,
                           ng_upstream_name=saved.get("ng_upstream_name")
                           or CONSOLE_UPSTREAM)
         else:
             cert = getattr(settings, "wildcard_cert_name", "") or None
+            # ensure_site 内含回读核验（location 读不到就抛 ng_verify_failed，
+            # 绝不带着半成品往下走）；站点在而 location 缺时它只补 location 一个写。
             site = await providers.ng.ensure_site(
                 server_name=hostname, upstream_name=CONSOLE_UPSTREAM,
                 upstream_server=f"{frps_host}:{port}", listen_port=443,
@@ -201,7 +208,8 @@ async def run_expose(
                              else "created")
             await log("info", f"NG {'[dry-run] ' if dry_run else ''}站点 {hostname}："
                               f"upstream {CONSOLE_UPSTREAM} = {frps_host}:{port}，"
-                              "headerHost=$host + websocket，reload 完成"
+                              f"location 回读确认 id={site.location_id}，"
+                              "headerHost=$host + websocket，conf 已重建并重载"
                               + ("（cert 未配置，走适配器默认）" if not cert else f"（cert={cert}）"))
             await persist(s, saved, ng_server_id=site.server_id,
                           ng_location_id=site.location_id,

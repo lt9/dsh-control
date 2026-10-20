@@ -1,23 +1,38 @@
-"""nginxWebUI 适配器（ARCHITECTURE §5.4 + docs 里的 NG 接口面）。
+"""nginxWebUI 适配器（ARCHITECTURE §5.4）。
 
 鉴权：``GET /token/getToken?name=&pass=``（明文口令，**不在 /api/ 下**）换
 ``obj.token``，之后所有 ``/api/*`` 带 ``token`` 请求头；401 自动重取一次。
 面板地址与账号全部来自构造参数。
 
-必须写对的点（都已在代码里强制）：
-- 反代必须走 location（``insertOrUpdateLocation``，``type=2`` 指 upstream），
-  服务器级反代生成的 conf 固定是 ``Host: $host:$proxy_port``，DSH 的 Origin/Host
-  准入会把它 403 掉（表现为"页面能开、remote.mux 一直重连"）。
+**写报文形状已按面板自身源码核定**（上游 cym1102/nginxWebUI 的
+``ServerApiController`` / ``Location`` 实体 / ``ConfService``，对照部署 4.2.5
+容器内嵌的 smart-doc 与前端 JS 逐项一致）：
+
+- location 参数名按 smart-doc 全集给全（camelCase，见 ``LOCATION_PARAM_FIELDS``
+  白名单，越界字段本地拒绝）。``type=2`` + ``upstreamId`` 是负载均衡反代的
+  正确写法：ConfService 该分支生成 ``proxy_pass http://<upstream>`` +
+  ``proxy_set_header Host <headerHost>`` + websocket 块。
+- 读回用 ``getLocationByServerId?serverId=``（返回该站全部 location）。
+- **API 面不生成 conf**：``/api/nginx/reload`` 只执行 ``nginx -s reload``。
+  DB 到磁盘的物化入口是 ``/api/nginx/replace``（无参，内部 buildConf(从 DB)），
+  校验入口是 ``/api/nginx/check``（把 DB 构出的配置写进 temp 跑 ``nginx -t``，
+  不碰真实文件）。所以 ``reload()`` = check → replace → reload 三步，任何一步
+  失败都抛错且不动磁盘（replace 会清空重建 conf.d，与面板 UI「覆盖配置」同义；
+  面板把旧配置记入操作日志。在面板里直接手改过 conf.d 文件的会被重建掉）。
+
+必须写对的点（都在代码里强制）：
 - location 的 ``headerHost`` 固定 ``$host``：任何含 ``$proxy_port`` /
-  ``$server_port`` / ``$host:`` 的值都在 ``_guard_header_host`` 处直接拒写。
+  ``$server_port`` / ``$host:`` 的值都在 ``_guard_header_host`` 处直接拒写
+  （服务器级反代的 conf 固定 ``Host: $host:$proxy_port``，DSH 的 Origin/Host
+  准入会把 WebSocket 403 掉）。
 - ``websocket=1``：``/api/remote.mux`` 是 WebSocket。
+- **写后必须回读**：``ensure_site`` 只有在 ``getLocationByServerId`` 里看到指向
+  正确 upstream 的 ``path=/`` location 才算成功；看不到抛 ``ng_verify_failed``，
+  错误里写明已建了什么、缺什么——绝不产生「reload 完成」式谎报。
 
-幂等：站点按 ``server_name`` 精确查（getPage 是模糊查，查回后再逐字比对），
-存在则带原 id 更新；upstream 同理。
-
-写接口的请求体字段全部集中在 ``_build_payload()`` 一处构造——厂商 smart-doc 说
-这些接口是 GET+query 形式，个别可选字段（证书路径模板、location 附加参数）以
-真机首发核对为准（回报里列了清单）。
+幂等/续建：站点按 ``server_name`` 精确查；server/upstream/location 三段各自
+「已一致就不发写请求」，半成品状态（站点在、location 缺）重跑只补 location
+一个写请求。``find_site`` 会展开读 location，``location_id=None`` 即半成品。
 
 安全边界：ensure/delete 只认第一标签以 ``dsh-`` / ``dshctl`` 开头的 FQDN
 （实例域名规范 ``dsh-<标签>.<zone>`` 与主控台自己的 ``dshctl``），删除必须逐字
@@ -39,11 +54,20 @@ DEFAULT_SITE_PREFIXES = ("dsh-", "dshctl")
 DEFAULT_UPSTREAM_PREFIXES = ("DSH_", "DSHCTL_", "dsh_", "dshctl_")
 
 # nginxWebUI 容器里 acme.sh 证书的固定目录（面板自身布局，非站点值）；
-# 证书名由调用方传入，如 "*.example.com"。 —— 待真机核对
+# 证书名由调用方传入，如 "*.example.com"。4.2.5 真机记录已证实此模板。
 _ACME_DIR = "/home/nginxWebUI/.acme.sh"
 
 # location 里 Host 头绝对禁止出现的写法（§5.4 的坑）
 _FORBIDDEN_HOST_PATTERNS = ("$proxy_port", "$server_port", "$host:")
+
+#: insertOrUpdateLocation 的参数全集。来源：部署版 smart-doc
+#: （``/api/server/insertOrUpdateLocation`` 的 curl 示例）逐项照抄。
+#: 白名单外的字段本地拒绝——不把没把握的参数发给生产面板。
+LOCATION_PARAM_FIELDS = frozenset({
+    "serverId", "path", "type", "value", "upstreamType", "upstreamId",
+    "upstreamPath", "rootPath", "rootPage", "rootType", "header",
+    "headerHost", "websocket", "cros", "returnUrl", "returnPath", "descr", "id",
+})
 
 
 def _guard_header_host(header_host: str) -> None:
@@ -213,21 +237,58 @@ class NgPanel:
                 payload["key"] = f"{_ACME_DIR}/{cert_name}/{cert_name}.key"
             return payload
         if kind == "location":
-            return {
+            payload_loc: dict[str, Any] = {
                 "serverId": kw["server_id"],
                 "path": kw.get("path", "/"),
-                "type": 2,                      # 2 = 负载均衡（反代到 upstream）
-                "upstreamId": kw["upstream_id"],
+                "type": 2,            # 负载均衡反代：ConfService 该分支生成
+                                      # proxy_pass <upstreamType>://<upstream名>
+                "value": "",          # type=0 直连才用；显式给空，别留面板默认
                 "upstreamType": kw.get("upstream_type", "http"),
+                "upstreamId": kw["upstream_id"],
                 "upstreamPath": "",
+                "rootPath": "",
+                "rootPage": "",
+                "rootType": 0,
                 "header": 1,
                 "headerHost": kw["header_host"],  # 恒为 $host，见 _guard_header_host
                 "websocket": 1 if kw.get("websocket", True) else 0,
                 "cros": 0,
+                "returnUrl": "",
+                "returnPath": 0,      # 真机首发时被面板落成 1，显式压回 0
                 "descr": kw.get("descr", "dsh-control"),
                 **({"id": kw["id"]} if kw.get("id") else {}),
             }
+            unknown = sorted(set(payload_loc) - LOCATION_PARAM_FIELDS)
+            if unknown:
+                raise IntegrationError(
+                    f"location 参数含白名单外字段 {unknown}，拒绝发送",
+                    code="location_fields_not_allowed",
+                )
+            return payload_loc
         raise IntegrationError(f"未知报文类型 {kind}", code="bad_payload_kind")
+
+    @staticmethod
+    def _server_matches(rec: dict[str, Any], *, listen_port: int,
+                        cert_name: str | None) -> bool:
+        """站点关键参数与期望一致才允许跳过写（证书路径按面板 4.2.5 模板比对）."""
+        if str(rec.get("listen")) != str(listen_port):
+            return False
+        want_ssl = 1 if cert_name else 0
+        if int(rec.get("ssl") or 0) != want_ssl:
+            return False
+        if cert_name:
+            if rec.get("pem") != f"{_ACME_DIR}/{cert_name}/fullchain.cer":
+                return False
+            if rec.get("key") != f"{_ACME_DIR}/{cert_name}/{cert_name}.key":
+                return False
+        return True
+
+    @staticmethod
+    def _location_matches(loc: dict[str, Any], *, upstream_id: int,
+                          header_host: str, websocket: bool) -> bool:
+        return (str(loc.get("upstreamId") or "") == str(upstream_id)
+                and str(loc.get("headerHost") or "") == header_host
+                and str(loc.get("websocket") or "") == ("1" if websocket else "0"))
 
     # ---------------------------------------------------------------- 读
 
@@ -246,18 +307,35 @@ class NgPanel:
             current += 1
         return records
 
-    async def find_site(self, server_name: str) -> NgSite | None:
+    async def _server_rec(self, server_name: str) -> dict[str, Any] | None:
         for rec in await self._get_page("/api/server/getPage", server_name):
             if rec.get("serverName") == server_name:
-                up = rec.get("proxyUpstreamId")
-                return NgSite(
-                    server_id=int(rec["id"]),
-                    server_name=server_name,
-                    upstream_id=int(up) if up else None,
-                    # 真正的指向在 location 上，这里不展开读，省一次请求
-                    location_id=None,
-                )
+                return rec
         return None
+
+    async def find_site(self, server_name: str) -> NgSite | None:
+        rec = await self._server_rec(server_name)
+        if rec is None:
+            return None
+        sid = int(rec["id"])
+        up = rec.get("proxyUpstreamId")
+        site = NgSite(
+            server_id=sid, server_name=server_name,
+            upstream_id=int(up) if up else None,
+            location_id=None,
+        )
+        # 真正的指向在 location 上：展开读回来。location_id=None 即
+        # 「站点在、反代没建成」的半成品——编排层据此必须走补建，不许当已存在。
+        for loc in await self._locations(sid):
+            if loc.get("path") == "/":
+                site.location_id = int(loc["id"]) if loc.get("id") else None
+                lu = loc.get("upstreamId")
+                if lu and not site.upstream_id:
+                    site.upstream_id = int(lu)
+                site.header_host = str(loc.get("headerHost") or "$host")
+                site.websocket = str(loc.get("websocket") or "") == "1"
+                break
+        return site
 
     async def _find_upstream(self, name: str) -> dict[str, Any] | None:
         for rec in await self._get_page("/api/upstream/getPage", name):
@@ -323,42 +401,68 @@ class NgPanel:
 
         upstream_id = await self._ensure_upstream(upstream_name, upstream_server)
 
-        site = await self.find_site(server_name)
-        server_payload = self._build_payload(
-            "server", server_name=server_name, listen_port=listen_port,
-            cert_name=cert_name, id=site.server_id if site else None,
-        )
-        await self._api("/api/server/insertOrUpdate", server_payload,
-                        write=True, action="server.insertOrUpdate")
-        if not self.dry_run:
-            site = await self.find_site(server_name)
-            if site is None:
-                raise IntegrationError(
-                    f"站点 {server_name} 保存后回读不到", code="ng_reread")
-        server_id = site.server_id if site else 0
-
-        locations = await self._locations(server_id) if (server_id and not self.dry_run) else []
-        existing_loc = next((l for l in locations if l.get("path") == "/"), None)
-        loc_payload = self._build_payload(
-            "location",
-            server_id=server_id,
-            upstream_id=upstream_id or ((site.upstream_id if site else None) or 0),
-            header_host=header_host,
-            websocket=websocket,
-            id=existing_loc.get("id") if existing_loc else None,
-        )
-        await self._api("/api/server/insertOrUpdateLocation", loc_payload,
-                        write=True, action="server.insertOrUpdateLocation")
+        # ---- 站点：已一致就不写；不一致带原 id 更新；缺就新建 ----
+        rec = await self._server_rec(server_name)
+        server_ok = (rec is not None
+                     and self._server_matches(rec, listen_port=listen_port,
+                                              cert_name=cert_name))
+        if not server_ok:
+            await self._api("/api/server/insertOrUpdate", self._build_payload(
+                "server", server_name=server_name, listen_port=listen_port,
+                cert_name=cert_name, id=int(rec["id"]) if rec else None,
+            ), write=True, action="server.insertOrUpdate")
         if self.dry_run:
+            # dry-run：读面是真状态照常用；写只进 recorder，最后返回全合成 id
+            server_id = int(rec["id"]) if rec else 0
+        else:
+            server_id = int(rec["id"]) if server_ok else None
+            if server_id is None:
+                rec = await self._server_rec(server_name)
+                if rec is None:
+                    raise IntegrationError(
+                        f"NG 半成品：upstream {upstream_name}(id={upstream_id}) 已确认，"
+                        f"但站点 {server_name} 保存后 getPage 回读不到——location 未写，"
+                        f"重跑可续建", code="ng_reread")
+                server_id = int(rec["id"])
+
+        # ---- location：已一致不写；指向不对带 id 更新；缺就补建 ----
+        locations = await self._locations(server_id)
+        loc = next((l for l in locations if l.get("path") == "/"), None)
+        if loc is None or not self._location_matches(
+                loc, upstream_id=upstream_id, header_host=header_host,
+                websocket=websocket):
+            await self._api("/api/server/insertOrUpdateLocation", self._build_payload(
+                "location", server_id=server_id, upstream_id=upstream_id,
+                header_host=header_host, websocket=websocket,
+                id=loc.get("id") if loc else None,
+            ), write=True, action="server.insertOrUpdateLocation")
+        if self.dry_run:
+            # 写意图已全部送进 recorder；不回读、不物化，id 全合成
             return NgSite(server_id=0, server_name=server_name,
                           upstream_id=upstream_id, location_id=0,
                           header_host=header_host, websocket=websocket)
+
+        # ---- 写后回读：getLocationByServerId 看不到就不算建成 ----
         locations = await self._locations(server_id)
-        loc = next((l for l in locations if l.get("path") == "/"), None)
+        back = next((l for l in locations
+                     if l.get("path") == "/" and self._location_matches(
+                         l, upstream_id=upstream_id, header_host=header_host,
+                         websocket=websocket)), None)
+        if back is None:
+            saw = "; ".join(
+                f"path={l.get('path')!r}->upstream {l.get('upstreamId')!r}"
+                for l in locations) or "一条都没有"
+            raise IntegrationError(
+                f"NG 半成品：upstream {upstream_name}(id={upstream_id})、"
+                f"站点 {server_name}(server_id={server_id}) 都已确认，"
+                f"但 location 写后回读不到指向 upstream {upstream_id} 的 path=/ "
+                f"（面板现回 {saw}）。缺 location，重跑可续建；"
+                f"conf 未物化前请勿 reload",
+                code="ng_verify_failed")
         return NgSite(
             server_id=server_id, server_name=server_name,
             upstream_id=upstream_id,
-            location_id=int(loc["id"]) if loc and loc.get("id") else None,
+            location_id=int(back["id"]) if back.get("id") else None,
             header_host=header_host, websocket=websocket,
         )
 
@@ -396,4 +500,16 @@ class NgPanel:
                         write=True, action="upstream.delete")
 
     async def reload(self) -> None:
+        """生效开关，三步（面板自身源码核定的 API 面语义）：
+
+        1. ``check``：把**数据库**构出的配置写进 temp 跑 ``nginx -t``，不碰真实文件；
+        2. ``replace``：conf.d 整目录清空、按数据库重建（面板 UI「覆盖配置」同义，
+           旧配置由面板记入操作日志。直接在面板外手改过 conf.d 文件的会被重建掉）；
+        3. ``reload``：``nginx -s reload``。
+
+        API 面的 reload 单发**不会**生成 conf——这正是首轮「库里全有、conf.d 没有、
+        公网 403」的根因；任何一步失败都抛错并停在原地。
+        """
+        await self._api("/api/nginx/check", write=True, action="nginx.check")
+        await self._api("/api/nginx/replace", write=True, action="nginx.replace")
         await self._api("/api/nginx/reload", write=True, action="nginx.reload")

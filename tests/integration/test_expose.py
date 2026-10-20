@@ -64,15 +64,16 @@ async def test_expose_idempotent_second_run_zero_writes(env):
     env.settings.console_host = "nas-1"
     _l, log = await collector()
     await run_expose(env.db, env.providers, env.settings, log=log)
-    writes_before = [ln for ln in env.journal
-                     if ln.startswith(("dns.create", "frp.ensure", "ng.ensure",
-                                       "ng.reload"))]
+    creates_before = [ln for ln in env.journal
+                      if ln.startswith(("dns.create", "frp.ensure", "ng.ensure"))]
     lines, log2 = await collector()
     await run_expose(env.db, env.providers, env.settings, log=log2)
-    writes_after = [ln for ln in env.journal
-                    if ln.startswith(("dns.create", "frp.ensure", "ng.ensure",
-                                      "ng.reload"))]
-    assert writes_after == writes_before  # 第二次零写请求
+    creates_after = [ln for ln in env.journal
+                     if ln.startswith(("dns.create", "frp.ensure", "ng.ensure"))]
+    assert creates_after == creates_before  # 第二次零创建/零改写
+    # 新契约（NG 半成品事故，2026-10）：API 面不生成 conf，库里齐而 conf.d
+    # 缺文件时唯有 replace+reload 能物化，所以 exists 也必须幂等 reload。
+    assert any(ln.startswith("ng.reload") for ln in env.journal)
     assert any("已存在" in m for _l, m in lines)          # 打印现状
     assert not any(ln.startswith(("dns.delete", "frp.delete", "ng.delete"))
                    for ln in env.journal)                # 绝不删除
