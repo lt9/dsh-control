@@ -16,6 +16,8 @@ from ..domain.timeutil import iso
 # 详情只给 mask，列表连 mask 都不给。
 _RELEASABLE_STATES = {"deploying", "running", "unhealthy", "restarting", "error"}
 _RESTARTABLE_STATES = {"running", "unhealthy", "restarting", "error"}
+# 重跑开通：只有从未开通成功过的状态才给这个入口（开通失败后必须有路可走）
+_DEPLOYABLE_STATES = {"pending", "error"}
 
 
 def list_item(inst: Instance, host: Host | None) -> dict[str, Any]:
@@ -91,6 +93,9 @@ async def instance_detail(
         "actions": {
             "restart": inst.state in _RESTARTABLE_STATES,
             "release": inst.state in _RELEASABLE_STATES,
+            # 开通失败/从未开通才有"重跑开通"；running 不给（那该走 restart）
+            "deploy": (inst.state in _DEPLOYABLE_STATES
+                       and inst.desired_state != "released"),
         },
     }
 

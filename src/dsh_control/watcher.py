@@ -43,6 +43,8 @@ class WatcherState:
 
     failures: dict[int, int] = field(default_factory=dict)
     last_restart_count: dict[int, int] = field(default_factory=dict)
+    # 已经提示过"容器不存在"的实例：这条只在状态跳变时记一次，别每轮刷屏
+    absent_noted: set[int] = field(default_factory=set)
 
 
 def _is_failure(snap: Any) -> bool:
@@ -143,6 +145,19 @@ async def scan_once(
             if snap and snap.image and snap.image != inst.image_tag:
                 inst.image_tag = snap.image
                 await s.commit()
+
+            # 容器不存在：要么开通从未走完（第 60 步之前失败并被回滚，实测就是这样），
+            # 要么被人 docker rm 了。这两种情况下 `docker restart` 只会回
+            # "No such container"，还会把 last_error 刷成和真实故障无关的一句，
+            # 把人往错方向带。所以这里不计健康失败、不自动重启，只提示一次。
+            if snap is None:
+                if inst.id not in wstate.absent_noted:
+                    wstate.absent_noted.add(inst.id)
+                    log.info("实例 %s 在 %s 上查不到容器 %s：不做自动重启，"
+                             "需要重新开通（续建）或释放", inst.slug, host.name,
+                             inst.container_name or inst.slug)
+                continue
+            wstate.absent_noted.discard(inst.id)
 
             # docker 策略自动拉起：restart_count 比上一次快照增长 → 重新抓 token
             # （契约硬承诺：任何重启后详情里必须是当前最新密钥）

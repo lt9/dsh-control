@@ -71,7 +71,8 @@ class FakeNg:
     """假面板：默认按 fixture 长；growth=True 时写完才“长出”对象（模拟真面板）。"""
 
     def __init__(self, *, server=None, servers=None, upstream=None, backends=None,
-                 locations=None, flaky_token=False, growth=False, check_fails=False):
+                 locations=None, flaky_token=False, growth=False, check_fails=False,
+                 fails=None):
         self.servers = list(servers) if servers is not None \
             else ([server] if server else [])
         self.server = self.servers[0] if self.servers else None
@@ -80,7 +81,10 @@ class FakeNg:
         self.locations = list(locations or [])
         self.flaky_token = flaky_token
         self.growth = growth
-        self.check_fails = check_fails
+        # fails: path → 前 n 次写请求回 500（模拟面板忙/并发撞车）
+        self.fails: dict[str, int] = dict(fails or {})
+        if check_fails:
+            self.fails["/api/nginx/check"] = 10 ** 9
         self.token_calls = 0
         self.requests: list[httpx.Request] = []
         self.writes: list[tuple[str, dict]] = []
@@ -122,15 +126,16 @@ class FakeNg:
             sid = params.get("serverId", "")
             return ok([l for l in self.locations
                        if str(l.get("serverId")) == str(sid)])
-        if path == "/api/nginx/check":
-            self.writes.append((path, params))
-            if self.check_fails:
-                return httpx.Response(200, json={"success": False, "status": "500",
-                                                 "msg": "效验失败"})
-            return ok("效验成功")
         if path.startswith("/api/") and ("insertOrUpdate" in path or path.endswith("/delete")
-                                         or path in ("/api/nginx/replace", "/api/nginx/reload")):
+                                         or path in ("/api/nginx/check", "/api/nginx/replace",
+                                                     "/api/nginx/reload")):
             self.writes.append((path, params))
+            n = self.fails.get(path, 0)
+            if n > 0:
+                self.fails[path] = n - 1
+                msg = "效验失败" if path.endswith("/check") else "面板忙"
+                return httpx.Response(200, json={"success": False, "status": "500",
+                                                 "msg": msg})
             if self.growth:
                 if path.endswith("/upstream/insertOrUpdate"):
                     self.upstream = dict(UPSTREAM_FIXTURE)
@@ -155,11 +160,12 @@ class FakeNg:
             return ok({})
         return httpx.Response(200, json={"success": False, "status": "404", "msg": "no route"})
 
-    def panel(self, dry_run=False, recorder=None):
+    def panel(self, dry_run=False, recorder=None, line_sink=None):
         client = httpx.AsyncClient(base_url=BASE,
                                    transport=httpx.MockTransport(self._handler))
         return NgPanel(base_url=BASE, username="u", password="p",
-                       dry_run=dry_run, recorder=recorder, client=client)
+                       dry_run=dry_run, recorder=recorder, client=client,
+                       line_sink=line_sink, retry_delays=(0.0, 0.0))  # 测试不真等
 
 
 def write_for(api, path_end):
@@ -384,6 +390,63 @@ def test_reload_stops_when_check_fails():
     assert "/api/nginx/reload" not in api.paths
 
 
+# ------------------------------------------- 有界重试（面板忙是正常工况，不判死）
+
+def test_check_busy_twice_then_passes_replace_exactly_once():
+    api = FakeNg(fails={"/api/nginx/check": 2})       # 面板正被并发操作撞车
+    lines: list[str] = []
+    run(api.panel(line_sink=lambda _lv, msg: lines.append(msg)).reload())
+    seq = [p for p, _ in api.writes]
+    assert seq == ["/api/nginx/check", "/api/nginx/check", "/api/nginx/check",
+                   "/api/nginx/replace", "/api/nginx/reload"]
+    assert len([p for p in seq if p.endswith("/replace")]) == 1   # 过了才重建，一次
+    assert len(lines) == 2
+    assert "校验未通过" in lines[0] and "后重试 2/3" in lines[0]
+    assert "效验失败" in lines[0]                     # 面板原文跟着进用户日志
+    assert "后重试 3/3" in lines[1]
+
+
+def test_check_three_failures_never_rebuilds_conf():
+    """最关键的一条：校验过不去，replace 一次都不许发生。"""
+    api = FakeNg(fails={"/api/nginx/check": 10 ** 9}, growth=True)
+    with pytest.raises(IntegrationError) as ei:
+        run(api.panel().reload())
+    assert ei.value.code == "ng_busy_or_drift"
+    msg = str(ei.value)
+    assert "连续 3 次" in msg and "面板原文" in msg and "效验失败" in msg
+    assert "本次未改动磁盘上任何配置文件" in msg       # 不谎报
+    assert [p for p, _ in api.writes if p.endswith("/replace")] == []
+    assert [p for p, _ in api.writes if p.endswith("/reload")] == []
+    assert len([p for p, _ in api.writes if p.endswith("/check")]) == 3
+
+
+def test_replace_fails_once_raises_immediately_never_retried():
+    api = FakeNg(fails={"/api/nginx/replace": 1})
+    with pytest.raises(IntegrationError) as ei:
+        run(api.panel().reload())
+    assert ei.value.code == "500"                     # 面板原文立抛，不包装不重试
+    seq = [p for p, _ in api.writes]
+    assert seq == ["/api/nginx/check", "/api/nginx/replace"]
+    assert "/api/nginx/reload" not in seq             # 后续步骤不动
+
+
+def test_reload_fails_once_second_attempt_succeeds():
+    api = FakeNg(fails={"/api/nginx/reload": 1})      # nginx -s reload 幂等可重试
+    lines: list[str] = []
+    run(api.panel(line_sink=lambda _lv, msg: lines.append(msg)).reload())
+    seq = [p for p, _ in api.writes]
+    assert seq == ["/api/nginx/check", "/api/nginx/replace",
+                   "/api/nginx/reload", "/api/nginx/reload"]
+    assert len(lines) == 1 and "重载未通过" in lines[0]
+
+
+def test_retry_progress_falls_back_to_recorder_when_no_line_sink():
+    rec = DryRunRecorder()
+    api = FakeNg(fails={"/api/nginx/check": 1})
+    run(api.panel(recorder=rec).reload())             # 没接 line_sink 也不能哑巴
+    assert any("校验未通过" in e.note and "后重试 2/3" in e.note for e in rec.entries)
+
+
 # ------------------------------------------------------------------ 删除纪律
 
 def test_delete_site_id_name_mismatch_blocks():
@@ -549,12 +612,19 @@ def _loc(sid, header_host, *, i):
                 serverId=str(sid), headerHost=header_host)
 
 
-PROBE_CODES = {
-    "dsh-clean.example.com": 401,
-    "legacy-db-dirty.example.com": 401,
-    "dsh-disk-dirty.example.com": 403,
-    "legacy-both-dirty.example.com": 403,
-    "plain-not-dsh.example.com": 404,
+JSON = "application/json"
+TEXT = "text/plain"
+# host → (状态码, 响应体, content-type)。体分 DSH 信封 与 非 DSH 裸文本两种。
+PROBES = {
+    "dsh-reg.example.com": (401, "forbidden-ish plain", TEXT),        # 已登记：体不重要
+    "dsh-reg-dirty.example.com": (403, "forbidden", TEXT),            # 真 DSH 脏墙就是裸文本
+    "dsh-fp401.example.com": (401, '{"ok": false, "error": "unauthenticated"}', JSON),
+    "dsh-fp200.example.com": (200, '{"ok": true}', JSON),
+    "dsh-jelly.example.com": (200, "<html>jellyfin</html>", TEXT),    # 带端口 Host 照样 200
+    "dsh-nginx401.example.com": (401, "401 Authorization Required", TEXT),
+    "dsh-office.example.com": (403, "access denied by policy", TEXT),  # 自家的 403
+    "dsh-gogs502.example.com": (502, "<html>bad gateway</html>", TEXT),
+    "dsh-in.example.com": (200, '{"ok": true}', JSON),
 }
 
 
@@ -562,43 +632,94 @@ def _probe_client(seen):
     def handle(request):
         host = request.url.host
         seen.append((host, request.url.path, request.headers.get("origin")))
-        if host == "dsh-unreachable.example.com":
+        if host == "dsh-down.example.com":
             raise httpx.ConnectError("no route to host")
-        return httpx.Response(PROBE_CODES[host], text="x")
+        code, body, ctype = PROBES[host]
+        return httpx.Response(code, text=body, headers={"content-type": ctype})
     return httpx.AsyncClient(transport=httpx.MockTransport(handle))
 
 
-def test_drift_scan_classifies_every_site_and_writes_nothing():
-    servers = [_srv(11, "dsh-clean.example.com"),
-               _srv(12, "legacy-db-dirty.example.com"),
-               _srv(13, "dsh-disk-dirty.example.com"),
-               _srv(14, "legacy-both-dirty.example.com"),
-               _srv(15, "dsh-unreachable.example.com"),
-               _srv(16, "plain-not-dsh.example.com"),
-               _srv(17, "dsh-disabled.example.com", enable=False),
-               _srv(18, "dsh-no-loc.example.com")]
-    locations = [_loc(1310000000000000011, "$host", i=1),
-                 _loc(1310000000000000012, "$host:$proxy_port", i=2),
-                 _loc(1310000000000000013, "$host", i=3),
-                 _loc(1310000000000000014, "$host:$server_port", i=4),
-                 _loc(1310000000000000015, "$host", i=5),
-                 _loc(1310000000000000016, "$host", i=6)]
+def test_drift_evidence_needs_registration_or_fingerprint():
+    """DB 证据只有两条通道：known_dsh 登记 / 家族信封指纹（真 DSH 脏 403 是裸文本，
+    所以登记通道不可省）；db_dirty 只在 登记DSH+403+库脏 时出现。"""
+    servers = [_srv(21, "dsh-reg.example.com"),
+               _srv(22, "dsh-reg-dirty.example.com"),
+               _srv(23, "dsh-fp401.example.com"),
+               _srv(24, "dsh-fp200.example.com"),
+               _srv(25, "dsh-gogs502.example.com")]
+    locations = [_loc(1310000000000000021, "$host", i=11),
+                 _loc(1310000000000000022, "$host:$proxy_port", i=12),
+                 _loc(1310000000000000023, "$host", i=13),
+                 _loc(1310000000000000024, "$host", i=14),
+                 _loc(1310000000000000025, "$host", i=15)]
     seen: list[tuple[str, str, str]] = []
     api = FakeNg(servers=servers, locations=locations)
-    rows = run(api.panel().drift_scan(probe_client=_probe_client(seen)))
-    assert {r["server_name"]: r["verdict"] for r in rows} == {
-        "dsh-clean.example.com": "consistent",
-        "legacy-db-dirty.example.com": "db_dirty",      # 库脏盘净：replace 会洗脏
-        "dsh-disk-dirty.example.com": "disk_dirty",     # 盘被手改脏，replace 能救
-        "legacy-both-dirty.example.com": "consistent",  # 两边同脏：replace 不变东西
-        "dsh-unreachable.example.com": "unreachable",   # 连不上 ≠ 脏 ≠ 干净
-        "plain-not-dsh.example.com": "not_dsh_backend",
-        "dsh-no-loc.example.com": "no_location",
-    }                                                   # enable=0 的站根本不出现
-    assert {r["header_host"] for r in rows
-            if r["server_name"] == "legacy-db-dirty.example.com"} == {"$host:$proxy_port"}
-    assert seen and all(path == "/api/healthz" and origin == f"https://{host}"
-                        for host, path, origin in seen)
-    assert api.writes == []                             # 全程纯只读
+    rows = run(api.panel().drift_scan(
+        probe_client=_probe_client(seen),
+        known_dsh={"dsh-reg.example.com", "dsh-reg-dirty.example.com",
+                   "dsh-gogs502.example.com"}))
+    verdicts = {r["server_name"]: (r["verdict"], r["dsh_proven"]) for r in rows}
+    assert verdicts == {
+        "dsh-reg.example.com": ("consistent", True),      # 登记 + 401 = 盘净库净
+        "dsh-reg-dirty.example.com": ("db_dirty", True),  # 登记 + 403 + 库脏 → 危险
+        "dsh-fp401.example.com": ("consistent", True),    # 没登记但信封对 → 证据
+        "dsh-fp200.example.com": ("consistent", True),    # {"ok": true} healthz 指纹
+        "dsh-gogs502.example.com": ("inconclusive", True),  # 证明了 DSH，502 也不说 Host
+    }
+    dangerous = [r["server_name"] for r in rows
+                 if r["verdict"] in ("db_dirty", "disk_dirty")]
+    assert dangerous == ["dsh-reg-dirty.example.com"]     # 危险列表只收有证据的
+    assert all(origin == f"https://{host}" for host, _p, origin in seen)
+    assert api.writes == []                               # 全程只读
     assert not [p for p in api.paths if "insertOrUpdate" in p or p.endswith("/delete")
                 or p.startswith("/api/nginx")]
+
+
+def test_drift_non_dsh_shapes_are_never_evidence():
+    """实测定罪现场的翻案：非 DSH 后端的 200/401/403（哪怕库脏、哪怕 403）一律
+    inconclusive，绝不进危险列表——旧版在这里给过假警报，也给过假安全感。"""
+    servers = [_srv(31, "dsh-jelly.example.com"),
+               _srv(32, "dsh-nginx401.example.com"),
+               _srv(33, "dsh-office.example.com")]
+    locations = [_loc(1310000000000000031, "$host:$proxy_port", i=21),  # 库脏 + 200
+                 _loc(1310000000000000032, "$host:$proxy_port", i=22),  # 库脏 + 401
+                 _loc(1310000000000000033, "$host", i=23)]              # 库净 + 403
+    api = FakeNg(servers=servers, locations=locations)
+    rows = run(api.panel().drift_scan(probe_client=_probe_client([])))
+    assert [r["verdict"] for r in rows] == ["inconclusive"] * 3
+    assert not any(r["dsh_proven"] for r in rows)
+    assert not any(r["verdict"] in ("db_dirty", "disk_dirty", "consistent")
+                   for r in rows)
+    assert api.writes == []
+
+
+def test_drift_scope_default_managed_and_all_sites_lists_foreign_unjudged():
+    servers = [_srv(41, "dsh-in.example.com"),
+               _srv(42, "legacy-other.example.com"),
+               _srv(43, "dsh-disabled.example.com", enable=False),
+               _srv(44, "dsh-down.example.com"),
+               _srv(45, "dsh-noloc.example.com")]
+    locations = [_loc(1310000000000000041, "$host", i=31),
+                 _loc(1310000000000000042, "$host:$proxy_port", i=32),
+                 _loc(1310000000000000044, "$host", i=33)]
+    api = FakeNg(servers=servers, locations=locations)
+
+    seen: list[tuple[str, str, str]] = []
+    rows = run(api.panel().drift_scan(probe_client=_probe_client(seen)))
+    names = {r["server_name"] for r in rows}
+    assert "legacy-other.example.com" not in names       # 默认只体检自己的
+    assert "dsh-disabled.example.com" not in names       # enable=0 跳过
+    verdicts = {r["server_name"]: r["verdict"] for r in rows}
+    assert verdicts["dsh-down.example.com"] == "unreachable"   # 连不上≠脏≠干净
+    assert verdicts["dsh-noloc.example.com"] == "no_location"
+
+    seen2: list[tuple[str, str, str]] = []
+    rows2 = run(api.panel().drift_scan(probe_client=_probe_client(seen2),
+                                       only_managed=False, all_sites=True))
+    foreign = next(r for r in rows2
+                   if r["server_name"] == "legacy-other.example.com")
+    assert foreign["verdict"] == "foreign_report"        # 只报库值
+    assert foreign["header_host"] == "$host:$proxy_port"
+    assert foreign["probe_status"] is None and foreign["dsh_proven"] is False
+    assert "legacy-other.example.com" not in [h for h, _p, _o in seen2]  # 一个探都不发
+    assert api.writes == []

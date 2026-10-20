@@ -193,3 +193,36 @@ async def test_missing_frps_upstream_host_fails_in_plan(env):
     # 失败发生在 plan：没有任何外部对象被创建
     assert not any(ln.startswith(("dns.create", "frp.ensure", "ng.ensure"))
                    for ln in env.journal)
+
+
+async def test_failed_deploy_can_be_retried_and_resumes(env):
+    """开通失败必须有路可走：修好成因后重跑是**续建**，不重建已经对的东西。"""
+    env.settings.frps_upstream_host = ""
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    body = r.json()
+    iid = body["instance_id"]
+    await wait_job(env.app, body["job_id"])
+    d = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d["state"] == "error"
+    # 失败态必须给"重跑开通"入口，否则实例永久卡死在 error
+    assert d["actions"] == {"restart": True, "release": True, "deploy": True}
+
+    env.settings.frps_upstream_host = "198.51.100.9"
+    r2 = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r2.status_code == 200, r2.text
+    await wait_job(env.app, r2.json()["job_id"])
+    d2 = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d2["state"] == "running", d2["last_error"]
+    assert d2["actions"]["deploy"] is False, "跑通了就不该再给重跑入口"
+    # 续建幂等：外部对象各只建一次
+    assert sum(1 for ln in env.journal if ln.startswith("dns.create")) == 1
+
+
+async def test_deploy_retry_refused_from_running(env):
+    """running 不等于"开通失败"，重跑开通必须拒——那是 restart 的语义。"""
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    body = r.json()
+    await wait_job(env.app, body["job_id"])
+    r2 = await env.client.post(f"/api/instances/{body['instance_id']}/deploy", headers=XRW)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["error"] == "cannot_deploy_from_running"

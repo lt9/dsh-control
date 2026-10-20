@@ -32,6 +32,7 @@ from ..integrations.base import (
     PublicProbe,
     redact,
 )
+from ..integrations.sinks import reset_line_sink, set_line_sink
 from ..settings import Settings, get_settings
 
 # ---------------------------------------------------------------- 日志安全
@@ -155,6 +156,8 @@ class JobCtx:
         self.ssh_key_pem = ssh_key_pem
         self._seq = 0
         self.rollback_actions: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+        # 面板/插件同步回调写进来的行，步骤边界批量落库（见 integrations/sinks.py）
+        self._line_buf: list[tuple[str, str]] = []
 
     # ---- 日志
 
@@ -169,10 +172,19 @@ class JobCtx:
                 buf.append((level, line))
         return sink
 
+    def line_sink(self) -> Callable[[str, str], None]:
+        """本 job 的行日志入口：面板插件（NG 重试提示等）经 contextvar 写到这里，
+        在步骤边界刷进 job 日志，前端点对点看得到。"""
+        return self.buffered_sink(self._line_buf)
+
     async def flush_lines(self, buf: list[tuple[str, str]]) -> None:
         for level, line in buf:
             await self.log(level, line)
         buf.clear()
+
+    async def flush_pending_lines(self) -> None:
+        """收尾时用：把最后一个步骤之后才回来的插件行落库，别丢。"""
+        await self.flush_lines(self._line_buf)
 
     # ---- providers
 
@@ -225,6 +237,8 @@ class JobCtx:
 
     @asynccontextmanager
     async def step(self, seq: int, key: str, title: str):
+        # 遗留的插件行先按上一步的 seq 归位，再切到本步（顺序反了会挂错步骤）
+        await self.flush_lines(self._line_buf)
         self._seq = seq
         step = await repo.add_step(self.s, self.job.id, seq, key, title)
         step.state = "running"
@@ -234,6 +248,7 @@ class JobCtx:
         try:
             yield step
         except Exception as exc:
+            await self.flush_lines(self._line_buf)
             step.state = "failed"
             step.finished_at = utcnow()
             msg = redact_text(str(exc) or exc.__class__.__name__)
@@ -246,6 +261,7 @@ class JobCtx:
         step.detail = (step.detail + "\n" if step.detail else "") + \
             f"耗时 {time.monotonic() - started:.1f}s"
         await self.s.commit()
+        await self.flush_lines(self._line_buf)
 
     async def finish_rollback(self, error: str) -> None:
         """失败时按契约「失败怎么办」列做回滚；回滚本身的异常只记日志不回抛。"""
@@ -348,6 +364,9 @@ class JobRunner:
             ctx.host = await repo.get_host(ctx.s, ctx.instance.host_id)
 
         error: str | None = None
+        # 面板插件（NG 重试提示这类）拿到的是进程级共享实例，回调签名里塞不进
+        # "当前哪个 job"，所以按执行上下文绑定；两个 job 并发也不串日志。
+        _sink_token = set_line_sink(ctx.line_sink())
         try:
             await flow(ctx)
         except StepFailed as exc:
@@ -369,6 +388,11 @@ class JobRunner:
         except Exception as exc:  # noqa: BLE001
             error = redact_text("".join(traceback.format_exception_only(exc)).strip())
         finally:
+            try:
+                await ctx.flush_pending_lines()
+            except Exception:  # noqa: BLE001, S110 —— 刷不动日志不能掩盖真正的失败
+                pass
+            reset_line_sink(_sink_token)
             try:
                 await ctx.s.close()
             except Exception:  # noqa: BLE001, S110 —— 收尾关不上也不能掩盖真正的失败

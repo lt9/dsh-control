@@ -151,3 +151,29 @@ async def test_released_and_deploying_are_skipped(env):
     await scan(env, wstate)
     assert wstate.failures == {}
     assert await job_count(env) == 0
+
+
+async def test_absent_container_never_auto_restarts(env):
+    """开通失败被回滚后容器根本不存在（真实开通就是这么翻车的）：watcher 不许
+    去 docker restart——它只会回 "No such container"，还把 last_error 刷成和真实
+    故障无关的一句，把人往错方向带。"""
+    iid = await make_running_instance(env)
+    env.runtime.exists = False
+    before = await job_count(env)
+    wstate = WatcherState()
+    await scan(env, wstate)
+    await scan(env, wstate)
+
+    assert await job_count(env) == before, "容器不存在却排了任务"
+    assert wstate.absent_noted == {iid}, "只该提示一次"
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        snap = await repo.latest_snapshot(s, iid)
+    assert snap is not None and snap.docker_state == "absent"
+    # 状态不瞎改：容器不存在不等于实例坏了，详情里 docker_state=absent 已说清
+    assert inst.state == "running"
+
+    # 容器回来了就忘，不影响后续正常收敛
+    env.runtime.exists = True
+    await scan(env, wstate)
+    assert wstate.absent_noted == set()

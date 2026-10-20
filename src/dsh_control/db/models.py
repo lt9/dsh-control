@@ -136,9 +136,11 @@ class Instance(Base):
     frp_proxy_id: Mapped[int | None] = mapped_column(
         BigInteger, comment="frp-panel proxy_config id（释放按它精确删）")
     frp_remote_port: Mapped[int | None] = mapped_column(
-        Integer, comment="frps 公网端口（释放后保留，不复用）")
+        Integer, comment="frps 公网端口（释放后保留不复用；仅开通失败回滚时清空放回池子）")
     ng_upstream_name: Mapped[str] = mapped_column(String(128), default="",
                                                   comment="nginxWebUI upstream 名 DSH_NN")
+    ng_upstream_id: Mapped[int | None] = mapped_column(
+        BigInteger, comment="nginxWebUI upstream id（释放随站点一并删；空=未登记/人工层）")
     ng_server_id: Mapped[int | None] = mapped_column(
         BigInteger, comment="nginxWebUI 站点 id（释放按它精确删）")
     ng_location_id: Mapped[int | None] = mapped_column(BigInteger,

@@ -38,6 +38,7 @@ from .ng_panel import NgPanel
 from .noop import ManualAction, NoopDns, NoopFrp, NoopNg
 from .probe import HttpPublicProbe
 from .shell import SshDshRuntime, SshExecutor
+from .sinks import emit_line
 
 ProviderFactory = Callable[[Any, Mapping[str, Any], DryRunRecorder], Any]
 
@@ -240,6 +241,9 @@ def _build_nginxwebui(settings: Any, creds: _CredStore, recorder: DryRunRecorder
         password=pwd,
         dry_run=_as_bool(_get(settings, "dry_run")),
         recorder=recorder,
+        # 面板的行日志走 contextvar 按 job 落地（见 jobs/runner.py 与 sinks.py）：
+        # providers 是进程级共享的，sink 直接挂在实例上会让并发 job 串日志。
+        line_sink=emit_line,
     )
 
 

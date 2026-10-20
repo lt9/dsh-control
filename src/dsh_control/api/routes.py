@@ -297,6 +297,43 @@ async def instance_events(request: Request, instance_id: int,
 # ---------------------------------------------------------------- 重启 / 释放
 
 _RESTARTABLE = {"running", "unhealthy", "restarting", "error"}
+# 开通失败后的续建入口（§6.1「重试」）：只有从未走完（pending）和已判死（error）可重跑。
+# deploying 说明有 job 在跑，running 该走 restart，released 是终态，都拒绝。
+_DEPLOYABLE = {"pending", "error"}
+
+
+@router.post("/instances/{instance_id}/deploy", dependencies=[Depends(require_xrw)])
+async def retry_deploy(request: Request, instance_id: int) -> dict[str, Any]:
+    """开通失败后重跑（§6.1「重试」）。
+
+    deploy 的每一步都是「已存在且一致就跳过」，所以重跑是**续建**：DNS/frp/NG
+    建到哪一步就接着往下走，不重建已经对的东西。只在从未走完（pending）或已判死
+    （error）时允许；deploying 有 job 在跑、released 是终态、running 该走 restart。
+    """
+    state = _state(request)
+    async with state.db.session() as s:
+        inst = await _load_instance(s, instance_id)
+        if inst.desired_state == "released" or inst.state not in _DEPLOYABLE:
+            raise HTTPException(
+                status_code=409,
+                detail={"ok": False, "error": f"cannot_deploy_from_{inst.state}",
+                        "message": "只有开通失败或尚未开通的实例可以重跑；"
+                                   "运行中的实例请走重启"})
+        for j in await repo.unfinished_jobs(s):
+            if j.instance_id == inst.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"ok": False, "error": "job_in_progress",
+                            "message": f"该实例已有 {j.kind} 任务在跑（job {j.id}），"
+                                       "等它结束再重跑"})
+        prev_state = inst.state
+        job = await repo.create_job(s, inst.id, "deploy")
+        await repo.add_event(s, "deploy_requeued",
+                             message=f"重新开通 {inst.slug}（从 {prev_state} 续建）",
+                             instance_id=inst.id, job_id=job.id,
+                             data={"from": prev_state})
+    state.runner.spawn(job.id)
+    return {"job_id": job.id}
 
 
 @router.post("/instances/{instance_id}/restart", dependencies=[Depends(require_xrw)])

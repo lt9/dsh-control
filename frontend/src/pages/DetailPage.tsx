@@ -44,6 +44,13 @@ export default function DetailPage() {
     try { const r = await api.restart(d.id); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=restart`); }
     catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); }
   };
+  // 开通失败不是死路：重跑是续建，从失败那一步接着做，已建好的域名/隧道/站点会被跳过
+  const doDeploy = async () => {
+    if (!d) return;
+    setBusy(true); setOpError(null);
+    try { const r = await api.deploy(d.id); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=deploy`); }
+    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); }
+  };
   const doRelease = async () => {
     if (!d) return;
     try { const r = await api.release(d.id, d.slug); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=release`); }
@@ -211,6 +218,12 @@ export default function DetailPage() {
                 <p className="mut small">已释放的实例只留档案：公网入口已注销、容器已停止（数据还在），没有恢复入口。</p>
               ) : (
                 <div className="actions">
+                  {d.actions.deploy && (
+                    <button type="button" className="btn btn-primary btn-lg" disabled={busy} onClick={doDeploy}
+                      title="从失败的那一步接着建：已建好的域名、隧道、反代会跳过，不会重复创建">
+                      <Icon name="plus" />重新开通
+                    </button>
+                  )}
                   <button type="button" className="btn btn-lg" disabled={!d.actions.restart || busy} onClick={doRestart}
                     title="重启会轮换登录密钥，新密钥自动抓回">
                     <Icon name="power" />重启

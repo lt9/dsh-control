@@ -42,10 +42,14 @@
 标记进 recorder/审计。
 
 ``drift_scan``（纯只读）：replace 是全面板按库重建，库盘不一致会被打回坏值；
-控制台没有 SSH 读不了磁盘，用 DSH 准入墙当探针（``https://<站点>/api/healthz``
-带 Origin：401/200=Host 干净、403=Host 带端口）量磁盘生效值，与库里
-header_host 对表，分 db_dirty / disk_dirty / consistent / unreachable /
-not_dsh_backend / no_location，给「跑 replace 之前」提供真凭据。
+这版 nginxWebUI 没有读 conf 文件内容的 API（见 docs/05），磁盘侧只能黑盒旁证
+（``https://<站点>/api/healthz`` 带 Origin）。**状态码仅在后端可证明是 DSH 时
+才是证据**（known_dsh 登记名单或家族 §4.1 响应指纹），证明不了一律
+inconclusive——非 DSH 后端（jellyfin/Gogs/onlyOffice…）的 200/401/403/502
+都不能拿来判 Host。判定分 consistent / db_dirty / disk_dirty / inconclusive /
+unreachable / no_location（+ all_sites=True 时 foreign_report 只报库值）。
+真一致性凭据是运维只读比对 conf.d 与库值；replace 会**删掉库里没有的 conf
+文件**（§5.4 红线）。
 
 安全边界：ensure/delete 只认第一标签以 ``dsh-`` / ``dshctl`` 开头的 FQDN
 （实例域名规范 ``dsh-<标签>.<zone>`` 与主控台自己的 ``dshctl``），删除必须逐字
@@ -55,12 +59,14 @@ not_dsh_backend / no_location，给「跑 replace 之前」提供真凭据。
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Iterable
 from typing import Any
 
 import httpx
 
-from .base import IntegrationError, NgSite, NotManaged
+from .base import IntegrationError, LineSink, NgSite, NotManaged
 from .dry_run import DryRunRecorder
 
 DEFAULT_SITE_PREFIXES = ("dsh-", "dshctl")
@@ -107,6 +113,33 @@ def _norm(value: object) -> str:
     return str(value)
 
 
+#: 家族 §4.1 的 401 机器码（ARCHITECTURE.md 错误清单）。响应里出现它们 +
+#: ``{"ok": false, ...}`` 信封 = 回话的是 DSH 系后端，状态码才能当 Host 证据。
+_DSH_ERROR_CODES = frozenset({
+    "bad_key", "unauthenticated", "missing_x_requested_with", "rate_limited",
+})
+
+
+def _looks_like_dsh(resp: httpx.Response) -> bool:
+    """DSH 响应指纹：只认自家信封，别的一律不认（宁 inconclusive 不误判）。
+
+    - 200 且体为 ``{"ok": true}``（/api/healthz 的固定形状）；
+    - 401 且体为 ``{"ok": false, "error": <机器码>}``（准入墙拦在没登录）。
+    DSH 脏 Host 的 403 是裸文本（现网实测 9 字节 forbidden），**不能**靠体证明
+    ——那条通道是编排层传 known_dsh（库里登记过的实例域名）。
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict) or "ok" not in body:
+        return False
+    if resp.status_code == 200 and body.get("ok") is True:
+        return True
+    return (resp.status_code == 401 and body.get("ok") is False
+            and body.get("error") in _DSH_ERROR_CODES)
+
+
 class NgPanel:
     """实现 base.NgProvider。"""
 
@@ -124,6 +157,8 @@ class NgPanel:
         timeout: float = 20.0,
         site_prefixes: tuple[str, ...] = DEFAULT_SITE_PREFIXES,
         upstream_prefixes: tuple[str, ...] = DEFAULT_UPSTREAM_PREFIXES,
+        line_sink: LineSink | None = None,
+        retry_delays: tuple[float, ...] = (4.0, 8.0),
     ) -> None:
         if not base_url:
             raise IntegrationError("nginxWebUI base_url 未配置", code="no_config")
@@ -132,6 +167,8 @@ class NgPanel:
         self._password = password
         self.dry_run = dry_run
         self.recorder = recorder
+        self.line_sink = line_sink    # 编排层接前端点对点日志用（可选，没接走 recorder）
+        self.retry_delays = retry_delays   # 有界重试的递增间隔（最多 len+1 次尝试）
         self.site_prefixes = site_prefixes
         self.upstream_prefixes = upstream_prefixes
         self._owns_client = client is None
@@ -685,28 +722,47 @@ class NgPanel:
         *,
         probe_client: httpx.AsyncClient | None = None,
         timeout: float = 6.0,
+        only_managed: bool = True,
+        all_sites: bool = False,
+        known_dsh: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """replace 之前的体检：**库里的 header_host vs 磁盘的真实生效值**。
 
-        replace 是全面板按库重建，库里任何与磁盘不一致的值都会打回磁盘
-        （例：库里还是 $host:$proxy_port 的脏值 → 重建把好站点洗脏）。控制台
-        没有 VPS 的 SSH 读不到 conf 文件，所以磁盘侧用黑盒探测：
-        ``GET https://<serverName>/api/healthz`` 带 ``Origin: https://<serverName>``
-        ——DSH 准入墙的行为已两次实测：后端收到的 Host 干净 → 401/200；
-        Host 带端口 → 403 forbidden。
+        能力边界（先读这段，别拿它当一致性证明）：
+        - 这一版 nginxWebUI **没有任何读配置文件内容的 API**（getFileContent /
+          getFile / fileContent / confContent 全部 404），磁盘真相只有运维侧
+          只读比对 conf.d 一条路（docs/05）。这里做的是黑盒旁证。
+        - HTTP 状态码**只有能证明后端是 DSH 时才是证据**（DSH 准入墙实测：
+          Host 干净→401/200，Host 带端口→403）。jellyfin/Gogs 这类后端带端口
+          的 Host 照样回 200/401/502；onlyOffice 自家就回 403——拿它们的状态码
+          判 Host 是错的。证明通道只有两条：
+          ① ``known_dsh``：编排层从自己的实例表里传进来的已登记 DSH 实例域名
+             （前缀像我们的站**不算**证明，前缀只是改删守卫）；
+          ② 响应指纹：家族 §4.1 信封——200 且体是 ``{"ok": true}``（healthz），
+             或 401 且体是 ``{"ok": false, "error": <机器码>}``。
+          证明不了的一律 ``inconclusive``：既不判干净也不判脏，不进危险列表。
 
-        判定（逐站点一条，含一致的，供编排层打表）：
-        - ``consistent``：库与盘同一状态（同干净或同脏——同脏 replace 不改东西）；
-        - ``db_dirty``：库里带端口而磁盘干净 → **replace 会把干净站点洗脏，
-          必须先修库（patch_location）再 replace**；
-        - ``disk_dirty``：库干净磁盘脏（人手改过文件）→ replace 会纠正回干净；
-        - ``unreachable``：探测连不上/超时/DNS 没生效——不下结论，绝不当脏或干净；
-        - ``not_dsh_backend``：探测回了别的状态码（非 401/200/403），说明后端不是
-          DSH（或没有 /api/healthz），无法用这个黑盒判定；
-        - ``no_location``：站点没有可判定的 location（半成品/纯静态），跳过判定。
+        判定（逐站点一条，供编排层打表；``dsh_proven`` 标明这条是不是证据）：
+        - ``db_dirty``：**仅适用于已确认为 DSH 的后端**——库里 headerHost 带端口
+          就报（盘净 → replace 会把干净盘洗脏；盘同脏 → 重建后脏到底）。
+          replace 前必须先 patch_location 修库；
+        - ``disk_dirty``：同样仅在已证明 DSH 时——库净而盘脏（403），人手改过
+          文件，replace 能纠正回干净；
+        - ``consistent``：已证明 DSH，库净且盘净（401/200）；
+        - ``inconclusive``：后端证明不了是 DSH（含 403 但无 DSH 特征、任何状态
+          码的非 DSH 形状）——不是证据，不是危险；
+        - ``unreachable``：连不上/超时/DNS 没生效——不下结论；
+        - ``no_location``：站点没有可判定的 location（半成品/纯静态）；
+        - ``foreign_report``：``all_sites=True`` 时列出的他人站点，**只报库值、
+          不发探测、不给判定**。
 
-        enable=0 的站点面板不发布 conf，直接跳过。全程只读：一个写请求都不发。
+        范围：默认 ``only_managed=True`` 只体检我们前缀内（或 ``known_dsh`` 登记过）
+        的站点；他人站点仅当显式 ``all_sites=True``（或 ``only_managed=False``，
+        等价）才列出来——``foreign_report`` 只报库值、不发探测、不给判定。
+        enable=0 的站点面板不发布 conf，跳过。全程只读：一个写请求都不发。
         """
+        known = {str(n).lower() for n in known_dsh}
+        list_foreign = all_sites or not only_managed
         sites = await self._get_page("/api/server/getPage")
         owns_probe = probe_client is None
         client = probe_client or httpx.AsyncClient(timeout=timeout)
@@ -716,14 +772,29 @@ class NgPanel:
                 name = str(rec.get("serverName") or "")
                 if not name or str(rec.get("enable")).lower() not in ("true", "1"):
                     continue
+                managed = (_first_label(name).startswith(self.site_prefixes)
+                           or name.lower() in known)
+                if not managed:
+                    if not list_foreign:
+                        continue
+                    server_id = int(rec["id"])
+                    locations = await self._locations(server_id)
+                    loc = next((l for l in locations if l.get("path") == "/"),
+                               None) or (locations[0] if locations else None)
+                    results.append({
+                        "server_name": name,
+                        "header_host": str((loc or {}).get("headerHost") or ""),
+                        "probe_status": None, "dsh_proven": False,
+                        "verdict": "foreign_report",   # 只报库值，不判
+                    })
+                    continue
                 server_id = int(rec["id"])
                 locations = await self._locations(server_id)
                 loc = next((l for l in locations if l.get("path") == "/"),
                            None) or (locations[0] if locations else None)
                 db_host = str((loc or {}).get("headerHost") or "")
-                row: dict[str, Any] = {"server_name": name,
-                                       "header_host": db_host,
-                                       "probe_status": None}
+                row: dict[str, Any] = {"server_name": name, "header_host": db_host,
+                                       "probe_status": None, "dsh_proven": False}
                 if loc is None or not db_host:
                     row["verdict"] = "no_location"
                     results.append(row)
@@ -737,35 +808,86 @@ class NgPanel:
                     row["verdict"] = "unreachable"   # 连不上≠脏≠干净
                     results.append(row)
                     continue
+                proven = name.lower() in known or _looks_like_dsh(resp)
+                row["dsh_proven"] = proven
                 code = resp.status_code
-                if code not in (200, 401, 403):
-                    row["verdict"] = "not_dsh_backend"
+                if not proven or code not in (200, 401, 403):
+                    row["verdict"] = "inconclusive"   # 不是证据就别当证据
+                elif any(pat in db_host for pat in _FORBIDDEN_HOST_PATTERNS):
+                    # 已确认 DSH + 库脏：盘净则 replace 会把干净盘洗脏，
+                    # 盘同脏则脏到底——无论哪种，replace 前必须先修库。
+                    row["verdict"] = "db_dirty"
+                elif code == 403:
+                    row["verdict"] = "disk_dirty"     # 库净盘脏：手改的文件，replace 能救
                 else:
-                    db_dirty = any(pat in db_host for pat in _FORBIDDEN_HOST_PATTERNS)
-                    disk_clean = code in (200, 401)
-                    if db_dirty and disk_clean:
-                        row["verdict"] = "db_dirty"      # replace 会洗脏，先修库
-                    elif not db_dirty and not disk_clean:
-                        row["verdict"] = "disk_dirty"    # 手改的盘，replace 能救
-                    else:
-                        row["verdict"] = "consistent"
+                    row["verdict"] = "consistent"     # 库净盘净（401/200）
                 results.append(row)
         finally:
             if owns_probe:
                 await client.aclose()
         return results
 
+    # ---------------------------------------------------- 有界重试（面板会忙）
+
+    def _progress(self, line: str) -> None:
+        """面向用户的一行中文：优先走编排层接的 line_sink（前端点对点日志），
+        没接就落 recorder（on_record 也通向日志）；两个都没有就沉默。"""
+        if self.line_sink is not None:
+            self.line_sink("info", line)
+        elif self.recorder is not None:
+            self.recorder.record("ng", "progress", method="", target=self.base_url,
+                                 payload={}, note=line)
+
+    async def _retry_step(self, path: str, *, action: str, verb: str,
+                          tail: str) -> Any:
+        """check / reload 这类可重复步骤的有界重试（默认 3 次尝试，间隔 4s、8s）。
+
+        实测背景：用户同时在面板点「重载配置」时，面板的 replace 会撞上我们
+        正在跑的 nginx -t，check 只回四个字「效验失败」——面板忙是正常工况，
+        不该把一次正常开通判死。只重试 5xx（忙/临时故障）；401/4xx 是确定性的
+        配置或权限问题，重试没有意义，原样立抛。
+        """
+        delays = self.retry_delays
+        attempts = len(delays) + 1
+        last: IntegrationError | None = None
+        for i in range(attempts):
+            try:
+                return await self._api(path, write=True, action=action)
+            except IntegrationError as exc:
+                if exc.code not in ("500", "502", "503", "504"):
+                    raise
+                last = exc
+                if i < attempts - 1:
+                    delay = delays[i]
+                    self._progress(
+                        f"nginxWebUI {verb}未通过（面板可能正被其他操作占用），"
+                        f"{delay:g} 秒后重试 {i + 2}/{attempts}：{exc}")
+                    await asyncio.sleep(delay)
+        gaps = "、".join(f"{d:g}s" for d in delays)
+        raise IntegrationError(
+            f"nginxWebUI {path} 连续 {attempts} 次失败（间隔 {gaps}）："
+            f"面板原文「{last}」。nginxWebUI 可能正被其他操作占用或库与磁盘存在"
+            f"漂移；{tail}",
+            code="ng_busy_or_drift",
+        ) from last
+
     async def reload(self) -> None:
         """生效开关，三步（面板自身源码核定的 API 面语义）：
 
-        1. ``check``：把**数据库**构出的配置写进 temp 跑 ``nginx -t``，不碰真实文件；
-        2. ``replace``：conf.d 整目录清空、按数据库重建（面板 UI「覆盖配置」同义，
-           旧配置由面板记入操作日志。直接在面板外手改过 conf.d 文件的会被重建掉）；
-        3. ``reload``：``nginx -s reload``。
+        1. ``check``：把**数据库**构出的配置写进 temp 跑 ``nginx -t``，不碰真实
+           文件——可重复，允许有界重试（面板并发忙时只回「效验失败」）；
+        2. ``replace``：conf.d 整目录清空、按库重建（面板 UI「覆盖配置」同义，
+           旧配置由面板记入操作日志；面板外手改过的 conf.d 会被重建掉）——
+           **绝不重试**：全面板重建重复执行的代价和不确定性都大，失败立即抛；
+        3. ``reload``：``nginx -s reload``，幂等，允许有界重试。
 
-        API 面的 reload 单发**不会**生成 conf——这正是首轮「库里全有、conf.d 没有、
-        公网 403」的根因；任何一步失败都抛错并停在原地。
+        API 面的 reload 单发**不会**生成 conf——这正是首轮「库里全有、conf.d
+        没有、公网 403」的根因。失败抛错并停在原地，日志里永远不会出现
+        「完成」二字。
         """
-        await self._api("/api/nginx/check", write=True, action="nginx.check")
+        await self._retry_step("/api/nginx/check", action="nginx.check",
+                               verb="校验", tail="本次未改动磁盘上任何配置文件")
         await self._api("/api/nginx/replace", write=True, action="nginx.replace")
-        await self._api("/api/nginx/reload", write=True, action="nginx.reload")
+        await self._retry_step(
+            "/api/nginx/reload", action="nginx.reload", verb="重载",
+            tail="conf 已按库重建落盘，但 nginx -s reload 未成功，新配置尚未生效")

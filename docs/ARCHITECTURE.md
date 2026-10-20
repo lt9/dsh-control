@@ -324,12 +324,23 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 站点接走，而日志照样打"reload 完成"。
 
 > `replace` 是**全面板重建**：`conf.d` 整目录按库重写，`nginx.conf` 里那份逐条
-> `include conf.d/xxx.conf;` 的清单也一起重写。两条推论，都是硬约束：
+> `include conf.d/xxx.conf;` 的清单也一起重写。三条推论，都是硬约束：
 > 1. **绝不可手工编辑 nginx 的任何文件**。手改的内容会在下一次任何人（包括用户自己点 UI 保存）
 >    触发 `replace` 时被无声打回库里的样子。
 > 2. 库里任何一处与磁盘不一致（drift）都是定时炸弹。跑 `replace` 之前必须核对：把库里的
 >    location 逐条与磁盘上对应 conf 的 `proxy_set_header Host` 比对；有漂移就先**走面板**把库
 >    对齐（绝不动文件系统），否则这次重建会把别人正在跑的服务打回坏状态。
+> 3. **红线：库里没有的 conf 文件会被 `replace` 直接删掉**——任何绕过面板塞进 `conf.d` 的
+>    文件（手工加的 server 块、别的工具放的配置）在一次重建后无声消失。往这台面板上加东西，
+>    只有走它自己的库一条路。
+>
+> **控制台没有读磁盘 conf 的能力**：这版 nginxWebUI 不提供任何读配置文件内容的接口
+> （`getFileContent` / `getFile` / `fileContent` / `confContent` 实测全 404）。真正能证明
+> 库盘一致的做法只有**运维侧只读比对 conf.d 与库值**（做法与最近一次实测见
+> `docs/05-故障排查.md`）。`drift_scan` 只是 replace 前的黑盒旁证：HTTP 状态码仅在后端
+> 可证明是 DSH 时才是 Host 证据（登记名单或 §4.1 信封指纹），证明不了一律
+> `inconclusive`——非 DSH 后端（jellyfin/Gogs/onlyOffice…）的 200/401/403/502 一概不是
+> 证据，拿它们判 Host 会给出假警报或假安全感（2026-10 实测翻案）。
 
 ### 5.5 首发验证顺序
 

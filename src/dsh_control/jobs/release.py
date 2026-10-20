@@ -11,9 +11,13 @@ probe_guard → ng_delete → frp_delete → dns_delete → container_stop → m
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 from ..db import repo
 from ..db.models import utcnow
 from ..domain.slug import derive
+from ..integrations.base import IntegrationError, NotManaged
 from .runner import JobCtx, StepFailed
 
 
@@ -27,6 +31,101 @@ def _synthetic_id(v: object) -> bool:
     """空 / 0 / "manual" 一律视为「这一层当初是人工做的或没登记」：
     绝不发删除请求，只提示人工删除。曾经被污染的 "manual" 也在这里兜住。"""
     return v is None or v in ("", 0, "0", "manual")
+
+
+async def idempotent_delete(log: Callable[[str, str], Awaitable[None]],
+                            label: str, obj_name: str,
+                            delete: Callable[[], Awaitable[None]],
+                            find: Callable[[], Awaitable[Any]]) -> None:
+    """释放/回滚的删除包装。区分"本来就没有"与"身份不明"两种查无此 id：
+
+    - 面板按 id 查不到（NotManaged），且按我们该有那条的名字（隧道名/rr/站点名，
+      都带我们自己的前缀）也查不到 → 对象本来就不在（被人工删过/重复释放），
+      记 info 按已删除处理，重跑不报错；
+    - 按名字查得到（但 id 对不上、或名字根本不是我们的）→ 原样上抛 NotManaged。
+      "拒绝盲删"的红线在 integrations 层把守，这里只豁免前者，绝不放宽后者。
+    """
+    try:
+        await delete()
+    except NotManaged:
+        if await find() is None:
+            await log("info", f"{label} {obj_name} 面板上已不存在，视为已删除")
+            return
+        raise
+
+
+async def delete_ng_upstream(ng: Any, upstream_id: int | None, upstream_name: str,
+                             log: Callable[[str, str], Awaitable[None]]) -> bool:
+    """删我们自己的 NG upstream 并回读确认（删站点时顺手带走，漏一次攒一条孤儿）。
+
+    - 面板 provider 没有 delete_upstream（noop 层）→ warn 提示人工删，不算失败；
+    - 按名字回读不到 → 本来就没有，info 通过（幂等）；
+    - 删除后/身份对不上仍看得到 → **error 点名人工删**，返回 False。
+      这一步不把释放拖失败：残留已大声记录，人比机器更会删一条 upstream。
+      id 缺失时按名字找到谁删谁——upstream 名带 DSH_ 前缀守卫，删不到别人头上。
+      _find_upstream 是 ng_panel 的扩展读接口：没有它就没有回读确认可言。
+    """
+    if not upstream_name:
+        return True
+    deleter = getattr(ng, "delete_upstream", None)
+    if deleter is None:
+        await log("warn", f"NG provider 不支持删 upstream：请人工在面板删除 {upstream_name}")
+        return True
+    find = getattr(ng, "_find_upstream", None)
+    if find is not None and await find(upstream_name) is None:
+        await log("info", f"NG upstream {upstream_name} 已不存在，跳过")
+        return True
+    target = upstream_id
+    if target is None or target in (0, "0"):
+        rec = await find(upstream_name) if find is not None else None
+        if rec is None:
+            await log("error", f"upstream {upstream_name} 无登记 id 且查不到定位，需人工删")
+            return False
+        target = int(rec["id"])
+    try:
+        await deleter(int(target), expect_name=upstream_name)
+    except NotManaged as exc:
+        if find is not None and await find(upstream_name) is None:
+            await log("info", f"NG upstream {upstream_name} 已不存在，视为已删除")
+            return True
+        await log("error", f"NG 里残留 upstream {upstream_name}（{exc}），需人工删")
+        return False
+    except IntegrationError as exc:
+        await log("error", f"NG 里残留 upstream {upstream_name}（删除失败：{exc}），需人工删")
+        return False
+    if find is not None and await find(upstream_name) is not None:
+        await log("error", f"NG 里残留 upstream {upstream_name}（删除后仍可见），需人工删")
+        return False
+    await log("info", f"已删除 NG upstream {upstream_name}（回读确认不在）")
+    return True
+
+
+# 开通失败回滚后要清空的登记字段：那次部署什么都没留下，库里留着指向已不存在
+# 对象的 id 就是假凭据——页面显示一条不存在的隧道，下一轮释放还拿死 id 去删。
+# 含 frp_remote_port：回滚的实例没占住任何隧道，端口该放回池子给下一个实例
+# （释放成功路径不同：那边按契约保留端口不复用，不走这里）。
+# 键=字段名，值=清空后的缺省。
+EXTERNAL_ID_FIELDS: dict[str, Any] = {
+    "dns_record_id": "",
+    "frp_proxy_id": None,
+    "frp_remote_port": None,
+    "ng_server_id": None,
+    "ng_location_id": None,
+    "ng_upstream_id": None,
+    "ng_upstream_name": "",
+}
+
+
+async def clear_external_ids(ctx: JobCtx, inst: Any, *, reason: str) -> None:
+    """清空指向已删对象的 id（含 frp 公网端口：清了才允许后续实例重新用这个端口）。"""
+    cleared = {f: getattr(inst, f) for f in EXTERNAL_ID_FIELDS
+               if getattr(inst, f, None) not in (None, "")}
+    for f, default in EXTERNAL_ID_FIELDS.items():
+        setattr(inst, f, default)
+    await ctx.s.commit()
+    if cleared:
+        await ctx.event("external_ids_cleared",
+                        f"{reason}，外部 id 已清空: {cleared}", cleared)
 
 
 async def run_release(ctx: JobCtx) -> None:
@@ -54,18 +153,37 @@ async def run_release(ctx: JobCtx) -> None:
                              "upstream": inst.ng_upstream_name})
         elif inst.ng_server_id and not _synthetic_id(inst.ng_server_id):
             server_id = inst.ng_server_id
-            await ctx.ng().delete_site(server_id, expect_name=inst.dns_name)
+            await idempotent_delete(
+                ctx.log, "NG 站点", inst.dns_name,
+                lambda: ctx.ng().delete_site(server_id, expect_name=inst.dns_name),
+                lambda: ctx.ng().find_site(inst.dns_name))
             await ctx.ng().reload()
+            # 站点删了不删 upstream，就是在面板里攒孤儿（dsh-01 实测踩过）
+            up_name = inst.ng_upstream_name or names.upstream
+            up_ok = await delete_ng_upstream(ctx.ng(), inst.ng_upstream_id,
+                                             up_name, ctx.log)
             await ctx.event(
                 "release_ng_deleted",
-                f"已删除 NG 站点 server_id={server_id} name={inst.dns_name}",
+                f"已删除 NG 站点 server_id={server_id} name={inst.dns_name}"
+                + ("" if up_ok else f"；upstream {up_name} 残留，见 error 日志"),
                 {"server_id": server_id, "server_name": inst.dns_name,
-                 "upstream": inst.ng_upstream_name},
+                 "upstream": up_name, "upstream_cleanup_ok": up_ok},
             )
             inst.ng_server_id = None
             inst.ng_location_id = None
+            if up_ok:
+                inst.ng_upstream_id = None
+                inst.ng_upstream_name = ""
             await ctx.s.commit()
         else:
+            # 站点没登记也要清 upstream：站点已删、upstream 忘了删正是残留形态
+            up_name = inst.ng_upstream_name or names.upstream
+            up_ok = await delete_ng_upstream(ctx.ng(), inst.ng_upstream_id,
+                                             up_name, ctx.log)
+            if up_ok:
+                inst.ng_upstream_id = None
+                inst.ng_upstream_name = ""
+                await ctx.s.commit()
             st.state = "skipped"
             st.detail = (f"无 NG 站点登记（server_id={inst.ng_server_id!r}）：跳过；"
                          f"若面板上存在 {inst.dns_name} 请人工删除")
@@ -83,13 +201,28 @@ async def run_release(ctx: JobCtx) -> None:
                             {"name": names.tunnel, "remote_port": inst.frp_remote_port})
         elif inst.frp_proxy_id and not _synthetic_id(inst.frp_proxy_id):
             proxy_id = inst.frp_proxy_id
-            await ctx.frp().delete(proxy_id, expect_name=names.tunnel)
+            client_id = ctx.host.frpc_client_id
+
+            async def frp_still_there() -> object:
+                # 双探测（D4）：登记的 proxy_id 还能查到东西 = 那个 id 上现在是
+                # 别家的对象——即便我们的隧道名查无，也拒当"已删除"，更不许删它；
+                # id 没了且我们的名字也查无，才是"本来就没有"。
+                got = await ctx.frp().get(proxy_id)
+                return got if got is not None else await ctx.frp().find_by_name(
+                    names.tunnel, client_id)
+
+            await idempotent_delete(
+                ctx.log, "frp 隧道", names.tunnel,
+                lambda: ctx.frp().delete(proxy_id, expect_name=names.tunnel),
+                frp_still_there)
             await ctx.event(
                 "release_frp_deleted", f"已删除隧道 {names.tunnel} proxy_id={proxy_id}",
                 {"proxy_id": proxy_id, "name": names.tunnel,
                  "remote_port": inst.frp_remote_port},
             )
             inst.frp_proxy_id = None
+            # frp_remote_port 故意保留（test_release 钉死的契约）：公网端口不复用，
+            # 防新实例撞上一条对端还没清干净的旧隧道。只有开通失败回滚才放回池子。
             await ctx.s.commit()
         else:
             st.state = "skipped"
@@ -109,7 +242,10 @@ async def run_release(ctx: JobCtx) -> None:
                                                        "dns_name": inst.dns_name})
         elif inst.dns_record_id and not _synthetic_id(inst.dns_record_id):
             record_id = inst.dns_record_id
-            await ctx.dns().delete(record_id)
+            await idempotent_delete(
+                ctx.log, "DNS 记录", slug,
+                lambda: ctx.dns().delete(record_id),
+                lambda: ctx.dns().find(slug))
             await ctx.event(
                 "release_dns_deleted", f"已删除 DNS 记录 {inst.dns_name} RecordId={record_id}",
                 {"record_id": record_id, "rr": slug, "dns_name": inst.dns_name},

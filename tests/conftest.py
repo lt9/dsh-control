@@ -128,8 +128,12 @@ class FakeNg:
         self.journal = journal
         self.manual_required = manual
         self.sites: dict[int, NgSite] = {}
+        # upstream 独立记账：真实面板里 upstream 不随站点删，孤儿就是这么攒的
+        self.upstreams: dict[int, dict] = {}
+        self.fail_reload = False
         self.reloads = 0
         self._n = 0
+        self._u = 0
 
     async def find_site(self, server_name: str) -> NgSite | None:
         return next((s for s in self.sites.values() if s.server_name == server_name), None)
@@ -146,10 +150,13 @@ class FakeNg:
             return NgSite(server_id=0, server_name=server_name,
                           location_id=0, header_host=header_host,
                           websocket=websocket)
+        self._u += 1
+        uid = self._u * 100
+        self.upstreams[uid] = {"id": uid, "name": upstream_name}
         self._n += 1
         site = NgSite(server_id=self._n, server_name=server_name,
-                      location_id=self._n * 10, header_host=header_host,
-                      websocket=websocket)
+                      upstream_id=uid, location_id=self._n * 10,
+                      header_host=header_host, websocket=websocket)
         self.sites[self._n] = site
         return site
 
@@ -160,7 +167,24 @@ class FakeNg:
         self.journal.add("ng.delete", site.server_name, f"id={server_id}")
         del self.sites[server_id]
 
+    async def _find_upstream(self, name: str) -> dict | None:
+        # 与 ng_panel 同名同德性：按名字在分页里精确匹配
+        return next((u for u in self.upstreams.values() if u["name"] == name), None)
+
+    async def delete_upstream(self, upstream_id: int, *, expect_name: str) -> None:
+        assert expect_name.startswith(("DSH_", "DSHCTL_")), expect_name
+        rec = next((u for u in self.upstreams.values() if u["id"] == upstream_id), None)
+        if rec is None or rec["name"] != expect_name:
+            raise NotManaged(
+                f"删除被拦：upstream_id={upstream_id} 查不到 / 名字不是 {expect_name!r}")
+        self.journal.add("ng.delete_upstream", expect_name, f"id={upstream_id}")
+        del self.upstreams[upstream_id]
+
     async def reload(self) -> None:
+        if self.fail_reload:
+            # 模拟 dsh-01 实测：对象都建好了，reload 的 nginx -t 与面板并发写撞车
+            from dsh_control.integrations.base import IntegrationError
+            raise IntegrationError("nginx -t 失败（面板并发重载）", code="ng_check")
         self.journal.add("ng.reload")
         self.reloads += 1
 

@@ -52,7 +52,7 @@ export interface InstanceDetail {
     captured_at: string | null;
   } | null;
   last_error: string | null; released_at: string | null;
-  actions: { restart: boolean; release: boolean };
+  actions: { restart: boolean; release: boolean; deploy: boolean };
 }
 
 export interface TokenResp { token: string | null; url: string | null; captured_at: string | null }
@@ -171,6 +171,9 @@ export const api = {
     http<unknown>(`/instances/${id}`, { method: "PATCH", json: { owner_label } }),
   restart: (id: number | string) =>
     http<{ job_id: number }>(`/instances/${id}/restart`, { method: "POST", json: {} }),
+  /** 开通失败后续建：从失败那一步接着做，已建好的外部对象会被跳过而不是重建。 */
+  deploy: (id: number | string) =>
+    http<{ job_id: number }>(`/instances/${id}/deploy`, { method: "POST", json: {} }),
   /** confirm 必须逐字等于 slug，由前端填（§4/§9），用户不打字；防误靠按住式确认 UI。 */
   release: (id: number | string, confirm: string) =>
     http<{ job_id: number }>(`/instances/${id}/release`, { method: "POST", json: { confirm } }),

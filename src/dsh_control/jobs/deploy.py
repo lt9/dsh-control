@@ -13,6 +13,7 @@ from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.frp_port import pick_free_port
 from ..domain.slug import derive, dns_rr
 from .capture import capture_token
+from .release import clear_external_ids, delete_ng_upstream, idempotent_delete
 from .runner import JobCtx, StepFailed
 
 
@@ -65,6 +66,16 @@ async def run_deploy(ctx: JobCtx) -> None:
     dns_name = inst.dns_name or names.server_name
     public_url = inst.public_url or f"https://{dns_name}"
     data_dir = f"{host.data_root.rstrip('/')}/{slug}"
+
+    # 回滚兜底。runner 按 reversed() 倒序执行，这里最先 append 就最后执行：
+    # 外部对象都清完之后，把库里指向它们的登记 id 全部抹掉——开通失败那次什么
+    # 都没留下，死 id 留着就是假凭据（页面显示一条不存在的隧道，后续释放还拿
+    # 死 id 去删，实测卡死过释放）。含 frp_remote_port：回滚实例没占住隧道，
+    # 端口该放回池子供下一个实例用（释放成功路径不同，那边按契约保留端口）。
+    ctx.rollback_actions.append(
+        ("external_ids_clear", lambda: clear_external_ids(
+            ctx, inst, reason="开通失败已回滚"))
+    )
 
     # ---- 10 plan：slug 已在建实例时生成；去 DNS 与库确认未被占用（无副作用）
     async with ctx.step(10, "plan", "域名标签查重") as st:
@@ -161,7 +172,10 @@ async def run_deploy(ctx: JobCtx) -> None:
                 st_skip_dns = False
             if not st_skip_dns:
                 ctx.rollback_actions.append(
-                    ("dns_delete", lambda rid=rec.record_id: ctx.dns().delete(rid))
+                    ("dns_delete", lambda rid=rec.record_id, r=rr: idempotent_delete(
+                        ctx.log, "DNS 记录", r,
+                        lambda: ctx.dns().delete(rid),
+                        lambda: ctx.dns().find(r)))
                 )
                 back = await ctx.dns().find(rr)
                 if back is None:
@@ -215,9 +229,20 @@ async def run_deploy(ctx: JobCtx) -> None:
                                 f"frp 层返回合成 id，需人工补做并回填: {names.tunnel}",
                                 {"name": names.tunnel, "remote_port": port})
             else:
+                client_id = host.frpc_client_id
+
+                async def frp_still_there(pid: int = tunnel.proxy_id,
+                                          n: str = names.tunnel) -> object:
+                    # 与 release 第 30 步同款双探测：id 还见得到东西就拒判"已删除"
+                    got = await ctx.frp().get(pid)
+                    return got if got is not None else await ctx.frp().find_by_name(
+                        n, client_id)
+
                 ctx.rollback_actions.append(
-                    ("frp_delete", lambda pid=tunnel.proxy_id, n=names.tunnel: ctx.frp().delete(
-                        pid, expect_name=n))
+                    ("frp_delete", lambda pid=tunnel.proxy_id, n=names.tunnel: idempotent_delete(
+                        ctx.log, "frp 隧道", n,
+                        lambda: ctx.frp().delete(pid, expect_name=n),
+                        frp_still_there))
                 )
                 inst.frp_proxy_id = tunnel.proxy_id
                 inst.frp_remote_port = tunnel.remote_port or port
@@ -271,17 +296,30 @@ async def run_deploy(ctx: JobCtx) -> None:
                                 f"NG 层返回合成 id，需人工补做并回填: {dns_name}",
                                 {"server_name": dns_name, "upstream": names.upstream})
             else:
+                # upstream 删除必须排在站点删除**之后**执行；runner 倒序跑
+                # rollback_actions，所以 append 顺序是反的：先 upstream 后站点。
+                if not _synthetic_id(site.upstream_id):
+                    ctx.rollback_actions.append(
+                        ("ng_upstream_delete",
+                         lambda uid=site.upstream_id, un=names.upstream: delete_ng_upstream(
+                             ctx.ng(), uid, un, ctx.log))
+                    )
                 ctx.rollback_actions.append(
-                    ("ng_delete", lambda sid=site.server_id, n=dns_name: ctx.ng().delete_site(
-                        sid, expect_name=n))
+                    ("ng_delete", lambda sid=site.server_id, n=dns_name: idempotent_delete(
+                        ctx.log, "NG 站点", n,
+                        lambda: ctx.ng().delete_site(sid, expect_name=n),
+                        lambda: ctx.ng().find_site(n)))
                 )
                 await ctx.ng().reload()  # ensure_site 不会自动 reload（对接要点 1）
                 inst.ng_upstream_name = names.upstream
+                inst.ng_upstream_id = (None if _synthetic_id(site.upstream_id)
+                                       else site.upstream_id)
                 inst.ng_server_id = site.server_id
                 inst.ng_location_id = site.location_id
                 await ctx.s.commit()
                 await ctx.event("ng_created", f"站点 {dns_name} server_id={site.server_id}",
                                 {"server_id": site.server_id, "upstream": names.upstream,
+                                 "upstream_id": site.upstream_id,
                                  "location_id": site.location_id})
 
     # ---- 60 container_deploy：跑 kit 的 new-instance.sh + deploy.sh。
