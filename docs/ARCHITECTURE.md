@@ -118,11 +118,11 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | GET | `/api/overview` | `{running, unhealthy, released, hosts, by_host[]}` |
 | GET | `/api/hosts` | 主机列表（不含密钥） |
 | GET | `/api/instances?q=&state=` | `q` 匹配 slug / owner_label / dns_name |
-| POST | `/api/instances` | `{owner_label, host_id, note?}` → `{instance_id, dns_name, job_id}`；域名前缀由服务端生成（§6.1） |
+| POST | `/api/instances` | 请求体可为空，或 `{host_id?}`（不传就由服务端按剩余空间选主机）→ `{instance_id, dns_name, job_id}`；slug 与端口一律服务端生成（§6.1.1），**任何情况下不接受用户传入的名字** |
 | GET | `/api/instances/{id}` | 详情，见下 |
 | GET | `/api/instances/{id}/token` | **现取**：SSH 抓容器日志里的最新一键地址，落库后返回 |
 | POST | `/api/instances/{id}/restart` | → `{job_id}` |
-| POST | `/api/instances/{id}/release` | `{confirm}` 必须逐字等于 `slug`，否则 422 → `{job_id}` |
+| POST | `/api/instances/{id}/release` | `{confirm}` 必须逐字等于 `slug`，否则 422 → `{job_id}`。**这个值由前端自己填**（前端知道 slug），用户不需要打字；防误操作靠 §9 的按住式确认，不靠输入 |
 | GET | `/api/jobs/{id}` | `{kind,state,steps:[{seq,key,title,state,detail}]}` |
 | GET | `/api/jobs/{id}/logs` | 增量日志：`?after=<id>` → `{items:[{id,seq,level,line,ts}], next}` |
 | GET | `/api/jobs/{id}/stream` | SSE，`step` / `log` / `done` 三种事件 |
@@ -199,7 +199,10 @@ intervalSeconds:0}, localIP, localPort, plugin:null, remotePort}`。
 RPC 签名 v1（HMAC-SHA1），endpoint `alidns.aliyuncs.com`。只用三个 Action：
 `DescribeDomainRecords`（查，含按 RR 精确查）、`AddDomainRecord`、`DeleteDomainRecord`。
 硬白名单：`DomainName` 必须等于 `DSHC_DNS_ZONE`（默认 `pipboy.cn`），`RR` 必须以
-`DSHC_DNS_PREFIX`（默认 `dshsub`）或 `dshctl` 开头，否则拒绝。记录固定 `Type=A`、
+`DSHC_DNS_PREFIX`（默认 `dsh-`）或 `dshctl` 开头，否则拒绝。`RR` 只能是**一级**子域
+（不含点），因为现成证书 `CN=*.pipboy.cn`、SAN 只有 `*.pipboy.cn` 与 `pipboy.cn`，
+通配符只覆盖一层；`wife.dsh.pipboy.cn` 这种两级名字会撞上证书不覆盖。本控制台**不申请
+自己的证书**，只复用 NG 里 acme.sh 自动续期的那张通配证书。记录固定 `Type=A`、
 `Value=DSHC_INGRESS_IP`（默认 `8.134.168.14`）、`TTL=600`。删除只按 `RecordId`，且该 id
 必须是库里登记过的。已实测：`pipboy.cn` 共 74 条，`dshsub1 A → 8.134.168.14`
 `RecordId=2112523148163198976`。
@@ -231,7 +234,7 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 
 | seq | key | 做什么 | 失败怎么办 |
 |---|---|---|---|
-| 10 | `plan` | 生成 slug：取 `DSHC_DNS_PREFIX` + 现有实例最大序号+1；查 DNS 确认未被占 | 直接失败，无副作用 |
+| 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
 | 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位 | 无副作用 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
 | 40 | `frp_create` | 建隧道（remotePort 从 4893 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
@@ -242,6 +245,25 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 | 90 | `verify` | 跑 kit 的 `verify.sh <slug>`，收条目数 | 记录，不推翻成功 |
 
 每步把命令、耗时、stdout 摘要写进 `deploy_steps`，前端按 seq 逐条点亮。
+
+#### 6.1.1 域名与命名规则（全部程序生成，用户不输入）
+
+`slug` 就是域名标签，同时当释放时的二次确认词，三处必须一致：
+
+- 形态：`dsh-NN`（两位零填充，`dsh-01`、`dsh-02`…），完整域名 `dsh-NN.pipboy.cn`。
+  只能是**一级**子域：现成证书 `CN=*.pipboy.cn`、SAN 只有 `*.pipboy.cn` 与 `pipboy.cn`，
+  通配符只覆盖一层，两级名字会证书不覆盖。本控制台**不申请自己的证书**，只复用 NG 里
+  acme.sh 自动续期那张。
+- **不允许用户输入或修改标签**。新建流程里标签由服务端按 `dsh-` + 现有实例最大序号 + 1
+  生成，创建后不可改（域名写进 DSH 的 `PUBLIC_URL` 与 `TRUSTED_HOSTS`，改名等于重开一个）。
+- 唯一性：`instances.slug` 唯一 + `dns.find(rr)` 为空 + VPS 上公网端口未占用，三者都过才继续。
+- 主机也由服务端选：`enabled` 主机里 `data_root` 剩余空间最大的那台（机械盘优先，
+  见 `DSHC_PREFER_HDD`），新建确认页只做展示，允许用一次点击换另一台（不输入）。
+- 给谁用的名字（`owner_label`）**不在新建流程里问**。它是事后可选的备注，在列表或详情页
+  点铅笔就地改，改它不影响域名、容器名或任何外部对象。
+- 派生名一律从 slug 出：容器名 `dsh-NN`、隧道名 `dsh_NN`（点换下划线）、NG upstream
+  `DSH_NN`、NG 站点 `server_name` 用完整域名。
+- 历史遗留的 `dshsub1` 不参与推导也不改名，它由人工拆除（docs/SEED.md §2）。
 
 ### 6.2 释放 `release`（二次确认后）
 
@@ -272,7 +294,7 @@ DSHC_LISTEN_HOST/PORT        0.0.0.0 / 13300
 DSHC_SESSION_DAYS            默认 7
 DSHC_INGRESS_IP              8.134.168.14
 DSHC_DNS_ZONE                pipboy.cn
-DSHC_DNS_PREFIX              dshsub
+DSHC_DNS_PREFIX              dsh-
 DSHC_PUBLIC_BASE             https://dshctl.pipboy.cn
 DSHC_BACKUP_WINDOW           03:20-04:00
 DSHC_RESTART_COOLDOWN        600
@@ -305,3 +327,16 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 约定：中文界面；状态色语义固定（running 绿、unhealthy/restarting 琥珀、error 红、
 released 灰）；所有时间按 `Asia/Shanghai`；复制成功要有可见反馈；表格与日志里的
 token 默认打码，点一下才展开。
+
+**交互做减法**（用户原话：有选择困难症，别让他输入这啊那啊）。落到界面上是硬要求：
+
+- 全系统只有两处需要用户输入：登录页粘贴密钥、给实例改备注名（且后者是点铅笔之后的
+  就地编辑，不做也是完整可用的）。新建、释放、重启、探活都不许要求打字。
+- 新建只有一个动作：点「新建」→ 一张自动填好的确认卡（域名、主机、资源、数据盘、
+  公网端口，全部程序生成，写清楚是自动生成）→ 点「开始部署」。要换主机是卡片上
+  一次点击的事，不是表单。
+- 释放的二次确认用**按住确认**（长按 1.5 秒才触发，松手取消），配合后果清单：会删解析、
+  删隧道、删 nginx 站点，容器只停不删，数据保留，以后不能恢复。服务端仍然要求
+  `confirm == slug`，由前端填。
+- 危险与不可逆动作不用弹窗套弹窗，一屏内把后果说完。
+- 不显示用户用不上的字段（镜像 id、内部状态机原始值这类收进次要位置或不显示）。
