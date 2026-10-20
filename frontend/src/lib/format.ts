@@ -90,7 +90,9 @@ export function maskMiddle(v: string, keepHead = 4, keepTail = 3): string {
   return `${v.slice(0, keepHead)}········${v.slice(-keepTail)}`;
 }
 
-/** 一键地址里的 token 段打码：只藏 token 值，域名照常可读。 */
+/** 一键地址里的 token 段打码：只藏 token 值，域名照常可读。
+ *  形态与"登录密钥"那一行统一（头 4 尾 3），否则同一枚密钥在同一个页面上
+ *  一处显示 aftb········FFI、一处显示 ········，核对的人会以为不是同一枚。 */
 export function maskUrlToken(url: string): string {
-  return url.replace(/(token=)[^&#]+/, (_m, p: string) => `${p}········`);
+  return url.replace(/(token=)([^&#]+)/, (_m, p: string, tok: string) => `${p}${maskMiddle(tok)}`);
 }

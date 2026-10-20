@@ -154,7 +154,11 @@ def create_app(db: Db | None = None, providers: Any | None = None,
                 return FileResponse(candidate)
             index = sdir / "index.html"
             if index.is_file():
-                return FileResponse(index)
+                # 入口 HTML 一律不许缓存。assets 带内容哈希，长期缓存没问题；
+                # index.html 没有哈希，这里不发 Cache-Control 时浏览器按 Last-Modified
+                # 启发式缓存，新版上线后老用户会一直跑旧前端。2026-10-21 现网就这么
+                # 把"要打字确认"的新页跑成"点一下就部署"的旧页，凭空开出一台公网实例。
+                return FileResponse(index, headers={"Cache-Control": "no-cache"})
             return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
     else:
         @app.get("/", include_in_schema=False)

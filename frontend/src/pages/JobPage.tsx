@@ -170,20 +170,30 @@ function DonePanel({ instanceId, restart = false }: { instanceId: number; restar
     got.current = true;
     void (async () => {
       try {
-        const [d, t] = await Promise.all([api.instance(instanceId), api.token(instanceId)]);
-        setDet(d); setUrl(t.url ?? null);
+        const d = await api.instance(instanceId);
+        setDet(d);
+        // 已回收的实例没有可用的公网入口，别再"现取一键地址"（容器已停，取到也是死链，
+        // 还会让外行以为这串地址照样能用）。
+        if (d.state === "released") return;
+        const t = await api.token(instanceId);
+        setUrl(t.url ?? null);
       } catch (e) {
         setErr(e instanceof Error ? e.message : String(e));
       }
     })();
   }, [instanceId]);
 
+  const gone = det?.state === "released";
+
   return (
     <div className="card done-panel" style={{ marginBottom: 16 }}>
       <h2>{restart ? "已重启，密钥已换新" : "开通完成"}</h2>
       <p className="mut small">{restart ? "旧密钥已失效，下面这串是新的。" : "把这串地址发给他：手机打开就能用，不用再登录。"}</p>
       {det && <p className="small">{det.owner_label || det.slug} · <span className="mono">{det.network?.dns_name}</span></p>}
-      {url
+      {gone
+        ? <p className="mut small" style={{ marginTop: 12 }}>这台已回收：公网入口注销、容器已停，
+            地址不再有效（数据还在，档案留着）。</p>
+        : url
         ? <>
             <code className="big-url">{url}</code>
             <CopyButton text={url} label="复制一键地址" big />
