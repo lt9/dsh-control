@@ -147,6 +147,7 @@ class FakeNg:
                           websocket: bool = True) -> NgSite:
         assert header_host == "$host", "headerHost 必须是 $host（NG-API.md）"
         assert websocket, "websocket 必须开"
+        assert cert_name, "443 站点必须带通配证书名：ssl=0 的 443 配置 nginx -t 过不了"
         self.journal.add("noop.ng.ensure" if self.manual_required
                          else "ng.ensure", server_name, upstream_name, upstream_server)
         if self.manual_required:
@@ -309,6 +310,8 @@ def make_settings(**over) -> Settings:
         "provider_dns": "aliyun", "provider_frp": "frp_panel", "provider_ng": "nginxwebui",
         "frp_port_start": 4893,
         "dsh_image": "dsh-test:v9",
+        # 443 站点必须带现成通配证书名（现网实测：ssl=0 的 443 面板配置过不了 nginx -t）
+        "wildcard_cert_name": "*.example.test",
         "wait_healthy_seconds": 1,
         "poll_interval": 1,
     }

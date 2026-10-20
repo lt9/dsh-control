@@ -879,22 +879,39 @@ class NgPanel:
         ) from last
 
     async def reload(self) -> None:
-        """生效开关，三步（面板自身源码核定的 API 面语义）：
+        """把库里的配置推到 nginx。顺序是 2026-10-21 现网实测纠正过的：
 
-        1. ``check``：把**数据库**构出的配置写进 temp 跑 ``nginx -t``，不碰真实
-           文件——可重复，允许有界重试（面板并发忙时只回「效验失败」）；
-        2. ``replace``：conf.d 整目录清空、按库重建（面板 UI「覆盖配置」同义，
-           旧配置由面板记入操作日志；面板外手改过的 conf.d 会被重建掉）——
-           **绝不重试**：全面板重建重复执行的代价和不确定性都大，失败立即抛；
+        0. ``check``（**预检只提醒、不拦**）：校验的是**磁盘当前**配置。它过不了
+           通常意味着库里已有还没落盘的对象（第 1 步会补上），也可能是有人面板外
+           手改坏了 conf。这里只记一行警告——拿它当闸门会把所有开通永久卡死。
+        1. ``replace``：conf.d 整目录按库重建（面板 UI「覆盖配置」同义，旧配置进
+           面板操作日志与备份表；面板外手改过的 conf.d 会被重建掉）——**绝不重试**。
+        2. ``check``（**硬闸**）：这时磁盘文件齐了，校验才有意义。不过就**不 reload**：
+           nginx 还在跑内存里的旧配置，用户正在服务的东西一根汗毛都没动。
         3. ``reload``：``nginx -s reload``，幂等，允许有界重试。
 
-        API 面的 reload 单发**不会**生成 conf——这正是首轮「库里全有、conf.d
-        没有、公网 403」的根因。失败抛错并停在原地，日志里永远不会出现
-        「完成」二字。
+        为什么 ``check`` 不能排在 ``replace`` 前面当闸门：面板 check 把库拼进临时主
+        配置，而主配置里的 ``include conf.d/upstreams.<name>.conf`` 指的是**磁盘**文件；
+        新建对象只有 replace 之后才有文件。所以"库里多一条还没落盘的对象"必然让 check
+        失败——当晚用「只建一条 upstream → check 失败 → 删掉 → check 成功」可逆实验
+        坐实，此前两次真实开通都卡在这上面（当时的报错把它误读成"面板正被占用"）。
+
+        真要把配置退回去：面板每次操作都把配置快照进自己的备份表，UI「备份恢复」
+        一键回到操作前，见 docs/05-故障排查.md。
         """
-        await self._retry_step("/api/nginx/check", action="nginx.check",
-                               verb="校验", tail="本次未改动磁盘上任何配置文件")
+        try:
+            # dry-run 不发预检：它不写库也不落盘，跑一次 nginx -t 只是白占面板。
+            if not self.dry_run:
+                await self._api("/api/nginx/check", write=False, action="nginx.check")
+        except IntegrationError as exc:
+            self._progress(f"[体检警告] replace 前磁盘配置校验未过：{exc}。"
+                           "常见原因是库里已有尚未落盘的对象（下一步 replace 会补上），"
+                           "也可能是面板外手改过 conf；继续按库重建")
         await self._api("/api/nginx/replace", write=True, action="nginx.replace")
         await self._retry_step(
+            "/api/nginx/check", action="nginx.check", verb="校验",
+            tail="conf 已按库重建落盘但校验不过，本次**没有 reload**：nginx 仍跑旧配置，"
+                 "要回退用面板的「备份恢复」")
+        await self._retry_step(
             "/api/nginx/reload", action="nginx.reload", verb="重载",
-            tail="conf 已按库重建落盘，但 nginx -s reload 未成功，新配置尚未生效")
+            tail="conf 已按库重建落盘且校验通过，但 nginx -s reload 未成功，新配置尚未生效")

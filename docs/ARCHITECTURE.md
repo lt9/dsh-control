@@ -318,8 +318,16 @@ Base：`http://203.0.113.10:18180`，账号在 `credentials(ng_panel)`。`/api/*
 
 **API 只写库，不落盘**（真机踩出来的，面板自己的前端也是这么走的）：`insertOrUpdate*` 全部只写
 sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保存站点后前端替用户调的就是它；
-`/api/nginx/reload` 只是 `nginx -s reload`，**不物化**。所以 `reload()` 是三步：`check`（把库
-构出的配置写 temp 跑 `nginx -t`，不碰真实文件）→ `replace` → `reload`，任一步失败就停在原位。
+`/api/nginx/reload` 只是 `nginx -s reload`，**不物化**。所以 `reload()` 是四步：软预检
+`check` → `replace`（按库落盘）→ 硬闸 `check` → `reload`，任一步失败就停在原位。
+
+**`check` 不能排在 `replace` 前面当闸门**（2026-10-21 现网实测，此前把它当闸门，两次真实
+开通都卡在这）：面板 check 把库拼进临时主配置，而主配置里 `include conf.d/upstreams.X.conf`
+指的是**磁盘**文件；新建对象只有 `replace` 之后才有文件。所以「库里多一条还没落盘的对象」
+必然让 check 失败——用「只建一条 upstream → check 失败 → 删掉 → check 恢复」的可逆实验坐实。
+于是预检只提醒不拦（拿它当闸 = 一次遗留脏库把所有开通永久卡死），硬闸移到 `replace` 之后：
+校验不过就不 `reload`，nginx 仍跑内存里的旧配置，用户正在服务的东西不受影响，回退走面板
+「备份恢复」（面板每次操作都自动快照进 sqlite 的 `bak` 表）。
 漏了 `replace` 的症状最难查：库里站点、location、后端全对，`conf.d` 里却没有文件，请求被别的
 站点接走，而日志照样打"reload 完成"。
 

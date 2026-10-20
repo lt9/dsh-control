@@ -143,7 +143,12 @@ async def run_deploy(ctx: JobCtx) -> None:
         # 代码里不许猜、不许回落 ingress_ip——云上无 NAT 回环，公网 IP 在入口机上不通。
         frps_host = ctx.settings.require("frps_upstream_host")
         image = ctx.settings.require("dsh_image")
+        # 443 必须挂证书：面板里 ssl=0 的 443 站点拼出来的配置 nginx 校验不过，
+        # 而且公网地址是 https，不挂证书等于建成就用不了。用现成通配证书，不签新的。
+        ctx.settings.require("wildcard_cert_name")
         await ctx.log("info", f"slug={slug} 域名={dns_name} 容器={names.container}")
+        await ctx.log("info", f"NG 挂现成通配证书 {ctx.settings.wildcard_cert_name}"
+                              "（443 不挂证书的面板配置过不了 nginx -t；本站不签新证书）")
         await ctx.log("info", f"镜像（准备好的版本，开通阶段永不构建）：{image}"
                               "——20 步会在目标主机上核验它在位")
         await ctx.log("info", f"NG 将以 {frps_host} 回源（frps 监听地址，"
@@ -327,6 +332,7 @@ async def run_deploy(ctx: JobCtx) -> None:
                 upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
                                 f":{inst.frp_remote_port}",
                 listen_port=443, header_host="$host", websocket=True,
+                cert_name=ctx.settings.require("wildcard_cert_name"),
             )
             st.detail = (
                 "NG provider = noop，需人工配置反向代理：\n"
@@ -335,6 +341,8 @@ async def run_deploy(ctx: JobCtx) -> None:
                 f":{inst.frp_remote_port}\n"
                 f"  server_name {dns_name}，location / 反代到该 upstream，"
                 "headerHost=$host，websocket=true\n"
+                f"  证书：{ctx.settings.wildcard_cert_name}"
+                "（443 必须挂证书，否则面板配置过不了 nginx -t）\n"
                 "（headerHost 带端口会让 /api/remote.mux 403，见 docs/NG-API.md）"
                 + _drained(ctx, "ng")
             )
@@ -345,6 +353,7 @@ async def run_deploy(ctx: JobCtx) -> None:
                 upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
                                 f":{inst.frp_remote_port}",
                 listen_port=443, header_host="$host", websocket=True,
+                cert_name=ctx.settings.require("wildcard_cert_name"),
             )
             if _synthetic_id(site.server_id):
                 st.state = "skipped"

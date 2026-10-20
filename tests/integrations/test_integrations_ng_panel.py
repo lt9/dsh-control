@@ -375,49 +375,68 @@ def test_ensure_site_bad_upstream_server_format_rejected():
 
 # ------------------------------------------------------------------ reload 三步
 
-def test_reload_sequence_check_replace_then_reload():
+def test_reload_sequence_rebuilds_validates_then_reloads():
+    """顺序是现网实测纠正的（旧序 check→replace 在新建对象上永远过不去）：
+    预检（软，只提醒）→ replace 按库重建 → 校验（硬闸）→ reload。"""
     api = FakeNg()
     run(api.panel().reload())
     seq = [p for p, _ in api.writes]
-    assert seq == ["/api/nginx/check", "/api/nginx/replace", "/api/nginx/reload"]
+    assert seq == ["/api/nginx/check", "/api/nginx/replace",
+                   "/api/nginx/check", "/api/nginx/reload"]
 
 
-def test_reload_stops_when_check_fails():
-    api = FakeNg(check_fails=True)
-    with pytest.raises(IntegrationError):
+def test_precheck_failure_warns_but_still_rebuilds():
+    """预检失败**不拦**：库里只要存在还没落盘的对象，面板 check 就必然失败
+    （主配置 include conf.d/upstreams.X.conf，文件要 replace 之后才存在）。
+    拿它当闸门 = 一次遗留脏库把所有开通永久卡死。它只留一行警告。"""
+    api = FakeNg(check_fails=True, growth=True)
+    lines: list[str] = []
+    with pytest.raises(IntegrationError):          # 最终仍会被硬闸拦下
+        run(api.panel(line_sink=lambda _lv, msg: lines.append(msg)).reload())
+    joined = "".join(lines)
+    assert "[体检警告]" in joined and "继续按库重建" in joined
+    assert [p for p, _ in api.writes if p.endswith("/replace")] == ["/api/nginx/replace"]
+
+
+def test_post_replace_check_failure_never_reloads():
+    """磁盘已按库重建，但校验不过 → **不许 reload**：nginx 还在跑内存里的旧配置，
+    用户正在服务的东西一根汗毛都没动。这是新顺序里的硬闸。"""
+    api = FakeNg(check_fails=True, growth=True)
+    with pytest.raises(IntegrationError) as ei:
         run(api.panel().reload())
-    assert "/api/nginx/replace" not in api.paths      # conf 一个字节没动
-    assert "/api/nginx/reload" not in api.paths
+    msg = str(ei.value)
+    assert "没有 reload" in msg and "备份恢复" in msg      # 告诉人怎么退
+    assert [p for p, _ in api.writes if p.endswith("/reload")] == []
 
 
 # ------------------------------------------- 有界重试（面板忙是正常工况，不判死）
 
 def test_check_busy_twice_then_passes_replace_exactly_once():
-    api = FakeNg(fails={"/api/nginx/check": 2})       # 面板正被并发操作撞车
+    """面板忙（用户同时在点重载）时 check 会只回「效验失败」：硬闸有界重试，
+    重建只发生一次，重试过程逐行进用户日志。"""
+    api = FakeNg(fails={"/api/nginx/check": 2})       # 第 1 次被预检吃掉
     lines: list[str] = []
     run(api.panel(line_sink=lambda _lv, msg: lines.append(msg)).reload())
     seq = [p for p, _ in api.writes]
-    assert seq == ["/api/nginx/check", "/api/nginx/check", "/api/nginx/check",
-                   "/api/nginx/replace", "/api/nginx/reload"]
-    assert len([p for p in seq if p.endswith("/replace")]) == 1   # 过了才重建，一次
-    assert len(lines) == 2
-    assert "校验未通过" in lines[0] and "后重试 2/3" in lines[0]
-    assert "效验失败" in lines[0]                     # 面板原文跟着进用户日志
-    assert "后重试 3/3" in lines[1]
+    assert seq == ["/api/nginx/check", "/api/nginx/replace",
+                   "/api/nginx/check", "/api/nginx/check", "/api/nginx/reload"]
+    assert len([p for p in seq if p.endswith("/replace")]) == 1   # 重建一次，不多
+    assert len(lines) == 2                                # 预检警告 + 一次重试
+    assert "[体检警告]" in lines[0]
+    assert "校验未通过" in lines[1] and "后重试 2/3" in lines[1]
+    assert "效验失败" in lines[1]                          # 面板原文跟着进用户日志
 
 
-def test_check_three_failures_never_rebuilds_conf():
-    """最关键的一条：校验过不去，replace 一次都不许发生。"""
+def test_post_replace_check_three_failures_never_reloads():
+    """最关键的一条：硬闸过不去，nginx 一次都不许重载。"""
     api = FakeNg(fails={"/api/nginx/check": 10 ** 9}, growth=True)
     with pytest.raises(IntegrationError) as ei:
         run(api.panel().reload())
     assert ei.value.code == "ng_busy_or_drift"
     msg = str(ei.value)
     assert "连续 3 次" in msg and "面板原文" in msg and "效验失败" in msg
-    assert "本次未改动磁盘上任何配置文件" in msg       # 不谎报
-    assert [p for p, _ in api.writes if p.endswith("/replace")] == []
-    assert [p for p, _ in api.writes if p.endswith("/reload")] == []
-    assert len([p for p, _ in api.writes if p.endswith("/check")]) == 3
+    assert [p for p, _ in api.writes if p.endswith("/reload")] == []   # 绝不 reload
+    assert len([p for p, _ in api.writes if p.endswith("/check")]) == 4  # 预检 1 + 硬闸 3
 
 
 def test_replace_fails_once_raises_immediately_never_retried():
@@ -435,16 +454,18 @@ def test_reload_fails_once_second_attempt_succeeds():
     lines: list[str] = []
     run(api.panel(line_sink=lambda _lv, msg: lines.append(msg)).reload())
     seq = [p for p, _ in api.writes]
-    assert seq == ["/api/nginx/check", "/api/nginx/replace",
+    assert seq == ["/api/nginx/check", "/api/nginx/replace", "/api/nginx/check",
                    "/api/nginx/reload", "/api/nginx/reload"]
     assert len(lines) == 1 and "重载未通过" in lines[0]
 
 
 def test_retry_progress_falls_back_to_recorder_when_no_line_sink():
     rec = DryRunRecorder()
-    api = FakeNg(fails={"/api/nginx/check": 1})
+    api = FakeNg(fails={"/api/nginx/check": 2})       # 预检吃 1 次，硬闸吃 1 次
     run(api.panel(recorder=rec).reload())             # 没接 line_sink 也不能哑巴
-    assert any("校验未通过" in e.note and "后重试 2/3" in e.note for e in rec.entries)
+    notes = [e.note for e in rec.entries]
+    assert any("[体检警告]" in n for n in notes)                      # 预检警告要留下
+    assert any("校验未通过" in n and "后重试 2/3" in n for n in notes)  # 重试也要留下
 
 
 # ------------------------------------------------------------------ 删除纪律
