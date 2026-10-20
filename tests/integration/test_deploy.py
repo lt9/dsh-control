@@ -42,7 +42,9 @@ async def test_deploy_full_flow_with_derived_names(env):
     # kit 的接口：new-instance.sh <名字> <宿主机端口>，端口是第 2 个位置参数
     assert "new-instance.sh dsh-01 4893" in journal
     assert "deploy.sh dsh-01" in journal
-    assert "verify.sh 'dsh-01'" in journal
+    assert "verify.sh dsh-01" in journal
+    # 安全门是控制台自己算的：读容器生效配置，不看 kit 脚本的脸色
+    assert "dsh web --dump-config" in journal
 
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
     assert job["state"] == "succeeded", job["error"]
@@ -459,3 +461,45 @@ async def test_missing_llm_credential_fails_at_plan_touching_nothing(env):
     assert job["steps"][0]["seq"] == 10 and job["steps"][0]["state"] == "failed"
     assert not any(ln.startswith(("dns.create", "frp.ensure", "ng.")) for ln in env.journal), \
         "第 10 步失败前不许碰任何外部系统"
+
+
+async def test_safety_gate_blocks_when_cloud_path_still_open(env):
+    """安全门不过就不许算开通完成——花钱和外传这两条由控制台自己判定，
+    不看 kit 校验脚本的脸色（那份在 pipefail 下出过假警报）。"""
+    from dsh_control.integrations.base import ExecResult
+
+    unsafe = ("config:\n  providers:\n    local:\n"
+              "      baseURL: https://llm.example.test:8000/v1\n"
+              "- id: llm-deepseek\n  name: '@x/key'\n  disabled: false\n")
+    env.providers.executor.handlers.insert(0, ("dump-config", ExecResult(0, unsafe, "")))
+
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "failed"
+    assert "安全门" in (job["error"] or "") and "llm-deepseek" in (job["error"] or "")
+    steps = {s["seq"]: s["state"] for s in job["steps"]}
+    assert steps[60] == "succeeded" and steps[90] == "failed"
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    assert d["state"] == "error"
+    # 第 60 步之后按契约保留现场：不回滚，DNS/隧道/站点都还在，人可以上去查
+    assert env.providers.dns.records and env.providers.frp.tunnels and env.providers.ng.sites
+    step90 = next(s for s in job["steps"] if s["seq"] == 90)
+    assert "安全门不通过" in (step90["detail"] or ""), "失败原因要落在步骤详情里，页面上看得见"
+    evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    assert any(e["kind"] == "job_failed" and "安全门" in e["message"] for e in evs)
+
+
+async def test_kit_verify_warnings_are_reported_but_not_fatal(env):
+    """kit verify 的提示（比如数据盘在同一块分区）给人看，不拦开通。"""
+    from dsh_control.integrations.base import ExecResult
+
+    env.providers.executor.handlers.insert(
+        0, ("./scripts/verify.sh", ExecResult(1, "  ✗ 数据目录与系统在同一个盘上\n", "")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "succeeded", job["error"]
+    evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    warn = next(e for e in evs if e["kind"] == "verify_warnings")
+    assert "数据目录" in warn["message"]

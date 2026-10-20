@@ -18,6 +18,7 @@ from ..db import repo
 from ..db.models import Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.frp_port import pick_free_port
+from ..domain.safety import MUST_BE_DISABLED, config_violations
 from ..domain.slug import derive, dns_rr
 from .capture import capture_token
 from .release import EXTERNAL_ID_FIELDS, clear_external_ids, delete_ng_upstream, idempotent_delete
@@ -628,9 +629,29 @@ async def run_deploy(ctx: JobCtx) -> None:
                             {"status_code": res.status_code, "hint": hint})
 
     # ---- 90 verify：kit 的 verify.sh <slug>，收条目数，不推翻成功
-    async with ctx.step(90, "verify", "跑 kit 校验脚本") as st:
-        r = await ctx.ssh(f"cd '{host.kit_path}' && ./scripts/verify.sh '{slug}'", timeout=300)
+    async with ctx.step(90, "verify", "安全门自检 + kit 校验脚本") as st:
+        # 顺序刻意是先自检再跑脚本：安全门是控制台自己算的，不依赖 kit 脚本写法
+        # （kit 那份在 pipefail 下出过假警报，见 domain/safety.py 与 kit 的提交）。
+        gate = await ctx.ssh(
+            f"docker exec {shlex.quote(inst.container_name or names.container)} sh -c "
+            + shlex.quote('cd "${DSH_HOME:-/data}" && dsh web --dump-config'),
+            timeout=180)
+        bad = config_violations(gate.stdout or "", base_url=ctx.settings.llm_base_url)
+        if bad:
+            raise StepFailed("安全门不通过（花钱/外传这两条不外包给脚本）：\n  - "
+                             + "\n  - ".join(bad))
+        await ctx.log("info", f"安全门：{len(MUST_BE_DISABLED)} 条云端路径确认已断开，"
+                              f"模型端点确认为 {ctx.settings.llm_base_url}")
+
+        r = await ctx.ssh(f"cd {shlex.quote(host.kit_path)} && "
+                          f"./scripts/verify.sh {shlex.quote(slug)}", timeout=300)
+        warns = [ln.strip() for ln in (r.stdout or "").splitlines() if "\u2717" in ln]
         st.detail = (st.detail + "\n" if st.detail else "") + (
-            "校验通过" if r.ok else f"verify.sh 未通过（不影响部署结果）: {r.tail(300)}")
+            "kit verify.sh 全项通过" if r.ok else
+            f"kit verify.sh 有 {len(warns) or '?'} 项不通过（给人看的参考，"
+            f"安全门已单独自检）:\n" + "\n".join(f"  {w}" for w in warns[:12]))
         if not r.ok:
-            await ctx.event("verify_failed", f"verify.sh 未通过: {r.tail(300)}", {})
+            await ctx.event("verify_warnings",
+                            f"kit verify.sh 提示 {len(warns) or '?'} 项: "
+                            f"{'; '.join(warns[:5])[:400]}",
+                            {"count": len(warns), "items": warns[:12]})

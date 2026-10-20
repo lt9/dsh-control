@@ -208,6 +208,35 @@ class FakeNg:
         self.reloads += 1
 
 
+SAFE_DUMP = """config:
+  agents: {}
+  providers:
+    local:
+      displayName: 家里的小模型
+      apiKeyEnv: LLAMA_API_KEY
+      baseURL: https://llm.example.test:8000/v1
+- id: fs-sandbox
+  name: '@deepseek-ai/dsh-fs-sandbox'
+# == patched by /data/profiles/web/cordis.patch.yml
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek-api-key'
+  disabled: true
+- id: llm-deepseek-account
+  name: '@deepseek-ai/dsh-llm-deepseek-account'
+  disabled: true
+- id: deepseek-account
+  disabled: true
+- id: authorization
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: web-deepseek-api
+  name: '@deepseek-ai/dsh-web-tools'
+"""
+
+
 class FakeExecutor:
     def __init__(self, journal: Journal, *, manual: bool = False) -> None:
         self.journal = journal
@@ -227,6 +256,9 @@ class FakeExecutor:
         for pattern, result in self.handlers:
             if pattern in command:
                 return result
+        if "dump-config" in command:
+            # 安全门（domain/safety.py）读的是这份；测试要改就直接塞 handlers
+            return ExecResult(0, SAFE_DUMP, "")
         return ExecResult(0, "ok\n", "")
 
 
