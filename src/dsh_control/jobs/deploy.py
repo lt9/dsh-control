@@ -8,7 +8,12 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy import select
+
 from ..db import repo
+from ..db.models import Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.frp_port import pick_free_port
 from ..domain.slug import derive, dns_rr
@@ -45,6 +50,61 @@ def _manual(ctx: JobCtx, which: str) -> bool:
     registry 的 Noop* 实现都带 manual_required=True。"""
     provider = getattr(ctx.providers, which, None)
     return bool(provider is not None and getattr(provider, "manual_required", False))
+
+
+_DRIFT_MEANING = {
+    "db_dirty": "库里 headerHost 带端口、磁盘是干净的——replace 会把它洗坏",
+    "dirty_both": "库里脏、磁盘同样脏——replace 不改现状，但该站点公网正被准入墙拦住",
+    "disk_dirty": "库里干净、磁盘被面板外手改过——replace 会按库把它重建",
+}
+
+
+def classify_drift(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """把库盘体检结果分成「必须拦」和「只提醒」两堆。
+
+    只拦 ``db_dirty``：那是 replace 会把**正在正常服务**的站点洗坏的一种，代价由
+    用户承担，不能拿它换一次开通。``dirty_both`` 的站点此刻公网本就 403 拦着、
+    replace 对它中性；``disk_dirty`` 是面板外手改、replace 会按库纠正——这两种
+    大声提醒但不拦，否则一个与本次无关的坏站点会让所有开通永远卡死。
+    ``dsh_proven=False``（证明不了后端是 DSH 的）一律不是证据，两堆都不进。
+    """
+    proven = [r for r in rows if r.get("dsh_proven")]
+    abort = [r for r in proven if r.get("verdict") == "db_dirty"]
+    warn = [r for r in proven if r.get("verdict") in ("dirty_both", "disk_dirty")]
+    return abort, warn
+
+
+async def _pre_replace_drift_check(ctx: JobCtx, dns_name: str) -> None:
+    """replace 之前的只读库盘体检；会把好盘洗坏的站点存在时直接中止本步。
+
+    nginxWebUI 的 ``/api/nginx/replace`` 是「按库重建**全部**站点」：库里脏的会被
+    写成脏、库里没有的 conf 会被删。所以动它之前必须先证明库和磁盘对得上，
+    见 docs/ARCHITECTURE.md §5.4 与 docs/05-故障排查.md。
+    """
+    scan = getattr(ctx.ng(), "drift_scan", None)
+    if scan is None:  # noop / 测试假件：没这个能力就直说，绝不编造"已检查通过"
+        await ctx.log("info", "NG provider 不提供库盘体检，本次跳过 replace 前置检查")
+        return
+    res = await ctx.s.scalars(select(Instance.dns_name)
+                              .where(Instance.desired_state != "released"))
+    known = {str(n).lower() for n in res.all() if n}
+    known.add(dns_name.lower())
+    rows = list(await scan(known_dsh=known) or [])
+    abort, warn = classify_drift(rows)
+    for r in warn:
+        await ctx.log("warn", f"[体检提醒] {r['server_name']}："
+                              f"{_DRIFT_MEANING.get(r['verdict'], r['verdict'])}"
+                              "（不拦本次开通，但请核对）")
+    if abort:
+        lines = "\n".join(f"  · {r['server_name']}：{_DRIFT_MEANING[r['verdict']]}"
+                          for r in abort)
+        raise StepFailed(
+            "nginxWebUI 体检发现：一旦按库重建（replace）就会洗坏正在服务的站点，"
+            "本次不做 replace，避免连累你其它在跑的服务：\n"
+            f"{lines}\n"
+            "处置：用面板把该站点 location / 的 headerHost 改回 $host"
+            "（本控制台的 patch_location 也能改，会自动 reload 生效），"
+            "体检干净后重新开通即可。")
 
 
 async def _pick_frp_port(ctx: JobCtx) -> int:
@@ -310,6 +370,7 @@ async def run_deploy(ctx: JobCtx) -> None:
                         lambda: ctx.ng().delete_site(sid, expect_name=n),
                         lambda: ctx.ng().find_site(n)))
                 )
+                await _pre_replace_drift_check(ctx, dns_name)
                 await ctx.ng().reload()  # ensure_site 不会自动 reload（对接要点 1）
                 inst.ng_upstream_name = names.upstream
                 inst.ng_upstream_id = (None if _synthetic_id(site.upstream_id)

@@ -743,9 +743,12 @@ class NgPanel:
           证明不了的一律 ``inconclusive``：既不判干净也不判脏，不进危险列表。
 
         判定（逐站点一条，供编排层打表；``dsh_proven`` 标明这条是不是证据）：
-        - ``db_dirty``：**仅适用于已确认为 DSH 的后端**——库里 headerHost 带端口
-          就报（盘净 → replace 会把干净盘洗脏；盘同脏 → 重建后脏到底）。
-          replace 前必须先 patch_location 修库；
+        - ``db_dirty``：仅已确认为 DSH + 库里 headerHost 带端口 + 探到 401/200
+          （**盘净**）——replace 会把好盘洗坏，危险，**必须先 patch_location
+          改库**再 replace；
+        - ``dirty_both``：仅已确认为 DSH + 库脏 + 探到 403（**盘同脏**）——库盘
+          一致，replace 是中性的、不会改变现状；但该站点当前公网被准入墙拦住，
+          同样是危险，只是不急：改库或改盘（走面板）都能解；
         - ``disk_dirty``：同样仅在已证明 DSH 时——库净而盘脏（403），人手改过
           文件，replace 能纠正回干净；
         - ``consistent``：已证明 DSH，库净且盘净（401/200）；
@@ -755,6 +758,9 @@ class NgPanel:
         - ``no_location``：站点没有可判定的 location（半成品/纯静态）；
         - ``foreign_report``：``all_sites=True`` 时列出的他人站点，**只报库值、
           不发探测、不给判定**。
+
+        危险列表 = ``db_dirty`` / ``dirty_both`` / ``disk_dirty`` 三值，且都以
+        ``dsh_proven=True`` 为前提；``dsh_proven=False`` 一律 ``inconclusive``。
 
         范围：默认 ``only_managed=True`` 只体检我们前缀内（或 ``known_dsh`` 登记过）
         的站点；他人站点仅当显式 ``all_sites=True``（或 ``only_managed=False``，
@@ -814,9 +820,10 @@ class NgPanel:
                 if not proven or code not in (200, 401, 403):
                     row["verdict"] = "inconclusive"   # 不是证据就别当证据
                 elif any(pat in db_host for pat in _FORBIDDEN_HOST_PATTERNS):
-                    # 已确认 DSH + 库脏：盘净则 replace 会把干净盘洗脏，
-                    # 盘同脏则脏到底——无论哪种，replace 前必须先修库。
-                    row["verdict"] = "db_dirty"
+                    # 两种病必须分开：盘净时 replace 会把好的洗坏（急，先改库）；
+                    # 盘同脏时库盘一致，replace 中性，但站点此刻正被准入墙拦着。
+                    row["verdict"] = "db_dirty" if code in (200, 401) \
+                        else "dirty_both"
                 elif code == 403:
                     row["verdict"] = "disk_dirty"     # 库净盘脏：手改的文件，replace 能救
                 else:

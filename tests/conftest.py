@@ -132,6 +132,9 @@ class FakeNg:
         self.upstreams: dict[int, dict] = {}
         self.fail_reload = False
         self.reloads = 0
+        # 库盘体检的假结果：测试注入用，默认"没危险"（真实 NgPanel 会真去探）
+        self.drift: list[dict] = []
+        self.drift_known: list[str] = []
         self._n = 0
         self._u = 0
 
@@ -179,6 +182,12 @@ class FakeNg:
                 f"删除被拦：upstream_id={upstream_id} 查不到 / 名字不是 {expect_name!r}")
         self.journal.add("ng.delete_upstream", expect_name, f"id={upstream_id}")
         del self.upstreams[upstream_id]
+
+    async def drift_scan(self, *, known_dsh=None, **_kw) -> list[dict]:
+        """只读体检假件：把编排层传进来的登记域名记下来，便于断言"只扫我们自己的"。"""
+        self.drift_known = sorted(str(n) for n in (known_dsh or ()))
+        self.journal.add("ng.drift_scan", *self.drift_known)
+        return list(self.drift)
 
     async def reload(self) -> None:
         if self.fail_reload:

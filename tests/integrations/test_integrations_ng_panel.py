@@ -618,6 +618,8 @@ TEXT = "text/plain"
 PROBES = {
     "dsh-reg.example.com": (401, "forbidden-ish plain", TEXT),        # 已登记：体不重要
     "dsh-reg-dirty.example.com": (403, "forbidden", TEXT),            # 真 DSH 脏墙就是裸文本
+    # 库脏但盘净（401）：这才是 replace 会洗坏好盘的那种
+    "dsh-reg-netdirty.example.com": (401, "forbidden-ish plain", TEXT),
     "dsh-fp401.example.com": (401, '{"ok": false, "error": "unauthenticated"}', JSON),
     "dsh-fp200.example.com": (200, '{"ok": true}', JSON),
     "dsh-jelly.example.com": (200, "<html>jellyfin</html>", TEXT),    # 带端口 Host 照样 200
@@ -641,34 +643,41 @@ def _probe_client(seen):
 
 def test_drift_evidence_needs_registration_or_fingerprint():
     """DB 证据只有两条通道：known_dsh 登记 / 家族信封指纹（真 DSH 脏 403 是裸文本，
-    所以登记通道不可省）；db_dirty 只在 登记DSH+403+库脏 时出现。"""
+    所以登记通道不可省）；库脏还要再分两种病：盘净（db_dirty，replace 会把它洗坏，
+    最急）和盘同脏（dirty_both，replace 中性，但站点此刻公网正被准入墙拦住）。"""
     servers = [_srv(21, "dsh-reg.example.com"),
                _srv(22, "dsh-reg-dirty.example.com"),
                _srv(23, "dsh-fp401.example.com"),
                _srv(24, "dsh-fp200.example.com"),
-               _srv(25, "dsh-gogs502.example.com")]
+               _srv(25, "dsh-gogs502.example.com"),
+               _srv(26, "dsh-reg-netdirty.example.com")]
     locations = [_loc(1310000000000000021, "$host", i=11),
                  _loc(1310000000000000022, "$host:$proxy_port", i=12),
                  _loc(1310000000000000023, "$host", i=13),
                  _loc(1310000000000000024, "$host", i=14),
-                 _loc(1310000000000000025, "$host", i=15)]
+                 _loc(1310000000000000025, "$host", i=15),
+                 _loc(1310000000000000026, "$host:$proxy_port", i=16)]
     seen: list[tuple[str, str, str]] = []
     api = FakeNg(servers=servers, locations=locations)
     rows = run(api.panel().drift_scan(
         probe_client=_probe_client(seen),
         known_dsh={"dsh-reg.example.com", "dsh-reg-dirty.example.com",
-                   "dsh-gogs502.example.com"}))
+                   "dsh-reg-netdirty.example.com", "dsh-gogs502.example.com"}))
     verdicts = {r["server_name"]: (r["verdict"], r["dsh_proven"]) for r in rows}
     assert verdicts == {
         "dsh-reg.example.com": ("consistent", True),      # 登记 + 401 = 盘净库净
-        "dsh-reg-dirty.example.com": ("db_dirty", True),  # 登记 + 403 + 库脏 → 危险
+        # 登记 + 库脏 + 403：库盘同脏，replace 中性，但公网正被墙拦着
+        "dsh-reg-dirty.example.com": ("dirty_both", True),
+        # 登记 + 库脏 + 401：盘是干净的，replace 会把它洗坏 → 最急
+        "dsh-reg-netdirty.example.com": ("db_dirty", True),
         "dsh-fp401.example.com": ("consistent", True),    # 没登记但信封对 → 证据
         "dsh-fp200.example.com": ("consistent", True),    # {"ok": true} healthz 指纹
         "dsh-gogs502.example.com": ("inconclusive", True),  # 证明了 DSH，502 也不说 Host
     }
-    dangerous = [r["server_name"] for r in rows
-                 if r["verdict"] in ("db_dirty", "disk_dirty")]
-    assert dangerous == ["dsh-reg-dirty.example.com"]     # 危险列表只收有证据的
+    dangerous = sorted(r["server_name"] for r in rows
+                       if r["verdict"] in ("db_dirty", "dirty_both", "disk_dirty"))
+    assert dangerous == ["dsh-reg-dirty.example.com",      # 两种脏都要进危险列表
+                         "dsh-reg-netdirty.example.com"]
     assert all(origin == f"https://{host}" for host, _p, origin in seen)
     assert api.writes == []                               # 全程只读
     assert not [p for p in api.paths if "insertOrUpdate" in p or p.endswith("/delete")

@@ -226,3 +226,41 @@ async def test_deploy_retry_refused_from_running(env):
     r2 = await env.client.post(f"/api/instances/{body['instance_id']}/deploy", headers=XRW)
     assert r2.status_code == 409
     assert r2.json()["detail"]["error"] == "cannot_deploy_from_running"
+
+
+async def test_replace_refused_when_drift_would_wash_a_live_site(env):
+    """库里脏+盘净（db_dirty）＝ replace 会把用户别的服务洗坏：第 50 步必须
+    **不做 replace** 就中止，并把已建对象回滚干净（红线：不拿他的服务换我一次开通）。"""
+    env.providers.ng.drift = [{"server_name": "someone-else.example.test",
+                               "header_host": "$host:$proxy_port", "probe_status": 401,
+                               "dsh_proven": True, "verdict": "db_dirty"}]
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    body = r.json()
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "failed"
+    assert "洗坏" in (job["error"] or "") and "replace" in (job["error"] or "")
+    by_key = {s["key"]: s for s in job["steps"]}
+    assert by_key["ng_create"]["state"] == "failed"
+    assert env.providers.ng.reloads == 0, "体检没过却仍然 replace 了"
+    # 扫的是登记在册的实例域名（含本次这台），不是全面板
+    assert body["dns_name"] in env.providers.ng.drift_known
+    # 回滚不留垃圾：站点、upstream 都不在面板里
+    assert await env.providers.ng.find_site(body["dns_name"]) is None
+    assert env.providers.ng.upstreams == {}
+
+
+async def test_dirty_both_warns_in_log_but_deploy_continues(env):
+    """库盘同脏（站点此刻公网被准入墙拦着）与本次无关：提醒一句，照建不误。"""
+    env.providers.ng.drift = [{"server_name": "office.example.test",
+                               "header_host": "$host:$proxy_port", "probe_status": 403,
+                               "dsh_proven": True, "verdict": "dirty_both"}]
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "succeeded", job["error"]
+    assert env.providers.ng.reloads == 1
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()
+    lines = logs["items"] if isinstance(logs, dict) and "items" in logs else logs
+    text = " ".join(x["line"] for x in lines)
+    assert "体检提醒" in text and "office.example.test" in text
