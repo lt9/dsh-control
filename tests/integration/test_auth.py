@@ -119,3 +119,61 @@ async def test_login_failure_body_also_matches_declared_length(env):
     assert status == 401
     assert int(headers["content-length"]) == len(body)
     assert b"bad_key" in body
+
+
+async def test_forged_xff_cannot_escape_login_limiter(env):
+    """公网入口挂上之后，"每次换一个 X-Forwarded-For"就等于换身份。
+    伪造头必须进同一个桶，否则 5 次/分钟的限速是装饰品。"""
+    from httpx import ASGITransport, AsyncClient
+
+    # 对端不是可信反代（公网直连的假设），转发的头一概不算身份
+    tr = ASGITransport(app=env.app, client=("198.51.100.7", 4444))
+    async with AsyncClient(transport=tr, base_url="http://test") as c:
+        for i in range(5):
+            r = await c.post("/api/login", json={"key": "nope"},
+                             headers={"X-Forwarded-For": f"203.0.113.{i}",
+                                      "X-Real-IP": f"203.0.113.{i}"})
+            assert r.status_code == 401, r.status_code
+        r = await c.post("/api/login", json={"key": OP_KEY})
+        assert r.status_code == 429, "伪造转发头绕开了限速"
+
+
+async def test_real_proxy_ip_still_limits_each_visitor(env):
+    """经我们自己的 nginx 进来时，X-Real-IP 是 nginx 用 $remote_addr 覆写的，
+    攻击者换不掉——所以限速仍然按真人分桶，不会一个人撞库全站关门。"""
+    from httpx import ASGITransport, AsyncClient
+
+    tr = ASGITransport(app=env.app, client=("172.19.4.1", 4444))
+    async with AsyncClient(transport=tr, base_url="http://test") as c:
+        for i in range(5):
+            r = await c.post("/api/login", json={"key": "nope"},
+                             headers={"X-Real-IP": "203.0.113.5",
+                                      "X-Forwarded-For": f"192.0.2.{i}, 203.0.113.5"})
+            assert r.status_code == 401, r.status_code
+        r = await c.post("/api/login", json={"key": OP_KEY},
+                         headers={"X-Real-IP": "203.0.113.5"})
+        assert r.status_code == 429, "同一个人没被算进同一个桶"
+        other = await c.post("/api/login", json={"key": OP_KEY},
+                             headers={"X-Real-IP": "198.51.100.20"})
+        assert other.status_code == 200, "别人被误关了"
+
+
+async def test_secure_cookie_only_over_tls(env):
+    """走 https 进来那次必须给 Secure；内网 http 直连不能被 Secure 弄坏。"""
+    from httpx import ASGITransport, AsyncClient
+
+    tls = ASGITransport(app=env.app, client=("192.168.3.109", 4444))
+    async with AsyncClient(transport=tls, base_url="http://test") as c:
+        r = await c.post("/api/login", json={"key": OP_KEY},
+                         headers={"X-Forwarded-Proto": "https"})
+        assert r.status_code == 200
+        assert "Secure" in r.headers["set-cookie"], "公网 https 登录没标 Secure"
+        r2 = await c.post("/api/login", json={"key": OP_KEY},
+                          headers={"X-Forwarded-Proto": "http"})
+        assert "Secure" not in r2.headers["set-cookie"], "明文链路不该标 Secure"
+
+    plain = ASGITransport(app=env.app, client=("192.168.3.77", 4444))
+    async with AsyncClient(transport=plain, base_url="http://test") as c:
+        r = await c.post("/api/login", json={"key": OP_KEY})
+        assert r.status_code == 200
+        assert "Secure" not in r.headers["set-cookie"], "内网 http 直连标了 Secure 会登不上"

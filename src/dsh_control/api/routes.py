@@ -29,6 +29,7 @@ from .auth import (
     clear_session_cookie,
     client_ip,
     constant_time_key_match,
+    is_https,
     session_from_request,
     set_session_cookie,
 )
@@ -112,7 +113,8 @@ async def login(request: Request, body: LoginRequest) -> JSONResponse:
     expires_at = datetime.now(UTC) + timedelta(days=state.settings.session_days)
     resp = JSONResponse(status_code=200, content={"ok": True, "expires_at": iso(expires_at)})
     set_session_cookie(resp, state.settings.session_secret,
-                       state.settings.session_days, expires_at=expires_at)
+                       state.settings.session_days, expires_at=expires_at,
+                       secure=is_https(request))
     return resp
 
 

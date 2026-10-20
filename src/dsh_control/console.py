@@ -240,7 +240,8 @@ async def run_expose(
                               "写请求将由真实适配器在 dry_run 下逐条记录")
 
     # ---- 收尾打印 ----
-    await log("info", f"入口 URL：{base_url}/?token=…（登录密钥走详情页 reveal）")
+    await log("info", f"入口 URL：{base_url}（主控台用运维密钥登录，没有 ?token= 这种"
+                      "一次性地址——那台是给实例用的）")
     await log("info", f"公网端口：{summary['frp_remote_port']}（frps -> "
                       f"{host.ssh_host}:{settings.listen_port}）")
     await log("info", f"公网要放行的只有 {base_url} 的 443。隧道端口 "

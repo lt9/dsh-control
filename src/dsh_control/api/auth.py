@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import secrets
 import time
@@ -112,15 +113,73 @@ EXEMPT_PATHS = {"/api/login", "/api/healthz"}
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
-def client_ip(request: Request) -> str:
+# 只信这些来源送来的转发头。我们的拓扑里请求要么从内网直连进来，要么经
+# frps + nginxWebUI 转发进来，两条路落的对端地址都在这些段里。
+TRUSTED_PROXY_NETS = ("127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12",
+                      "192.168.0.0/16", "fc00::/7")
+
+
+def peer_ip(request: Request) -> str:
+    """TCP 层看到的对端地址（不受任何请求头影响）。"""
+    return request.client.host if request.client else ""
+
+
+def _from_trusted_proxy(request: Request) -> bool:
+    ip = peer_ip(request)
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for cidr in TRUSTED_PROXY_NETS:
+        if addr in ipaddress.ip_network(cidr):
+            return True
+    return False
+
+
+def forwarded_for(request: Request) -> str:
+    """真实来源 IP，用来做限速与审计。
+
+    这里踩过两个方向的坑，都记着：
+
+    1. 取 ``X-Forwarded-For`` 最左段 = 取客户端自己写上去的那一段。公网入口
+       挂上之后，登录限速（5 次/分钟）想绕就绕——每发一次换一个假 XFF 就行，
+       审计日志里的 IP 也全是编的。
+    2. 反过来完全不看转发头也不对：穿两层反代后所有人都是代理那一台 IP，
+       限速就变成"一个人撞库，全站一起被关在门外"。
+
+    口径：只对可信反代送来的头认真；优先 ``X-Real-IP``（nginxWebUI 用
+    ``$remote_addr`` 覆写，客户端伪造不了），否则取 XFF **最右段**
+    （``$proxy_add_x_forwarded_for`` 追加的那一段才是代理亲眼看到的对端）。
+    """
+    if not _from_trusted_proxy(request):
+        return peer_ip(request) or "unknown"
+    real = request.headers.get("x-real-ip", "").strip()
+    if real:
+        return real
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+        return [x for x in fwd.split(",") if x.strip()][-1].strip()
+    return peer_ip(request) or "unknown"
+
+
+# 兼容旧调用点
+client_ip = forwarded_for
+
+
+def is_https(request: Request) -> bool:
+    """这次请求是不是走 TLS 进来的。只有可信反代报的 ``X-Forwarded-Proto`` 才算数。"""
+    if _from_trusted_proxy(request):
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+    return request.url.scheme == "https"
 
 
 def set_session_cookie(response: JSONResponse, secret: str, days: int,
-                       *, expires_at: datetime | None = None) -> datetime:
+                       *, expires_at: datetime | None = None,
+                       secure: bool = False) -> datetime:
     """给响应挂会话 cookie。
 
     ``expires_at`` 可由调用方传入：登录响应体里也要回这个时间，两边必须是同一个值，
@@ -135,7 +194,9 @@ def set_session_cookie(response: JSONResponse, secret: str, days: int,
         path="/",
         httponly=True,
         samesite="lax",
-        secure=False,  # 内网直连 http 也要能用；公网入口 https 由 frps/NG 终结
+        # 内网直连 http 也要能用，所以不能一律 Secure；但走 https 进来的那次
+        # 必须带上——否则这枚能开全部运维权限的 cookie 有机会跟着明文请求跑掉。
+        secure=secure,
     )
     return expires_at
 
