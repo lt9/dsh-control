@@ -283,3 +283,52 @@ async def test_release_all_objects_already_gone_passes(env):
     logs = (await env.client.get(f"/api/jobs/{job_id}/logs")).json()["items"]
     assert [l for l in logs if l["level"] == "error"] == [], logs
     assert sum(1 for l in logs if "已不存在，视为已删除" in l["line"]) >= 3
+
+
+async def test_release_recovers_when_panel_changed_proxy_id(env):
+    """proxy_id 是缓存不是身份：frpc 掉线重连后面板会重建隧道行换 id
+    （现网 2026-10-21：库里 2404，面板上 dsh_01 已是 2439）。照着旧 id 删，
+    释放永远卡在"查不到 proxy_id，拒绝盲删"。"""
+    from dsh_control.db import repo
+
+    body = await deploy(env)
+    iid = body["instance_id"]
+    (tunnel,) = env.providers.frp.tunnels.values()
+    true_id = tunnel.proxy_id
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        inst.frp_proxy_id = 424242          # 库里一条陈旧登记，面板上早已没有
+        await s.commit()
+
+    r = await env.client.post(f"/api/instances/{iid}/release",
+                              json={"confirm": "dsh-01"}, headers=XRW)
+    await wait_job(env.app, r.json()["job_id"])
+    job = (await env.client.get(f"/api/jobs/{r.json()['job_id']}")).json()
+    assert job["state"] == "succeeded", job["error"]
+    line = next(ln for ln in env.journal if ln.startswith("frp.delete"))
+    assert f"id={true_id}" in line, f"必须删面板上那条真身，实际 {line}"
+    assert env.providers.frp.tunnels == {}
+    evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
+    assert any(e["kind"] == "frp_proxy_id_healed" for e in evs), "校正过程要留痕"
+
+
+async def test_release_refuses_tunnel_with_other_remote_port(env):
+    """按名字找回真身时端口必须对得上：对不上就不是我们那条，宁可不删。"""
+    from dsh_control.db import repo
+
+    body = await deploy(env)
+    iid = body["instance_id"]
+    (tunnel,) = env.providers.frp.tunnels.values()
+    tunnel.remote_port = 4999               # 同名但指向变了
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        inst.frp_proxy_id = 424242
+        await s.commit()
+
+    r = await env.client.post(f"/api/instances/{iid}/release",
+                              json={"confirm": "dsh-01"}, headers=XRW)
+    await wait_job(env.app, r.json()["job_id"])
+    job = (await env.client.get(f"/api/jobs/{r.json()['job_id']}")).json()
+    assert job["state"] == "failed"
+    assert "不一致" in job["error"] and "拒绝删除" in job["error"]
+    assert tunnel.proxy_id in env.providers.frp.tunnels, "对不上就不许动它"

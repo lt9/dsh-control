@@ -216,6 +216,32 @@ async def run_release(ctx: JobCtx) -> None:
             proxy_id = inst.frp_proxy_id
             client_id = ctx.host.frpc_client_id
 
+            # proxy_id 是缓存，不是身份。这台 frp 面板在 frpc 掉线重连后会重建
+            # 隧道行、换 id（现网 2026-10-21：库里 2404，面板上 dsh_01 已经是
+            # 2439），照着旧 id 删永远卡在"查不到 proxy_id，拒绝盲删"。
+            # 身份是（隧道名 + 客户端），再加一道 remotePort 对得上才认——
+            # 名字是我们自己的前缀 + 端口一致，才允许把删除指过去。
+            if await ctx.frp().get(proxy_id) is None:
+                by_name = await ctx.frp().find_by_name(names.tunnel, client_id)
+                if by_name is not None:
+                    want = inst.frp_remote_port
+                    if want is not None and by_name.remote_port != want:
+                        raise StepFailed(
+                            f"面板上 {names.tunnel} 的 remotePort={by_name.remote_port}，"
+                            f"与登记的 {want} 不一致：那不是本控制台为这台实例建的隧道，"
+                            "拒绝删除。请人工核对后再处理。")
+                    await ctx.log(
+                        "warn", f"登记的 proxy_id={proxy_id} 在面板上已不存在，"
+                                f"按名字找回真身 proxy_id={by_name.proxy_id}"
+                                "（remotePort 一致），以面板为准纠正登记后再删")
+                    proxy_id = by_name.proxy_id
+                    inst.frp_proxy_id = by_name.proxy_id
+                    await ctx.s.commit()
+                    await ctx.event("frp_proxy_id_healed",
+                                    f"隧道 {names.tunnel} 的 proxy_id 校正为 {proxy_id}",
+                                    {"name": names.tunnel, "proxy_id": proxy_id,
+                                     "remote_port": inst.frp_remote_port})
+
             async def frp_still_there() -> object:
                 # 双探测（D4）：登记的 proxy_id 还能查到东西 = 那个 id 上现在是
                 # 别家的对象——即便我们的隧道名查无，也拒当"已删除"，更不许删它；
