@@ -19,20 +19,28 @@ async def detail(env, iid: int) -> dict:
 
 
 async def test_detail_shows_newest_token_after_manual_restart(env):
+    from dsh_control.domain.slug import token_mask
+
     body = await deploy(env)
     iid = body["instance_id"]
-    first = (await detail(env, iid))["access"]["token"]
+    first = (await env.client.get(f"/api/instances/{iid}/token",
+                                  headers=XRW)).json()["token"]
 
     r = await env.client.post(f"/api/instances/{iid}/restart", headers=XRW)
     assert r.status_code == 200
     await wait_job(env.app, r.json()["job_id"])
 
-    d = await detail(env, iid)
-    new = d["access"]["token"]
-    # SEED.md §3 第 4 步：重启后 token 变了，且详情拿到的是新的完整值
+    # SEED.md §3 第 4 步：重启后一键地址变了，reveal 接口现取到新完整值
+    new = (await env.client.get(f"/api/instances/{iid}/token",
+                                headers=XRW)).json()["token"]
     assert new and new != first
     assert env.runtime.token == new
-    assert new in d["access"]["url"]
+    assert new in (await env.client.get(f"/api/instances/{iid}/token",
+                                        headers=XRW)).json()["url"]
+    # 详情退回报备：mask 跟着换成新密钥的 mask，且不给完整值
+    d = await detail(env, iid)
+    assert d["access"]["token_masked"] == token_mask(new)
+    assert "token" not in d["access"] and "url" not in d["access"]
     assert d["access"]["captured_at"] is not None
     assert d["state"] == "running"
 
@@ -59,7 +67,9 @@ async def test_token_endpoint_recaptures_live_value(env):
     got = r.json()
     assert got["token"] == live and live in got["url"]
     d = await detail(env, iid)
-    assert d["access"]["token"] == live
+    from dsh_control.domain.slug import token_mask
+    assert d["access"]["token_masked"] == token_mask(live)
+    assert "token" not in d["access"]
     # 不带 XRW 的写式取用被拒
     r = await env.client.get(f"/api/instances/{iid}/token")
     assert r.status_code == 403
@@ -90,3 +100,17 @@ async def test_token_not_found_returns_502(env):
     r = await env.client.get(f"/api/instances/{iid}/token", headers=XRW)
     assert r.status_code == 502
     assert r.json()["detail"]["error"] == "token_not_found"
+
+
+async def test_list_and_detail_leak_no_full_token(env):
+    """列表连 mask 都不给；详情只给 mask。全值只在 /token reveal 里。"""
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    body = r.json()
+    await wait_job(env.app, body["job_id"])
+    blob_list = (await env.client.get("/api/instances")).text
+    blob_detail = (await env.client.get(f"/api/instances/{body['instance_id']}")).text
+    assert env.runtime.token not in blob_list
+    assert env.runtime.token not in blob_detail
+    item = (await env.client.get("/api/instances")).json()["items"][0]
+    assert "token" not in str(item.keys())
+    assert "access" not in item  # 列表没有 access 块

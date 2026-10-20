@@ -33,7 +33,8 @@ async def test_seed_into_populates_site_creds_hosts(env):
     site = {
         "site": {"public_base": "https://c.example.test",
                  "ingress_ip": "203.0.113.99", "dns_zone": "example.test",
-                 "domain_prefix": "dsh-", "frp_port_start": 4900},
+                 "domain_prefix": "dsh-", "frp_port_start": 4900,
+                 "frps_upstream_host": "198.51.100.77"},
         "providers": {"dns": "noop", "frp": "noop", "ng": "noop"},
         "credentials": [
             {"kind": "ssh_key", "name": "console-ed25519",
@@ -61,6 +62,8 @@ async def test_seed_into_populates_site_creds_hosts(env):
         # env fixture 已灌过 site？没有——fixture 只灌 operator_key；seed_into 会 upsert
         assert site_row.secret["dns_zone"] == "example.test"
         assert site_row.secret["providers"]["dns"] == "noop"
+        # ⑧修正：回源地址随 site.toml 入库，并会被 apply_site_overrides 灌进 settings
+        assert site_row.secret["frps_upstream_host"] == "198.51.100.77"
 
         key = await s.scalar(select(Credential).where(Credential.name == "console-ed25519"))
         assert key.secret["private_key_pem"] == "INLINE-PEM"
@@ -68,6 +71,10 @@ async def test_seed_into_populates_site_creds_hosts(env):
         host = (await s.scalars(select(Host).where(Host.name == "nas-x"))).one()
         assert host.ssh_port == 2333
         assert host.ssh_credential_id == key.id
+
+    from dsh_control.settings import Settings, apply_site_overrides
+    st = apply_site_overrides(Settings(_env_file=None), site["site"])
+    assert st.frps_upstream_host == "198.51.100.77"
 
     # 幂等：再灌一次不重复
     import os as _os

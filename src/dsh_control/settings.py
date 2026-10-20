@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     ingress_ip: str = ""
     dns_zone: str = ""
     dns_prefix: str = "dsh-"          # §6.1.1 一级子域前缀（通用规则的一部分）
+    # NG 回源地址（frps 监听地址，NG 容器视角可达的那一个）。
+    # 不能由 ingress_ip 推：云上无 NAT 回环，公网入口 IP 在入口机上自己都出不去。
+    frps_upstream_host: str = ""
     frp_port_start: int = 4893        # DSHC_FRP_PORT_START：公网端口搜索起点
     prefer_hdd: bool = True           # DSHC_PREFER_HDD：自动选主机时机械盘优先
 
@@ -87,6 +90,7 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
     mapping = {
         "public_base": "public_base", "ingress_ip": "ingress_ip",
         "dns_zone": "dns_zone", "domain_prefix": "dns_prefix",
+        "frps_upstream_host": "frps_upstream_host",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
     }
     for src, dst in mapping.items():

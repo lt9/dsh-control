@@ -73,7 +73,12 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 10 plan：slug 已在建实例时生成；去 DNS 与库确认未被占用（无副作用）
     async with ctx.step(10, "plan", "域名标签查重") as st:
+        # NG 回源地址必须站点显式声明（DSHC_FRPS_UPSTREAM_HOST / site.toml）：
+        # 代码里不许猜、不许回落 ingress_ip——云上无 NAT 回环，公网 IP 在入口机上不通。
+        frps_host = ctx.settings.require("frps_upstream_host")
         await ctx.log("info", f"slug={slug} 域名={dns_name} 容器={names.container}")
+        await ctx.log("info", f"NG 将以 {frps_host} 回源（frps 监听地址，"
+                              "需 NG 容器视角可达；本站若 NG 为 host 网络通常填 127.0.0.1）")
         if _manual(ctx, "dns"):
             await ctx.log("info", f"DNS 层为 noop：请自行确认 {rr} 记录未被占用")
         else:
@@ -214,13 +219,14 @@ async def run_deploy(ctx: JobCtx) -> None:
             st.state = "skipped"
             await ctx.ng().ensure_site(
                 server_name=dns_name, upstream_name=names.upstream,
-                upstream_server=f"{ctx.settings.require('ingress_ip')}"
+                upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
                                 f":{inst.frp_remote_port}",
                 listen_port=443, header_host="$host", websocket=True,
             )
             st.detail = (
                 "NG provider = noop，需人工配置反向代理：\n"
-                f"  upstream {names.upstream}: {ctx.settings.require('ingress_ip')}"
+                f"  upstream {names.upstream}: "
+                f"{ctx.settings.require('frps_upstream_host')}"
                 f":{inst.frp_remote_port}\n"
                 f"  server_name {dns_name}，location / 反代到该 upstream，"
                 "headerHost=$host，websocket=true\n"
@@ -231,14 +237,16 @@ async def run_deploy(ctx: JobCtx) -> None:
         else:
             site = await ctx.ng().ensure_site(
                 server_name=dns_name, upstream_name=names.upstream,
-                upstream_server=f"{ctx.settings.require('ingress_ip')}:{inst.frp_remote_port}",
+                upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
+                                f":{inst.frp_remote_port}",
                 listen_port=443, header_host="$host", websocket=True,
             )
             if _synthetic_id(site.server_id):
                 st.state = "skipped"
                 st.detail = ("provider 返回合成 server_id，未登记。这一层要人工补做：\n"
                              f"  upstream {names.upstream}: "
-                             f"{ctx.settings.require('ingress_ip')}:{inst.frp_remote_port}\n"
+                             f"{ctx.settings.require('frps_upstream_host')}"
+                             f":{inst.frp_remote_port}\n"
                              f"  server_name {dns_name}（headerHost=$host，websocket=true）\n"
                              "  补做后把真实 server_id 人工回填，否则释放时删不到。"
                              + _drained(ctx, "ng"))

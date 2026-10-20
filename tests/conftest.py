@@ -271,6 +271,7 @@ def make_settings(**over) -> Settings:
         "session_secret": "unit-test-secret",
         "dns_zone": "example.test",
         "ingress_ip": "203.0.113.10",
+        "frps_upstream_host": "198.51.100.9",
         "public_base": "https://console.example.test",
         "provider_dns": "aliyun", "provider_frp": "frp_panel", "provider_ng": "nginxwebui",
         "frp_port_start": 4893,

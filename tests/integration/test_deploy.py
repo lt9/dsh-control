@@ -26,7 +26,10 @@ async def test_deploy_full_flow_with_derived_names(env):
     # prefer_hdd：机械盘 nas-1 剩余 10G 也应赢固态 100G
     assert detail["host"]["name"] == "nas-1"
     assert detail["network"]["frp_remote_port"] == 4893
-    assert detail["access"]["has_token"] and detail["access"]["token"]
+    # 详情只给 mask：完整 token 与含 token 的 url 都不许出现在 detail 里
+    assert detail["access"]["has_token"]
+    assert detail["access"]["token_masked"]
+    assert "token" not in detail["access"] and "url" not in detail["access"]
     assert detail["config"]["items"], "配置弹窗必须有数据"
     assert detail["dsh_version"] == "0.9.9"
 
@@ -34,7 +37,8 @@ async def test_deploy_full_flow_with_derived_names(env):
     assert "dns.create dsh-01 203.0.113.10" in journal
     # 派生命名（§6.1.1）：隧道 dsh_NN，upstream DSH_NN，server_name 完整域名
     assert "frp.ensure dsh_01 remote=4893 local=192.0.2.10" in journal
-    assert "ng.ensure dsh-01.example.test DSH_01 203.0.113.10:4893" in journal
+    # NG 回源必须用站点声明的 frps_upstream_host（198.51.100.9），不是 ingress_ip
+    assert "ng.ensure dsh-01.example.test DSH_01 198.51.100.9:4893" in journal
     assert "new-instance.sh 'dsh-01'" in journal
     assert "deploy.sh 'dsh-01'" in journal
     assert "verify.sh 'dsh-01'" in journal
@@ -43,6 +47,10 @@ async def test_deploy_full_flow_with_derived_names(env):
     assert job["state"] == "succeeded", job["error"]
     assert [st["key"] for st in job["steps"]] == STEP_KEYS_DEPLOY
     assert all(st["state"] == "succeeded" for st in job["steps"])
+    # plan 步骤要把「NG 用哪个地址回源」打印给运维看（在步骤日志流里）
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs",
+                                 params={"after": 0})).json()["items"]
+    assert any("198.51.100.9" in it["line"] for it in logs)
 
 
 async def test_explicit_host_id_overrides_pick(env):
@@ -170,3 +178,18 @@ async def test_patch_notes_only(env):
                                headers=XRW)
     assert r.status_code == 200  # 未声明字段被 schema 忽略
     assert (await env.client.get(f"/api/instances/{iid}")).json()["slug"] == "dsh-01"
+
+
+async def test_missing_frps_upstream_host_fails_in_plan(env):
+    """⑧修正：回源地址不许猜、不许回落 ingress_ip——缺失时 plan 步骤直接失败。"""
+    env.settings.frps_upstream_host = ""
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "failed"
+    assert "DSHC_FRPS_UPSTREAM_HOST" in (job["error"] or "")
+    detail = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    assert detail["state"] == "error"
+    # 失败发生在 plan：没有任何外部对象被创建
+    assert not any(ln.startswith(("dns.create", "frp.ensure", "ng.ensure"))
+                   for ln in env.journal)

@@ -12,7 +12,8 @@ from ..domain import config_docs
 from ..domain.slug import token_mask
 from ..domain.timeutil import iso
 
-# 允许出现完整 token 的接口只有详情与 /token（契约：列表接口绝不返回）。
+# 完整 token 只允许出现在 reveal 动作 GET /instances/{id}/token（契约 §0.4）；
+# 详情只给 mask，列表连 mask 都不给。
 _RELEASABLE_STATES = {"deploying", "running", "unhealthy", "restarting", "error"}
 _RESTARTABLE_STATES = {"running", "unhealthy", "restarting", "error"}
 
@@ -47,8 +48,6 @@ async def instance_detail(
     access: dict[str, Any] = {
         "has_token": token is not None,
         "token_masked": token_mask(token.token) if token else "",
-        "token": token.token if token else "",
-        "url": token.url if token else "",
         "captured_at": iso(token.captured_at) if token else None,
     }
 
