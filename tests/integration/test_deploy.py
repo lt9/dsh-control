@@ -47,6 +47,24 @@ async def test_next_slug_tracks_existing_instances(env):
     assert (await env.client.get("/api/instances/next-slug")).json()["slug"] == "dsh-02"
 
 
+async def test_container_port_never_laundered_from_host_port(env):
+    """docker 映射读不到时，宁可显示 0 + 标明来源，也不许把 .env 的 HOST_PORT
+    洗成"容器内监听端口"——那是第 27 个缺陷的本体：详情页曾把 4895 标在容器上。"""
+    from dsh_control.integrations.base import ExecResult
+
+    env_txt = "HOST_PORT=4895\nDATA_DIR=/mnt/hdd2/dsh-family/dsh-family/dsh-01/data\n"
+    env.providers.executor.handlers.insert(
+        0, ("cat /srv/dsh-family/instances/dsh-01/.env", ExecResult(0, env_txt, "")))
+    env.providers.executor.handlers.insert(
+        0, ("HostConfig.PortBindings", ExecResult(1, "", "permission denied")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    kv = {i["key"]: i["value"] for i in d["config"]["items"]}
+    assert str(kv["CONTAINER_PORT"]) != "4895", kv
+    assert "没读到 docker 端口映射" in str(kv["CONFIG_SOURCE"]), kv.get("CONFIG_SOURCE")
+
+
 async def test_deploy_full_flow_with_derived_names(env):
     body = await create(env)
     assert body["dns_name"] == "dsh-01.example.test"
@@ -588,7 +606,9 @@ async def test_config_snapshot_reports_effective_values(env):
     await wait_job(env.app, body["job_id"])
     d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     kv = {i["key"]: i["value"] for i in d["config"]["items"]}
-    assert str(kv["CONTAINER_PORT"]) == "4895", kv
+    # 容器内监听端口取自 docker 映射的左半边；4895 是宿主机发布端口
+    assert str(kv["CONTAINER_PORT"]) == "8080", kv
+    assert str(kv["HOST_PORT"]) == "4895", kv
     assert kv["DOCUMENTS_DIRECTORY"] == "/mnt/hdd2/dsh-family/dsh-family/dsh-01/data"
     assert str(kv["FRP_REMOTE_PORT"]) != "0"
     assert str(kv["CONFIG_SOURCE"]).startswith("生效值"), kv.get("CONFIG_SOURCE")
@@ -610,9 +630,25 @@ async def test_config_snapshot_labels_estimates_when_env_unreadable(env):
     assert (await env.client.get(f"/api/jobs/{body['job_id']}")).json()["state"] == "succeeded"
     d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     kv = {i["key"]: i["value"] for i in d["config"]["items"]}
-    assert str(kv["CONFIG_SOURCE"]).startswith("估算")
+    # docker 端口映射还是读到了，所以是"部分生效值"，但绝不自称完整生效值
+    assert str(kv["CONFIG_SOURCE"]) == "部分生效值（没读到实例 .env）", kv.get("CONFIG_SOURCE")
     logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
     assert any("估算" in it["line"] for it in logs)
+
+
+async def test_config_snapshot_says_estimate_when_nothing_readable(env):
+    """.env 和 docker 映射都读不到：快照必须自报"这是估算"，不许冒充生效值。"""
+    from dsh_control.integrations.base import ExecResult
+
+    env.providers.executor.handlers.insert(
+        0, ("cat /srv/dsh-family/instances/dsh-01/.env", ExecResult(1, "", "cat: 不存在")))
+    env.providers.executor.handlers.insert(
+        0, ("HostConfig.PortBindings", ExecResult(1, "", "permission denied")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    kv = {i["key"]: i["value"] for i in d["config"]["items"]}
+    assert str(kv["CONFIG_SOURCE"]).startswith("估算"), kv.get("CONFIG_SOURCE")
 
 
 class _QueueProbe:

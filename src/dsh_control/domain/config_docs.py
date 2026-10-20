@@ -27,8 +27,15 @@ _ITEMS: list[dict[str, Any]] = [
     {
         "key": "CONTAINER_PORT",
         "label": "容器内监听端口",
-        "help": "DSH 进程在容器里监听的端口。frp 隧道把它映射到 VPS 的公网端口，"
-                "nginxWebUI 再按域名反代过来。端口在本控制台内全局唯一分配。",
+        "help": "DSH 进程在容器里监听的端口，取自 docker 的端口映射（8080/tcp -> "
+                "0.0.0.0:4895 里的 8080）。现网曾把宿主机端口当这个值显示，"
+                "于是 4895 被标在了容器上。",
+    },
+    {
+        "key": "HOST_PORT",
+        "label": "宿主机发布端口",
+        "help": "容器端口发布到宿主机上的哪个端口（上面那条映射的右半边）。"
+                "frpc 从这里取流量，再经隧道送到 VPS 的公网端口。",
     },
     {
         "key": "FRP_REMOTE_PORT",
@@ -114,6 +121,7 @@ def default_rendered(*, slug: str, public_url: str, trusted_hosts: list[str],
         "PUBLIC_URL": public_url,
         "TRUSTED_HOSTS": ",".join(trusted_hosts),
         "CONTAINER_PORT": container_port,
+        "HOST_PORT": 0,
         "FRP_REMOTE_PORT": frp_remote_port,
         "DOCUMENTS_DIRECTORY": data_dir,
         "DATA_DIR": data_dir,

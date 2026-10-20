@@ -256,6 +256,10 @@ class FakeExecutor:
         for pattern, result in self.handlers:
             if pattern in command:
                 return result
+        if "HostConfig.PortBindings" in command:
+            # 假主机上的容器一律监听 8080，发布到 4895。容器内监听端口只能问
+            # docker，别拿 .env 的 HOST_PORT 顶替（现网第 27 个缺陷）。
+            return ExecResult(0, "8080/tcp=4895 ", "")
         if "dump-config" in command:
             # 安全门（domain/safety.py）读的是这份；测试要改就直接塞 handlers
             return ExecResult(0, SAFE_DUMP, "")

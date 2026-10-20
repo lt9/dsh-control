@@ -217,6 +217,33 @@ async def _env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
     return out
 
 
+PORT_MAP_SNIPPET = """
+docker inspect --format '{{range $p, $b := .HostConfig.PortBindings}}\
+{{$p}}={{(index $b 0).HostPort}} {{end}}' __NAME__ 2>/dev/null || echo absent
+"""
+
+
+async def _port_map(ctx: JobCtx, container: str) -> tuple[int, int]:
+    """返回 (容器内监听端口, 宿主机发布端口)，读的是 docker 自己的端口映射。
+
+    现网第 27 个缺陷：第 65 步把 .env 里的 HOST_PORT 当成"容器内监听端口"写进
+    快照，详情页因此把 4895 标在容器上。真值是 docker inspect 里的
+    `8080/tcp -> 0.0.0.0:4895`——容器监听什么端口只有 docker 知道，
+    kit 的 .env 里那个键名连它自己都不守（dsh-01 写 8080，dsh-02 写 4895）。
+    """
+    cmd = PORT_MAP_SNIPPET.replace("__NAME__", shlex.quote(container))
+    r = await ctx.ssh(cmd, timeout=60, quiet=True)
+    out = (r.stdout or "").strip()
+    if not out or out == "absent" or "{" in out:   # 模板没渲染成功也不许当真值
+        return (0, 0)
+    for part in out.split():
+        left, _, right = part.partition("=")
+        inner = left.split("/")[0].strip()
+        if inner.isdigit():
+            return (int(inner), int(right) if right.strip().isdigit() else 0)
+    return (0, 0)
+
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -648,18 +675,32 @@ async def run_deploy(ctx: JobCtx) -> None:
             # 读不回事实不该让开通失败（容器已经起来了），但也不许把估算值当事实
             # 摆在详情页上：快照里明写来源，页面上就看得见这是开工前的推测。
             await ctx.log("warn", "读不到实例 .env，配置快照沿用开通前的估算值（已在快照里标注）")
+        cport, hport = await _port_map(ctx, inst.container_name)
+        if facts.get("HOST_PORT") and hport and str(hport) != str(facts["HOST_PORT"]):
+            await ctx.log("warn", f"端口对不上：docker 映射的宿主机端口是 {hport}，"
+                                  f"实例 .env 写的 HOST_PORT 是 {facts['HOST_PORT']}，"
+                                  "详情页以 docker 的映射为准")
         rendered = default_rendered(
             slug=slug, public_url=public_url, trusted_hosts=[dns_name],
-            container_port=int(facts.get("HOST_PORT") or inst.container_port or 0),
+            # 容器内监听端口只认 docker 的端口映射；读不到就留 0 并在来源里写明，
+            # 绝不拿 HOST_PORT 顶替（那是宿主机端口，两个数字含义不同）。
+            container_port=cport or int(inst.container_port or 0),
             frp_remote_port=int(inst.frp_remote_port or port or 0),
             data_dir=facts.get("DATA_DIR") or data_dir,
             image_tag=facts.get("DSH_IMAGE") or image,
         )
-        rendered["CONFIG_SOURCE"] = "生效值（实例 .env）" if facts else "估算（未读到实例 .env）"
+        rendered["HOST_PORT"] = hport or int(facts.get("HOST_PORT") or 0)
+        if facts and cport:
+            rendered["CONFIG_SOURCE"] = "生效值（实例 .env + docker 端口映射）"
+        elif facts or cport:
+            rendered["CONFIG_SOURCE"] = "部分生效值（" +                 ("没读到 docker 端口映射）" if not cport else "没读到实例 .env）")
+        else:
+            rendered["CONFIG_SOURCE"] = "估算（未读到实例 .env 与端口映射）"
         await repo.add_config_snapshot(ctx.s, inst.id, CONFIG_VERSION, rendered)
         await ctx.s.commit()
         st.detail = (f"配置快照来源：{rendered['CONFIG_SOURCE']}；"
-                     f"端口 {rendered['CONTAINER_PORT']}，"
+                     f"容器内 {rendered['CONTAINER_PORT']} ← 宿主机 "
+                     f"{rendered['HOST_PORT']} ← 公网 {rendered['FRP_REMOTE_PORT']}；"
                      f"数据目录 {rendered['DOCUMENTS_DIRECTORY']}")
 
     # ---- 70 token_capture：从容器日志抓一键地址（标 error，可重试）
