@@ -12,6 +12,7 @@ from ..db import repo
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.slug import derive, dns_rr
 from .capture import capture_token
+from ..domain.frp_port import pick_free_port
 from .runner import JobCtx, StepFailed
 
 
@@ -46,19 +47,13 @@ def _manual(ctx: JobCtx, which: str) -> bool:
 
 
 async def _pick_frp_port(ctx: JobCtx) -> int:
-    """从 DSHC_FRP_PORT_START 起找第一个未占用的公网端口；
-    不复用已释放实例用过的端口（库里 released 也计入 max）。"""
-    port = max(ctx.settings.frp_port_start, await repo.max_frp_remote_port(ctx.s) + 1)
-    if _manual(ctx, "frp"):
-        # 没有面板可探测：只做库内去重，人工建隧道时按这个端口做
-        return port
-    frp = ctx.frp()
-    for _ in range(200):
-        if not await frp.remote_port_taken(port):
-            return port
-        await ctx.log("info", f"frp 端口 {port} 已被占用，探测下一个")
-        port += 1
-    raise StepFailed("连续 200 个 frp 端口都被占用")
+    """共享实现见 domain/frp_port.py（主控台入口 expose 用同一套，不许另写一份）。"""
+    try:
+        return await pick_free_port(
+            ctx.s, ctx.frp(), ctx.settings, skip_probe=_manual(ctx, "frp"),
+            log=lambda m: ctx.log("info", m))
+    except RuntimeError as exc:
+        raise StepFailed(str(exc)) from exc
 
 
 async def run_deploy(ctx: JobCtx) -> None:

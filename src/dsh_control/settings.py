@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     frp_port_start: int = 4893        # DSHC_FRP_PORT_START：公网端口搜索起点
     prefer_hdd: bool = True           # DSHC_PREFER_HDD：自动选主机时机械盘优先
 
+    # ---- 主控台自身公网入口（cli expose 用；console_host 留空=hosts 恰好一台时自动选）
+    console_host: str = ""            # DSHC_CONSOLE_HOST：主控台所在主机（name 或 ssh_host）
+    wildcard_cert_name: str = ""      # DSHC_WILDCARD_CERT_NAME：NG 建站用的现成通配证书名
+
+    # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
+    dsh_image: str = ""               # DSHC_IMAGE：默认部署镜像，如 dsh-family:v1.2.3
+
     # ---- provider 注册表选择（site.toml [providers]；noop = 该层人工做，步骤标 skipped）
     provider_dns: str = "noop"        # aliyun | noop
     provider_frp: str = "noop"        # frp_panel | noop
@@ -91,6 +98,8 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
         "public_base": "public_base", "ingress_ip": "ingress_ip",
         "dns_zone": "dns_zone", "domain_prefix": "dns_prefix",
         "frps_upstream_host": "frps_upstream_host",
+        "dsh_image": "dsh_image", "console_host": "console_host",
+        "wildcard_cert_name": "wildcard_cert_name",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
     }
     for src, dst in mapping.items():
