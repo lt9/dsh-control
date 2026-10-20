@@ -251,9 +251,18 @@ async def test_deploy_rollback_removes_upstream_and_clears_ids(env):
         assert (inst.ng_server_id is None and inst.ng_location_id is None
                 and inst.ng_upstream_id is None and inst.ng_upstream_name == "")
     evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
-    cleared = next(e for e in evs if e["kind"] == "external_ids_cleared")
-    assert "已清空" in cleared["message"]
-    assert cleared["data"]["frp_proxy_id"] is not None  # 记的是清掉前的死 id
+    # 回滚现在按"谁删的谁抹"逐对象清（一次失败的续建不许清别人建的对象），
+    # 事件因此是多条：合起来必须把这次建过的每个登记字段都交代清楚。
+    cleared = [e for e in evs if e["kind"] == "external_ids_cleared"]
+    assert cleared, "回滚必须记下抹掉了哪些死 id"
+    assert all("已清空" in e["message"] for e in cleared)
+    wiped = {k: v for e in cleared for k, v in (e["data"] or {}).items()}
+    assert wiped["frp_proxy_id"] is not None           # 记的是清掉前的死 id
+    assert wiped["dns_record_id"], "DNS 死 id 没记下来"
+    assert wiped["frp_remote_port"] is not None, "端口要放回池子"
+    # NG 的 id 是 reload 成功之后才登记的；这次 reload 就失败了，从没登记过，
+    # 清理记录里当然不该出现——出现反而说明我们在清自己没碰过的东西。
+    assert "ng_server_id" not in wiped and "ng_upstream_id" not in wiped
 
 
 async def test_release_all_objects_already_gone_passes(env):

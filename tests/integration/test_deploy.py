@@ -307,3 +307,61 @@ async def test_host_prepare_creates_missing_data_root(env):
     assert any("mkdir -p '/hdd1/dsh-data'" in c for c in cmds), \
         "预检没创建数据根目录，第 60 步挂载会失败"
     assert any("test -w '/hdd1/dsh-data'" in c for c in cmds), "没校验目录可写"
+
+
+async def test_retry_adopts_dns_record_pointing_at_our_ingress(env):
+    """现网形状：上次建到第 60 步失败，DNS/隧道/站点留在外面（按契约不回滚），
+    而库里的登记 id 被当时刻板式的"通吃回滚"抹掉过。续建要按「记录值 == 本站入口」
+    认出自己的解析并复用，不能判成别人占用把实例永久锁死在 error。"""
+    from dsh_control.db import repo
+
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    iid = body["instance_id"]
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        assert inst.dns_record_id, "第一次开通应把 RecordId 登记进库"
+        inst.state = "error"        # 模拟第 60 步失败后的现场
+        inst.dns_record_id = ""     # 模拟旧回滚把登记抹了（缺陷本身）
+        await s.commit()
+
+    r = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r.status_code == 200, r.text
+    await wait_job(env.app, r.json()["job_id"])
+    d = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d["state"] == "running", d["last_error"]
+    assert sum(1 for ln in env.journal if ln.startswith("dns.create")) == 1, "复用了还重复建"
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        assert inst.dns_record_id, "复用之后要把 RecordId 挂回库里"
+    events = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
+    assert any("复用" in e["message"] for e in events), "复用这条判断必须在事件里看得见"
+
+
+async def test_failed_retry_keeps_previous_attempts_registrations(env):
+    """一次失败的**续建**只许抹它自己建的东西：上一次尝试留下的 DNS/隧道/站点
+    还活着，登记 id 一旦被抹就成了孤儿——页面看不见、释放删不掉。"""
+    from dsh_control.db import repo
+
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    iid = body["instance_id"]
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        keep = (inst.dns_record_id, inst.frp_proxy_id, inst.frp_remote_port,
+                inst.ng_server_id, inst.ng_upstream_id)
+        inst.state = "error"
+        await s.commit()
+
+    env.settings.frps_upstream_host = ""        # 让这次续建在第 10 步就失败
+    r = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r.status_code == 200, r.text
+    await wait_job(env.app, r.json()["job_id"])
+    assert (await env.client.get(f"/api/instances/{iid}")).json()["state"] == "error"
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        assert (inst.dns_record_id, inst.frp_proxy_id, inst.frp_remote_port,
+                inst.ng_server_id, inst.ng_upstream_id) == keep, "失败的续建抹掉了上次的登记"
+    assert env.providers.dns.records and env.providers.frp.tunnels and env.providers.ng.sites
+    logs = (await env.client.get(f"/api/jobs/{r.json()['job_id']}/logs?after=0")).json()["items"]
+    assert any("外部登记 id 保持不动" in it["line"] for it in logs), "要说明为什么没清"

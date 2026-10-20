@@ -11,7 +11,7 @@ probe_guard → ng_delete → frp_delete → dns_delete → container_stop → m
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from ..db import repo
@@ -116,16 +116,29 @@ EXTERNAL_ID_FIELDS: dict[str, Any] = {
 }
 
 
-async def clear_external_ids(ctx: JobCtx, inst: Any, *, reason: str) -> None:
-    """清空指向已删对象的 id（含 frp 公网端口：清了才允许后续实例重新用这个端口）。"""
-    cleared = {f: getattr(inst, f) for f in EXTERNAL_ID_FIELDS
+async def clear_external_ids(ctx: JobCtx, inst: Any, *, reason: str,
+                             only: Iterable[str] | None = None) -> None:
+    """清空指向已删对象的 id（含 frp 公网端口：清了才允许后续实例重新用这个端口）。
+
+    ``only`` 给出时**只清这些字段**。开通失败的回滚只能清"这次 job 自己建出来、
+    又被这次回滚删掉"的对象 id：整片清会把上一次尝试留下的对象（第 60 步之后按
+    契约不回滚，对象还活着）的登记一起抹掉——对象变孤儿，页面看不见，释放也删不掉。
+    2026-10-21 dsh-01 就是这么把自己锁死的：续建在第 10 步失败，回滚把上一次建好
+    的 DNS/隧道/站点的 id 全清了，域名反过来被第 10 步判成"别人占用"。
+    """
+    fields = (list(EXTERNAL_ID_FIELDS) if only is None
+              else [f for f in EXTERNAL_ID_FIELDS if f in set(only)])
+    cleared = {f: getattr(inst, f) for f in fields
                if getattr(inst, f, None) not in (None, "")}
-    for f, default in EXTERNAL_ID_FIELDS.items():
-        setattr(inst, f, default)
+    for f in fields:
+        setattr(inst, f, EXTERNAL_ID_FIELDS[f])
     await ctx.s.commit()
     if cleared:
         await ctx.event("external_ids_cleared",
                         f"{reason}，外部 id 已清空: {cleared}", cleared)
+    elif only is not None:
+        await ctx.log("info", "本次没有新建外部对象，库里的外部登记 id 保持不动"
+                              "（上一次尝试建的东西还在用，清了就成了孤儿）")
 
 
 async def run_release(ctx: JobCtx) -> None:

@@ -156,6 +156,10 @@ class JobCtx:
         self.ssh_key_pem = ssh_key_pem
         self._seq = 0
         self.rollback_actions: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+        # 本次 job **挂回去**的既有对象字段（续建时按名字找回上次建的记录）。
+        # 回滚清登记 id 时这些字段必须跳过：对象是上一次尝试建的、还活着，
+        # 把它 id 抹掉就成了孤儿（页面看不见、释放删不掉）。
+        self.kept_fields: set[str] = set()
         # 面板/插件同步回调写进来的行，步骤边界批量落库（见 integrations/sinks.py）
         self._line_buf: list[tuple[str, str]] = []
 

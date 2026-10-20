@@ -9,6 +9,7 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 from __future__ import annotations
 
 import shlex
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy import select
@@ -19,7 +20,7 @@ from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.frp_port import pick_free_port
 from ..domain.slug import derive, dns_rr
 from .capture import capture_token
-from .release import clear_external_ids, delete_ng_upstream, idempotent_delete
+from .release import EXTERNAL_ID_FIELDS, clear_external_ids, delete_ng_upstream, idempotent_delete
 from .runner import JobCtx, StepFailed
 
 
@@ -51,6 +52,20 @@ def _manual(ctx: JobCtx, which: str) -> bool:
     registry 的 Noop* 实现都带 manual_required=True。"""
     provider = getattr(ctx.providers, which, None)
     return bool(provider is not None and getattr(provider, "manual_required", False))
+
+
+def _rollback_del(ctx: JobCtx, inst: Any, name: str,
+                  delete_act: Callable[[], Awaitable[None]],
+                  fields: tuple[str, ...]) -> Callable[[], Awaitable[None]]:
+    """回滚动作 = 删掉这次建的对象 + 只抹它自己的登记字段。
+
+    登记 id 的清理必须跟"谁删的"绑在一起：通吃式地清一遍，会让一次失败的**续建**
+    把上一次尝试建的、这次根本没动的对象 id 也抹掉，对象当场变孤儿。
+    """
+    async def act() -> None:
+        await delete_act()
+        await clear_external_ids(ctx, inst, reason=f"开通失败已回滚 {name}", only=fields)
+    return act
 
 
 _DRIFT_MEANING = {
@@ -129,13 +144,20 @@ async def run_deploy(ctx: JobCtx) -> None:
     data_dir = f"{host.data_root.rstrip('/')}/{slug}"
 
     # 回滚兜底。runner 按 reversed() 倒序执行，这里最先 append 就最后执行：
-    # 外部对象都清完之后，把库里指向它们的登记 id 全部抹掉——开通失败那次什么
-    # 都没留下，死 id 留着就是假凭据（页面显示一条不存在的隧道，后续释放还拿
-    # 死 id 去删，实测卡死过释放）。含 frp_remote_port：回滚实例没占住隧道，
-    # 端口该放回池子供下一个实例用（释放成功路径不同，那边按契约保留端口）。
+    # 外部对象都删完之后，把库里指向它们的登记 id 抹掉——死 id 留着就是假凭据
+    # （页面显示一条不存在的隧道，后续释放还拿死 id 去删，实测卡死过释放）。
+    # 只清**本次 job 写过**的字段，且跳过 kept_fields（续建时按名字挂回去的既有
+    # 对象）：上一次尝试建的东西还活着，一次失败的续建没资格清它们的登记。
+    baseline = {f: getattr(inst, f, None) for f in EXTERNAL_ID_FIELDS}
+
+    def _fields_written_by_this_job() -> set[str]:
+        return {f for f, old in baseline.items()
+                if getattr(inst, f, None) != old and f not in ctx.kept_fields}
+
     ctx.rollback_actions.append(
         ("external_ids_clear", lambda: clear_external_ids(
-            ctx, inst, reason="开通失败已回滚"))
+            ctx, inst, reason="开通失败已回滚（仅本次写入的登记）",
+            only=_fields_written_by_this_job()))
     )
 
     # ---- 10 plan：slug 已在建实例时生成；去 DNS 与库确认未被占用（无副作用）
@@ -159,10 +181,28 @@ async def run_deploy(ctx: JobCtx) -> None:
         else:
             existing = await ctx.dns().find(rr)
             if existing is not None:
-                raise StepFailed(
-                    f"DNS 里已存在记录 {rr}.{ctx.settings.dns_zone} "
-                    f"(RecordId={existing.record_id})，重新创建实例以换新标签"
-                )
+                rid = str(existing.record_id or "")
+                ours = bool(inst.dns_record_id) and rid == str(inst.dns_record_id)
+                # 名字对得上不足以证明是我们的（域名由 slug 推出来，谁手动建一条
+                # 同名记录都长这样）。再看**记录值**：指向本站入口 IP 的那条才是
+                # 本控制台建的，续建直接复用；值不一样就是别人在用——不复用，
+                # 也绝不删。2026-10-21 就是这里判错，把用户自己的实例永久锁死在
+                # error，同时差点让他去删别人的解析。
+                ingress = ctx.settings.require("ingress_ip")
+                same_target = str(existing.value or "").strip() == ingress
+                if ours or same_target:
+                    if rid:
+                        inst.dns_record_id = rid
+                    ctx.kept_fields.add("dns_record_id")
+                    await ctx.log("info", f"DNS 记录 {rr} → {existing.value} 复用"
+                                          f"（RecordId={rid}；记录值与本站入口一致，"
+                                          "判为本控制台先前所建）")
+                else:
+                    raise StepFailed(
+                        f"DNS 里已存在记录 {rr}.{ctx.settings.dns_zone} "
+                        f"(RecordId={existing.record_id})，指向 {existing.value}，"
+                        f"与本站入口 {ingress} 不一致 → 不是本控制台建的：不复用、"
+                        "也不删（那是别人的解析）。换标签重新创建实例。")
         inst.dns_name = dns_name
         inst.public_url = public_url
         inst.container_name = names.container
@@ -225,7 +265,19 @@ async def run_deploy(ctx: JobCtx) -> None:
             )
             await ctx.s.commit()
         else:
-            rec = await ctx.dns().create(rr, ctx.settings.require("ingress_ip"), ttl=600)
+            ingress = ctx.settings.require("ingress_ip")
+            found = await ctx.dns().find(rr)
+            # 续建幂等：同名同值的 A 记录就是本控制台上次给这台实例建的，复用即可。
+            # 重复 create 只会往 DNS 里堆记录，阿里云还会直接报 AlreadyExists
+            # （2026-10-21 现网续建就卡在这儿）。
+            reuse = found is not None and str(found.value or "").strip() == ingress
+            rec = found if reuse else await ctx.dns().create(rr, ingress, ttl=600)
+            if reuse:
+                ctx.kept_fields.add("dns_record_id")
+                await ctx.log("info", f"DNS 已存在 {rr} A -> {found.value}"
+                                      f"（RecordId={found.record_id}），复用不重建")
+                await ctx.event("dns_reused", f"复用 A 记录 {rr} -> {found.value}",
+                                {"record_id": found.record_id, "rr": rr})
             if _synthetic_id(rec.record_id):
                 # provider 没标 manual_required 却返回合成占位：同样按人工层处理
                 st.state = "skipped"
@@ -240,12 +292,16 @@ async def run_deploy(ctx: JobCtx) -> None:
                 st_skip_dns = True
             else:
                 st_skip_dns = False
-            if not st_skip_dns:
+            if not st_skip_dns and not reuse:
+                # 复用来的记录不进回滚：不是这次建的，就没资格删。
                 ctx.rollback_actions.append(
-                    ("dns_delete", lambda rid=rec.record_id, r=rr: idempotent_delete(
-                        ctx.log, "DNS 记录", r,
-                        lambda: ctx.dns().delete(rid),
-                        lambda: ctx.dns().find(r)))
+                    ("dns_delete", _rollback_del(
+                        ctx, inst, "DNS 记录",
+                        lambda rid=rec.record_id, r=rr: idempotent_delete(
+                            ctx.log, "DNS 记录", r,
+                            lambda: ctx.dns().delete(rid),
+                            lambda: ctx.dns().find(r)),
+                        ("dns_record_id",)))
                 )
                 back = await ctx.dns().find(rr)
                 if back is None:
@@ -309,10 +365,13 @@ async def run_deploy(ctx: JobCtx) -> None:
                         n, client_id)
 
                 ctx.rollback_actions.append(
-                    ("frp_delete", lambda pid=tunnel.proxy_id, n=names.tunnel: idempotent_delete(
-                        ctx.log, "frp 隧道", n,
-                        lambda: ctx.frp().delete(pid, expect_name=n),
-                        frp_still_there))
+                    ("frp_delete", _rollback_del(
+                        ctx, inst, "frp 隧道",
+                        lambda pid=tunnel.proxy_id, n=names.tunnel: idempotent_delete(
+                            ctx.log, "frp 隧道", n,
+                            lambda: ctx.frp().delete(pid, expect_name=n),
+                            frp_still_there),
+                        ("frp_proxy_id", "frp_remote_port")))
                 )
                 inst.frp_proxy_id = tunnel.proxy_id
                 inst.frp_remote_port = tunnel.remote_port or port
@@ -374,15 +433,20 @@ async def run_deploy(ctx: JobCtx) -> None:
                 # rollback_actions，所以 append 顺序是反的：先 upstream 后站点。
                 if not _synthetic_id(site.upstream_id):
                     ctx.rollback_actions.append(
-                        ("ng_upstream_delete",
-                         lambda uid=site.upstream_id, un=names.upstream: delete_ng_upstream(
-                             ctx.ng(), uid, un, ctx.log))
+                        ("ng_upstream_delete", _rollback_del(
+                            ctx, inst, "NG upstream",
+                            lambda uid=site.upstream_id, un=names.upstream: delete_ng_upstream(
+                                ctx.ng(), uid, un, ctx.log),
+                            ("ng_upstream_id", "ng_upstream_name")))
                     )
                 ctx.rollback_actions.append(
-                    ("ng_delete", lambda sid=site.server_id, n=dns_name: idempotent_delete(
-                        ctx.log, "NG 站点", n,
-                        lambda: ctx.ng().delete_site(sid, expect_name=n),
-                        lambda: ctx.ng().find_site(n)))
+                    ("ng_delete", _rollback_del(
+                        ctx, inst, "NG 站点",
+                        lambda sid=site.server_id, n=dns_name: idempotent_delete(
+                            ctx.log, "NG 站点", n,
+                            lambda: ctx.ng().delete_site(sid, expect_name=n),
+                            lambda: ctx.ng().find_site(n)),
+                        ("ng_server_id", "ng_location_id")))
                 )
                 await _pre_replace_drift_check(ctx, dns_name)
                 await ctx.ng().reload()  # ensure_site 不会自动 reload（对接要点 1）
