@@ -9,27 +9,48 @@
    **一律只读**；创建/删除只允许作用于本控制台登记过的对象（按 `dns_record_id`、
    `frp_proxy_id`、`ng_*` 主键精确删）。
 2. frp 隧道、nginxWebUI 配置、阿里云解析删除属于不可逆动作，全部放在 `release` 流程里，
-   该流程要求二次确认（确认词必须等于实例 slug）。
+   该流程要求二次确认：服务端仍校验 `confirm == slug`，但该值由前端填，用户用长按确认
+   而不是打字（§9）。
 3. 释放**不删容器**：只 `docker stop`。数据目录、容器、镜像一律保留。列表仍可见，状态
    `released`，不提供恢复入口。
 4. 任何密钥、token、AK/SK 不写日志、不进错误信息、不进 URL query。列表和详情默认打码，
    完整值只在明确的 reveal 动作里返回。
 5. 主机侧执行一律走 SSH + `docker` 命令，不在被管主机上常驻 agent。
 
-## 1. 组件
+## 1. 仓库布局与组件
+
+MIT 开源项目，目录按标准 src-layout 组织：
 
 ```
-backend/  FastAPI + SQLAlchemy 2 + asyncpg + Alembic（对齐 ai-seo-platform 后端约定）
-frontend/ React 18 + Vite + TS（对齐 ai-seo-platform console 约定）
+dsh-control/
+├── LICENSE  README.md  CONTRIBUTING.md  SECURITY.md  CHANGELOG.md
+├── Makefile  pyproject.toml  .env.example  .editorconfig
+├── Dockerfile  docker-compose.yml
+├── src/dsh_control/
+│   ├── settings.py  main.py  cli.py  watcher.py
+│   ├── api/        路由、鉴权、schema、序列化
+│   ├── db/         模型、仓储、会话（迁移在仓库根 migrations/）
+│   ├── domain/     slug、配置项说明、时间等纯逻辑
+│   ├── jobs/       deploy / restart / release 状态机与 runner
+│   └── integrations/  外部系统适配器（§5），base.py 是冻结接口
+├── migrations/     Alembic
+├── tests/          unit/ 与 integration/，不碰真外部系统
+├── frontend/       React + Vite + TS，构建产物打进镜像由后端 serve
+├── deploy/         部署样例（compose 片段、反代样例配置）
+├── scripts/        开发辅助脚本
+└── docs/           本文件、adr/、vendor/；docs/site/ 是本站点专属资料，已 gitignore，
+                    含内网地址与记录 id，开源发布时不带
 ```
 
-后端内部模块与所有者：
+导入一律 `from dsh_control...`，**没有 `backend/` 前缀**（2026-10-20 已从
+`backend/src/...` 迁到 `src/...`，测试从 `tests/` 起，Alembic 在 `migrations/`）。
+ADR 一条决策一个文件：`docs/adr/NNN-标题.md`。
 
 | 模块 | 路径 | 职责 |
 |---|---|---|
-| app/api | `src/dsh_control/api/` | 路由、鉴权、序列化 |
-| domain | `src/dsh_control/db/` | 模型、迁移、仓储 |
-| orchestrator | `src/dsh_control/jobs/` | 部署/释放/重启状态机，步骤与日志落库 |
+| api | `src/dsh_control/api/` | 路由、鉴权、序列化 |
+| db | `src/dsh_control/db/` | 模型、迁移、仓储 |
+| jobs | `src/dsh_control/jobs/` | 部署/释放/重启状态机，步骤与日志落库 |
 | watcher | `src/dsh_control/watcher.py` | 周期采状态、自动重启、抓 token |
 | integrations | `src/dsh_control/integrations/` | 外部系统适配器（下面 §5） |
 | cli | `src/dsh_control/cli.py` | `init` / `serve` / `seed` |
@@ -39,22 +60,38 @@ frontend/ React 18 + Vite + TS（对齐 ai-seo-platform console 约定）
 库：与 ai-seo-platform 同一个 PG 实例（`tierai-prod-postgres-1`，Docker 网络
 `tierai-prod_default`），独立数据库 `dsh_control`。
 
+### 2.0 数据库三条规矩（不可违反，评审会逐条查）
+
+1. **不用外键**。表之间只有逻辑关联（`host_id`、`instance_id` 这类列 + 普通索引），
+   没有 `FOREIGN KEY` 约束，级联行为一律在程序里显式写。删除父行不自动动子行，
+   谁删谁负责，删完记 `events`。
+2. **不写联表查询**。仓储层一张表一张表查，用 `WHERE id IN (...)` 批量取回后在 Python
+   里组装；一个请求里不许出现 `JOIN`。列表接口组装详情时也是这个走法。
+3. **每个字段都要有备注**。SQLAlchemy 每个列写 `comment="…"`，Alembic 迁移里
+   `op.create_table` 的列同样带 `comment=`，落库后 `psql` 里 `\d+ 表名` 必须能看到
+   中文说明。表本身也要 `Comment`。没有备注的列不许合入。
+
+顺带：布尔列用 `is_`/`has_` 前缀或 `enabled` 这类形容词；时间列统一 `created_at`、
+`updated_at`、`*_at`，一律 `timestamptz` 存 UTC，显示层转 `Asia/Shanghai`；
+软删不用（本项目的"释放"是业务终态，不是软删标记）；金额/字节用 `bigint`；
+状态列用 `text` + CHECK 约束（不用 PG enum，加值要改类型太脆）。
+
 ```
 credentials        外部密钥仓库（按用户要求明文存库，可读回；只在 reveal 接口出网）
   id, kind(ssh_key|ssh_password|aliyun_ak|frp_panel|ng_panel|operator_key),
   name UNIQUE, secret jsonb, note, created_at, updated_at
 
 hosts              被管主机
-  id, name UNIQUE, ssh_host, ssh_port, ssh_user, ssh_credential_id -> credentials,
+  id, name UNIQUE, ssh_host, ssh_port, ssh_user, ssh_credential_id,   # 逻辑指向 credentials.id，无外键
   docker_context, kit_path,                 # dsh-family 仓库在被管机上的路径
   data_root,                                # 实例数据根目录（必须落在机械盘）
   frpc_client_id,                           # frp-panel 里的客户端 id，例 tuan.c.TuanCloud@1
   enabled bool, note, created_at, updated_at
 
 instances          DSH 实例（一个容器 = 一个人）
-  id, slug UNIQUE,                          # 域名前缀 dshsub2 这种，也当确认词
-  owner_label,                              # 给谁用的，例 老婆
-  host_id -> hosts, container_name,
+  id, slug UNIQUE,                          # 域名标签 dsh-NN，程序生成，也当确认词
+  owner_label,                              # 备注名，事后可改，不影响任何外部对象
+  host_id, container_name,                    # 逻辑指向 hosts.id，无外键
   config_version, image_tag, dsh_version,
   dns_name, dns_record_id,
   frp_proxy_id, frp_remote_port,
@@ -85,6 +122,8 @@ deploy_steps       点对点进度，前端按 seq 渲染
 events             审计与自动重启记录
   id, kind, instance_id NULL, job_id NULL, message, data jsonb, created_at
 ```
+
+上面每个 `id` 类关联列都只建普通索引，不建外键；`instance_id`/`job_id`/`host_id`/`ssh_credential_id` 的取值合法性由仓储层在写入前校验。
 
 ## 3. 实例状态机
 

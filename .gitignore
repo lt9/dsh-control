@@ -8,3 +8,6 @@ frontend/dist/
 *.sqlite
 .pytest_cache/
 .ruff_cache/
+
+# 本站点专属运维资料（含内网地址、记录 id、凭据名称），不随开源仓库发布
+docs/site/

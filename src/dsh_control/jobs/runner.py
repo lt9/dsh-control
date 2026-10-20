@@ -1,0 +1,373 @@
+"""任务引擎：deploy / restart / release 三个状态机共用。
+
+- 步骤与日志全部落库（deploy_steps / deploy_logs），前端按 seq 点对点渲染、
+  按 id 增量拉日志。
+- 所有往日志/事件里写的文本先过 redact_text()（token/AK/SK/密码不落日志）；
+  往 events.data 里写的 dict 先过 integrations.base.redact()。
+- 外部调用一律走 integrations/base.py 的 Protocol；实例从
+  integrations/registry.build_providers(settings) -> Providers 拿。
+  本模块只按下面的 ProvidersLike 形状取属性，不 import 任何具体实现。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+import traceback
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Protocol
+
+from ..db import repo
+from ..db.models import DeployJob, Host, Instance, utcnow
+from ..integrations.base import (
+    DnsProvider,
+    DshRuntime,
+    ExecResult,
+    Executor,
+    FrpProvider,
+    NgProvider,
+    PublicProbe,
+    redact,
+)
+from ..settings import Settings, get_settings
+
+
+# ---------------------------------------------------------------- 日志安全
+
+_TOKEN_URL_RE = re.compile(r"(https?://[^\s'\"]*[?&]token=)[^\s'\\"&]+")
+_SECRET_KV_RE = re.compile(
+    r"((?:token|secret|password|passwd|pass|access[_-]?key(?:[_-]?(?:id|secret))?|ak|sk"
+    r"|authorization|cookie)\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s'\"]+)",
+    re.IGNORECASE,
+)
+_HEADER_RE = re.compile(r"(Authorization|Cookie)\s*:\s*\S+", re.IGNORECASE)
+
+
+def redact_text(text: str) -> str:
+    """字符串版的 redact()：token URL、k=v 形式的密钥、请求头一律打码。
+
+    base.py 的 redact() 只处理 dict；本函数是它的字符串补角，
+    所有日志行 / 错误信息 / step detail 入库与出网前都必须经过。
+    """
+    if not text:
+        return text
+    text = _TOKEN_URL_RE.sub(r"\1***", text)
+    text = _HEADER_RE.sub(r"\1: ***", text)
+    text = _SECRET_KV_RE.sub(r"\1***", text)
+    return text
+
+
+def _scrub(obj: Any) -> Any:
+    """对 redact() 结果再扫一遍：任何嵌套字符串里的 token 形态也打码。"""
+    if isinstance(obj, str):
+        return redact_text(obj)
+    if isinstance(obj, dict):
+        return {k: _scrub(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub(x) for x in obj]
+    return obj
+
+
+class StepFailed(RuntimeError):
+    """步骤失败：中止 job，把 message 记进 job.error。"""
+
+
+class ProvidersLike(Protocol):
+    """integrations/registry.build_providers(settings) 返回的 Providers 需满足的形状。
+
+    runtime 按主机绑定：DshRuntime 的方法签名里只有 container（base.py 冻结），
+    所以 registry 必须提供 runtime_for(...) 工厂（或裸 runtime 实例作为单主机回退）。
+    """
+
+    dns: DnsProvider
+    frp: FrpProvider
+    ng: NgProvider
+    executor: Executor
+    probe: PublicProbe
+
+
+# ---------------------------------------------------------------- 上下文
+
+@dataclass(slots=True)
+class HostEndpoint:
+    host: str
+    port: int
+    user: str
+    private_key_pem: str
+
+
+def make_runtime(providers: Any, ep: HostEndpoint) -> DshRuntime:
+    """从 Providers 拿绑定到具体主机的 DshRuntime。
+
+    registry.build_providers 返回的对象需要提供下面任一形状：
+    1. runtime_for(host=, port=, user=, private_key_pem=) -> DshRuntime（推荐，多主机）
+    2. 裸 runtime 属性（DshRuntime 实例，只适用单主机/测试替身）
+    """
+    for name in ("runtime_for", "runtime_factory", "dsh_runtime_for"):
+        factory = getattr(providers, name, None)
+        if callable(factory):
+            try:
+                return factory(host=ep.host, port=ep.port, user=ep.user,
+                               private_key_pem=ep.private_key_pem)
+            except TypeError:
+                return factory(ep.host, ep.port, ep.user, ep.private_key_pem)
+    rt = getattr(providers, "runtime", None)
+    if rt is not None and hasattr(rt, "inspect"):
+        return rt
+    raise RuntimeError(
+        "providers 未提供 DshRuntime：需要 runtime_for(host=,port=,user=,private_key_pem=) "
+        "工厂或 runtime 实例（见 jobs/runner.ProvidersLike）"
+    )
+
+
+class JobCtx:
+    """一次 job 执行的全部依赖。flows 只碰这个对象。"""
+
+    def __init__(self, db, providers: Any, settings: Settings | None,
+                 job: DeployJob, instance: Instance, host: Host,
+                 ssh_key_pem: str) -> None:
+        self.db = db
+        self.s = db.session()
+        self.providers = providers
+        self.settings = settings or get_settings()
+        self.job = job
+        self.instance = instance
+        self.host = host
+        self.ssh_key_pem = ssh_key_pem
+        self._seq = 0
+        self.rollback_actions: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+
+    # ---- 日志
+
+    async def log(self, level: str, line: str) -> None:
+        await repo.add_log(self.s, self.job.id, self._seq, level, redact_text(line))
+
+    def buffered_sink(self, buf: list[tuple[str, str]]) -> Callable[[str, str], None]:
+        """base.LineSink 实现：行先缓冲（回调是同步的），步骤边界批量落库。"""
+        def sink(level: str, line: str) -> None:
+            line = line.rstrip("\r\n")
+            if line:
+                buf.append((level, line))
+        return sink
+
+    async def flush_lines(self, buf: list[tuple[str, str]]) -> None:
+        for level, line in buf:
+            await self.log(level, line)
+        buf.clear()
+
+    # ---- providers
+
+    def endpoint(self) -> HostEndpoint:
+        return HostEndpoint(self.host.ssh_host, self.host.ssh_port,
+                            self.host.ssh_user, self.ssh_key_pem)
+
+    def executor(self) -> Executor:
+        return self.providers.executor
+
+    def runtime(self) -> DshRuntime:
+        return make_runtime(self.providers, self.endpoint())
+
+    def dns(self) -> DnsProvider:
+        return self.providers.dns
+
+    def frp(self) -> FrpProvider:
+        return self.providers.frp
+
+    def ng(self) -> NgProvider:
+        return self.providers.ng
+
+    def probe(self) -> PublicProbe:
+        return self.providers.probe
+
+    # ---- SSH
+
+    async def ssh(self, command: str, *, timeout: float = 300) -> ExecResult:
+        ep = self.endpoint()
+        buf: list[tuple[str, str]] = []
+        result = await self.executor().run(
+            host=ep.host, port=ep.port, user=ep.user,
+            private_key_pem=ep.private_key_pem, command=command,
+            timeout=timeout, line_sink=self.buffered_sink(buf),
+        )
+        await self.flush_lines(buf)
+        await self.log("info", f"$ {redact_text(command)}  -> exit {result.code}")
+        return result
+
+    # ---- 事件（dict 先过 base.redact，再对嵌套字符串过 redact_text——
+    #      base.redact 只按 key 名打码，url 里夹带的 token 值要二次清洗）
+
+    async def event(self, kind: str, message: str = "", data: dict[str, Any] | None = None) -> None:
+        await repo.add_event(
+            self.s, kind, instance_id=self.instance.id, job_id=self.job.id,
+            message=redact_text(message), data=_scrub(redact(data or {})),
+        )
+
+    # ---- 步骤
+
+    @asynccontextmanager
+    async def step(self, seq: int, key: str, title: str):
+        self._seq = seq
+        step = await repo.add_step(self.s, self.job.id, seq, key, title)
+        step.state = "running"
+        step.started_at = utcnow()
+        await self.s.commit()
+        started = time.monotonic()
+        try:
+            yield step
+        except Exception as exc:  # noqa: BLE001 —— 步骤失败统一转 StepFailed
+            step.state = "failed"
+            step.finished_at = utcnow()
+            msg = redact_text(str(exc) or exc.__class__.__name__)
+            step.detail = (step.detail + "\n" if step.detail else "") + \
+                f"耗时 {time.monotonic() - started:.1f}s\n失败: {msg}"
+            await self.s.commit()
+            raise StepFailed(f"[{seq}:{key}] {msg}") from exc
+        step.state = "succeeded"
+        step.finished_at = utcnow()
+        step.detail = (step.detail + "\n" if step.detail else "") + \
+            f"耗时 {time.monotonic() - started:.1f}s"
+        await self.s.commit()
+
+    async def finish_rollback(self, error: str) -> None:
+        """失败时按契约「失败怎么办」列做回滚；回滚本身的异常只记日志不回抛。"""
+        for name, action in reversed(self.rollback_actions):
+            try:
+                await self.log("info", f"回滚: {name}")
+                await action()
+            except Exception as exc:  # noqa: BLE001
+                await self.log("error", f"回滚 {name} 失败: {redact_text(str(exc))}")
+
+
+# ---------------------------------------------------------------- 执行器
+
+FlowFn = Callable[[JobCtx], Awaitable[None]]
+
+
+class JobRunner:
+    """进程内 asyncio 任务表。同一实例同时只允许一个在途 job。"""
+
+    def __init__(self, db, providers: Any, settings: Settings | None = None) -> None:
+        self.db = db
+        self.providers = providers
+        self.settings = settings or get_settings()
+        self._tasks: dict[int, asyncio.Task] = {}
+        self._flows: dict[str, FlowFn] = {}
+
+    def register(self, kind: str, flow: FlowFn) -> None:
+        self._flows[kind] = flow
+
+    def register_flows(self, flows: dict[str, FlowFn]) -> None:
+        self._flows.update(flows)
+
+    async def has_active_job(self, instance_id: int) -> bool:
+        async with self.db.session() as s:
+            for task_id, task in list(self._tasks.items()):
+                if task.done():
+                    continue
+                job = await repo.get_job(s, task_id)
+                if job and job.instance_id == instance_id and job.state in ("pending", "running"):
+                    return True
+        return False
+
+    def spawn(self, job_id: int) -> asyncio.Task:
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            return task
+        task = asyncio.create_task(self._run(job_id), name=f"dshc-job-{job_id}")
+        self._tasks[job_id] = task
+        return task
+
+    async def wait(self, job_id: int, timeout: float = 30) -> None:
+        task = self._tasks.get(job_id)
+        if task is None:
+            return
+        await asyncio.wait_for(asyncio.shield(task), timeout)
+
+    async def cancel_all(self) -> None:
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
+
+    async def _run(self, job_id: int) -> None:
+        async with self.db.session() as s:
+            job = await repo.get_job(s, job_id)
+            if job is None or job.state not in ("pending",):
+                return
+            flow = self._flows.get(job.kind)
+            if flow is None:
+                job.state = "failed"
+                job.error = f"未知任务类型 {job.kind}"
+                job.finished_at = utcnow()
+                await s.commit()
+                return
+            instance = await repo.get_instance(s, job.instance_id)
+            host = await repo.get_host(s, instance.host_id) if instance else None
+            ssh_key_pem = ""
+            if host and host.ssh_credential_id:
+                from ..db.models import Credential
+                cred = await s.get(Credential, host.ssh_credential_id)
+                ssh_key_pem = (cred.secret or {}).get("private_key_pem", "") if cred else ""
+            if job is None or instance is None or host is None:
+                job.state = "failed"
+                job.error = "实例或主机不存在"
+                job.finished_at = utcnow()
+                await s.commit()
+                return
+            job.state = "running"
+            job.started_at = utcnow()
+            await s.commit()
+            if job.kind == "deploy":
+                await repo.set_instance_state(s, instance, "deploying")
+            elif job.kind == "restart":
+                await repo.set_instance_state(s, instance, "restarting")
+            ctx = JobCtx(self.db, self.providers, self.settings, job, instance,
+                         host, ssh_key_pem)
+
+        error: str | None = None
+        try:
+            await flow(ctx)
+        except StepFailed as exc:
+            error = str(exc)
+            try:
+                await ctx.finish_rollback(error)
+            finally:
+                await ctx.event("job_failed", error, {"kind": job.kind})
+        except asyncio.CancelledError:
+            error = "任务被取消（服务重启？）"
+            ctx_job = job
+            async with self.db.session() as s2:
+                j2 = await repo.get_job(s2, job_id)
+                if j2:
+                    j2.state = "failed"
+                    j2.error = error
+                    j2.finished_at = utcnow()
+                    await s2.commit()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            error = redact_text("".join(traceback.format_exception_only(exc)).strip())
+        finally:
+            try:
+                await ctx.s.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        async with self.db.session() as s:
+            j = await repo.get_job(s, job_id)
+            inst = await repo.get_instance(s, j.instance_id)
+            if error is None:
+                j.state = "succeeded"
+            else:
+                j.state = "failed"
+                j.error = error[:4000]
+                if inst and j.kind != "release":
+                    await repo.set_instance_state(s, inst, "error", last_error=error[:2000])
+                elif inst:
+                    inst.last_error = error[:2000]
+            j.finished_at = utcnow()
+            await s.commit()
+            await repo.add_event(
+                s, f"job_{j.kind}_{j.state}", instance_id=j.instance_id, job_id=j.id,
+                message=redact_text(error or "完成"),
+            )
