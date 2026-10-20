@@ -1,12 +1,23 @@
 services:
   dsh-control:
-    build: .
+    build:
+      context: .
+      args:
+        # 境内构建传镜像源，默认走上游（见 Dockerfile 注释）。
+        #   APT_MIRROR=https://mirrors.aliyun.com \
+        #   PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple docker compose build
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     image: dsh-control:latest
     container_name: dsh-control
     ports:
       - "13300:13300"
     env_file: .env
     volumes:
-      - ./data:/data                 # sqlite 或备份落盘（PG 时可不挂）
-      - ./secrets:/secrets:ro        # site.toml env_file 指向的私钥文件放这里（路径须在容器内可达）
+      - ./data:/data                 # sqlite 或备份落盘（用外部 PG 时可不挂）
+      - ./secrets:/secrets:ro        # 私钥等文件放这里（路径须在容器内可达）
+      - ./deploy:/site:ro            # 只读给 cli seed 用：--site /site/site.toml
+    # 站点专属差异（连哪个网络、挂哪把真密钥）写在 deploy/site.compose.yml，
+    # 那个文件已 gitignore。启动时两份一起带上：
+    #   docker compose -f docker-compose.yml -f deploy/site.compose.yml up -d
     restart: unless-stopped

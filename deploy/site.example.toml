@@ -18,13 +18,13 @@ env = { access_key_id = "DSHC_ALIYUN_AK", access_key_secret = "DSHC_ALIYUN_SK" }
 
 [[credentials]]
 kind = "frp_panel"
-name = "panel"
+name = "frp-panel"
 env = { username = "DSHC_FRP_PANEL_USER", password = "DSHC_FRP_PANEL_PASS" }
 base_url = "http://203.0.113.10:9000"
 
 [[credentials]]
 kind = "ng_panel"
-name = "panel"
+name = "ng-panel"
 env = { username = "DSHC_NG_USER", password = "DSHC_NG_PASS" }
 base_url = "http://203.0.113.10:18180"
 

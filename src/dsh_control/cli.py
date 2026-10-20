@@ -32,15 +32,24 @@ from .settings import get_settings
 def _alembic_config():
     from alembic.config import Config
 
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        cand = parent / "migrations"
+    # 查找顺序：显式指定 > 当前工作目录 > 包自身往上。
+    # 只看包自身是不够的：镜像里包被装进 site-packages，`__file__` 的任何父目录
+    # 都不含 /app/migrations，容器里就会报"找不到 migrations/"。
+    candidates: list[Path] = []
+    env = os.environ.get("DSHC_MIGRATIONS_DIR", "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path.cwd() / "migrations")
+    candidates.extend(parent / "migrations" for parent in Path(__file__).resolve().parents)
+
+    for cand in candidates:
         if cand.is_dir():
             cfg = Config()
             cfg.set_main_option("script_location", str(cand))
-            cfg.set_main_option("prepend_sys_path", str(parent))
+            cfg.set_main_option("prepend_sys_path", str(cand.parent))
             return cfg
-    raise SystemExit("找不到 migrations/ 目录（应与 pyproject.toml 同级）")
+    raise SystemExit(
+        "找不到 migrations/ 目录（应与 pyproject.toml 同级，或用 DSHC_MIGRATIONS_DIR 指定）")
 
 
 def cmd_migrate(database_url: str) -> None:
@@ -155,6 +164,7 @@ async def seed_into(db: Db, site: dict[str, Any]) -> tuple[int, int]:
             host.ssh_user = str(h.get("ssh_user", ""))
             host.ssh_credential_id = cred_id
             host.docker_context = str(h.get("docker_context", "default"))
+            host.kit_path = str(h.get("kit_path", ""))
             host.data_root = str(h.get("data_root", ""))
             host.frpc_client_id = str(h.get("frpc_client_id", ""))
             host.enabled = bool(h.get("enabled", True))

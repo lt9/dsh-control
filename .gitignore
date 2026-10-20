@@ -13,3 +13,4 @@ frontend/dist/
 docs/site/
 # 站点真实配置（含内网地址与凭据变量所指文件路径），不提交
 deploy/site.toml
+deploy/site.compose.yml
