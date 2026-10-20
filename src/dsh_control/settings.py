@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     console_host: str = ""            # DSHC_CONSOLE_HOST：主控台所在主机（name 或 ssh_host）
     wildcard_cert_name: str = ""      # DSHC_WILDCARD_CERT_NAME：NG 建站用的现成通配证书名
 
+    # ---- 模型（kit 的 compose 里 LLM_BASE_URL / LLM_API_KEY 是必填，缺了容器拒启）
+    # 地址是站点事实，放这里；密钥是机密，放 credentials(kind=llm_key)。
+    llm_base_url: str = ""            # DSHC_LLM_BASE_URL：自部署 provider 的 /v1 地址
+    llm_model_id: str = ""            # DSHC_LLM_MODEL_ID：留空则用 kit 默认模型
+
     # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
     # 默认部署镜像标签（准备好的版本，如 registry.local/dsh:stable）
     dsh_image: str = Field(default="",
@@ -110,6 +115,7 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
         "frps_upstream_host": "frps_upstream_host",
         "dsh_image": "dsh_image", "console_host": "console_host",
         "wildcard_cert_name": "wildcard_cert_name",
+        "llm_base_url": "llm_base_url", "llm_model_id": "llm_model_id",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
     }
     for src, dst in mapping.items():

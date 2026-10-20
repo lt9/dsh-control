@@ -123,7 +123,11 @@ class ExecResult:
 class Executor(Protocol):
     async def run(self, *, host: str, port: int, user: str, private_key_pem: str,
                   command: str, timeout: float = 300,
-                  line_sink: LineSink | None = None) -> ExecResult: ...
+                  line_sink: LineSink | None = None,
+                  stdin: str | None = None) -> ExecResult:
+        """stdin 只用来递密钥：命令行会进日志（打码只认 token/secret/password
+        这类名字，认不出 LLM_API_KEY），在目标机上 `ps` 也看得见。"""
+        ...
 
 
 @dataclass(slots=True)

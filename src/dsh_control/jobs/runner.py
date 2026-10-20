@@ -216,13 +216,15 @@ class JobCtx:
 
     # ---- SSH
 
-    async def ssh(self, command: str, *, timeout: float = 300) -> ExecResult:
+    async def ssh(self, command: str, *, timeout: float = 300,
+                  stdin: str | None = None) -> ExecResult:
+        """stdin 是给密钥用的：不进 command，因此不进日志、不进目标机的 ps。"""
         ep = self.endpoint()
         buf: list[tuple[str, str]] = []
         result = await self.executor().run(
             host=ep.host, port=ep.port, user=ep.user,
             private_key_pem=ep.private_key_pem, command=command,
-            timeout=timeout, line_sink=self.buffered_sink(buf),
+            timeout=timeout, line_sink=self.buffered_sink(buf), stdin=stdin,
         )
         await self.flush_lines(buf)
         await self.log("info", f"$ {redact_text(command)}  -> exit {result.code}")

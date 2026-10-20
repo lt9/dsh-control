@@ -68,6 +68,7 @@ class SshExecutor:
         command: str,
         timeout: float = 300,
         line_sink: LineSink | None = None,
+        stdin: str | None = None,
     ) -> ExecResult:
         if self.dry_run:
             if self.recorder is not None:
@@ -89,9 +90,12 @@ class SshExecutor:
                 f.write(private_key_pem if private_key_pem.endswith("\n")
                         else private_key_pem + "\n")
             os.chmod(key_path, 0o600)
+            # 密钥类数据走 stdin，绝不进 command：命令行会落进任务日志，
+            # 也在目标机的 ps 里裸奔；dry-run 记录里同样不收它。
             return await self._spawn(
                 host=host, port=port, user=user, key_path=key_path,
                 command=command, timeout=timeout, line_sink=line_sink,
+                stdin=stdin,
             )
         finally:
             with suppress(OSError):
@@ -107,6 +111,7 @@ class SshExecutor:
         command: str,
         timeout: float,
         line_sink: LineSink | None,
+        stdin: str | None = None,
     ) -> ExecResult:
         argv = [
             self.ssh_binary,
@@ -121,11 +126,19 @@ class SshExecutor:
         ]
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=(asyncio.subprocess.PIPE if stdin is not None
+                   else asyncio.subprocess.DEVNULL),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        if stdin is not None and proc.stdin is not None:
+            payload = stdin if stdin.endswith("\n") else stdin + "\n"
+            proc.stdin.write(payload.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+            with suppress(Exception):
+                await proc.stdin.wait_until_closed()
         out_lines: list[str] = []
         err_lines: list[str] = []
         pumps = [

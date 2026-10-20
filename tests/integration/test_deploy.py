@@ -421,3 +421,41 @@ async def test_rollback_of_retry_leaves_reused_tunnel_alone(env):
         assert inst.frp_proxy_id == 777, "复用的登记被抹掉了，隧道从此没人认领"
         assert inst.frp_remote_port == 4894
         assert inst.dns_record_id == "", "这次真的建过的 DNS 才该被抹"
+
+
+async def test_llm_key_travels_by_stdin_never_in_command(env):
+    """模型密钥不许出现在命令行：命令行会进任务日志，也在目标机的 ps 里裸奔，
+    而打码正则只认 token/secret/password 这类名字，认不出 LLM_API_KEY。"""
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "succeeded", job["error"]
+    ex = env.providers.executor
+    patch_cmds = [c for c in ex.commands if "LLM_API_KEY" in c]
+    assert patch_cmds, "第 60 步要往实例 .env 写模型配置"
+    assert not any("sk-TEST-LLM-KEY" in c for c in ex.commands), "密钥漏进命令行"
+    assert not any("sk-TEST-SEARCH" in c for c in ex.commands)
+    assert any(s and "sk-TEST-LLM-KEY" in s for s in ex.stdins), "密钥该走 stdin 递过去"
+    assert any("put LLM_BASE_URL https://llm.example.test:8000/v1" in c for c in ex.commands)
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
+    assert not any("sk-TEST-LLM-KEY" in it["line"] for it in logs), "日志里不许出现密钥"
+    assert any("LLM_API_KEY 已写入" in it["line"] for it in logs)
+
+
+async def test_missing_llm_credential_fails_at_plan_touching_nothing(env):
+    """缺模型密钥要在第 10 步就停：别等 DNS/隧道/站点都建好了才发现容器起不来。"""
+    from dsh_control.db import repo
+
+    async with env.db.session() as s:
+        cred = await repo.get_credential_by_kind(s, "llm_key")
+        await s.delete(cred)
+        await s.commit()
+
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
+    assert job["state"] == "failed"
+    assert "llm_key" in (job["error"] or "")
+    assert job["steps"][0]["seq"] == 10 and job["steps"][0]["state"] == "failed"
+    assert not any(ln.startswith(("dns.create", "frp.ensure", "ng.")) for ln in env.journal), \
+        "第 10 步失败前不许碰任何外部系统"

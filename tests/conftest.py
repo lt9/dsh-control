@@ -214,10 +214,13 @@ class FakeExecutor:
         self.manual_required = manual
         self.handlers: list[tuple[str, ExecResult]] = []
         self.commands: list[str] = []
+        self.stdins: list[str | None] = []
 
     async def run(self, *, host: str, port: int, user: str, private_key_pem: str,
-                  command: str, timeout: float = 300, line_sink=None) -> ExecResult:
+                  command: str, timeout: float = 300, line_sink=None,
+                  stdin: str | None = None) -> ExecResult:
         self.commands.append(command)
+        self.stdins.append(stdin)
         self.journal.add("ssh", host, command[:80].replace("\n", " "))
         if line_sink:
             line_sink("stdout", f"$ {command}")
@@ -321,6 +324,8 @@ def make_settings(**over) -> Settings:
         "dsh_image": "dsh-test:v9",
         # 443 站点必须带现成通配证书名（现网实测：ssl=0 的 443 面板配置过不了 nginx -t）
         "wildcard_cert_name": "*.example.test",
+        # kit 的 compose 里 LLM_BASE_URL / LLM_API_KEY 必填，缺一个容器就拒启
+        "llm_base_url": "https://llm.example.test:8000/v1",
         "wait_healthy_seconds": 1,
         "poll_interval": 1,
     }
@@ -366,6 +371,10 @@ async def env(tmp_path):
     async with db.session() as s:
         await repo.upsert_credential(s, kind="operator_key", name="default",
                                      secret={"key": OP_KEY}, note="")
+        await repo.upsert_credential(s, kind="llm_key", name="family-llm",
+                                     secret={"api_key": "sk-TEST-LLM-KEY",
+                                             "search_api_key": "sk-TEST-SEARCH"},
+                                     note="模型密钥（写进实例 .env）")
     nas = await seed_host(db, name="nas-1", ssh_port=2333, data_root="/hdd1/dsh-data")
     ssd = await seed_host(db, name="host-2", ssh_host="192.0.2.20",
                           data_root="/ssd1/dsh-data")
@@ -401,6 +410,10 @@ async def noop_env(tmp_path):
     async with db.session() as s:
         await repo.upsert_credential(s, kind="operator_key", name="default",
                                      secret={"key": OP_KEY}, note="")
+        await repo.upsert_credential(s, kind="llm_key", name="family-llm",
+                                     secret={"api_key": "sk-TEST-LLM-KEY",
+                                             "search_api_key": "sk-TEST-SEARCH"},
+                                     note="模型密钥（写进实例 .env）")
     await seed_host(db, name="solo")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

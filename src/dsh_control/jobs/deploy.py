@@ -133,6 +133,32 @@ async def _pick_frp_port(ctx: JobCtx) -> int:
         raise StepFailed(str(exc)) from exc
 
 
+async def _llm_material(ctx: JobCtx) -> dict[str, str]:
+    """取站点级模型配置：地址在 settings，密钥在 credentials(kind=llm_key)。
+
+    kit 的 compose 把 LLM_BASE_URL 和 LLM_API_KEY 写成必填（``${VAR:?缺少 …}``），
+    少一个容器直接拒启（2026-10-21 现网第 60 步就是这么炸的：报错说容器里的
+    ``$LLAMA_API_KEY`` 没设置，那是 compose 改名映射后的容器视角，要补的是实例
+    ``.env`` 里的 ``LLM_API_KEY``，见 kit 的 docs/02 第 2 节）。
+    """
+    base = ctx.settings.llm_base_url
+    if not base:
+        raise StepFailed(
+            "站点没配 llm_base_url：kit 的 compose 里 LLM_BASE_URL 必填，缺了容器起不来。"
+            "补站点配置（deploy/site.toml 的 [site].llm_base_url）后重跑开通")
+    cred = await repo.get_credential_by_kind(ctx.s, "llm_key")
+    secret = (cred.secret or {}) if cred else {}
+    api_key = str(secret.get("api_key") or "").strip()
+    if not api_key:
+        raise StepFailed(
+            "站点没登记模型密钥：credentials 里需要一条 kind=llm_key 且 api_key 非空。"
+            "compose 里 LLM_API_KEY 必填，缺了容器起不来（密钥只在第 60 步经 stdin "
+            "写进实例 .env，不进命令行、不进日志）")
+    return {"base_url": base, "model_id": ctx.settings.llm_model_id,
+            "api_key": api_key,
+            "search_key": str(secret.get("search_api_key") or "").strip()}
+
+
 async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, Any | None]:
     """续建先认出自己的隧道，再考虑挑新端口；返回 (端口, 复用到的隧道)。
 
@@ -200,6 +226,13 @@ async def run_deploy(ctx: JobCtx) -> None:
                               "——20 步会在目标主机上核验它在位")
         await ctx.log("info", f"NG 将以 {frps_host} 回源（frps 监听地址，"
                               "需 NG 容器视角可达；本站若 NG 为 host 网络通常填 127.0.0.1）")
+        await _llm_material(ctx)
+        await ctx.log("info", "模型 provider 已就位："
+                              f"{ctx.settings.llm_base_url}"
+                              + (f"，模型 {ctx.settings.llm_model_id}"
+                                 if ctx.settings.llm_model_id else "（模型用 kit 默认）")
+                              + "；密钥从 credentials(kind=llm_key) 取，"
+                                "只经 stdin 写入实例 .env")
         if _manual(ctx, "dns"):
             await ctx.log("info", f"DNS 层为 noop：请自行确认 {rr} 记录未被占用")
         else:
@@ -517,6 +550,7 @@ async def run_deploy(ctx: JobCtx) -> None:
         # 公网那两条 kit 不管（它只预填局域网白名单）：TRUSTED_HOSTS 少了域名，
         # DSH 准入墙会把 /api 判 403；PUBLIC_URL 缺了，容器日志里打的一键登录地址
         # 就是局域网地址，抓到的 token 拼出的链接对外没用。镜像也在这里落到 .env。
+        llm = await _llm_material(ctx)  # 现取现用：中途可能换密钥
         patch = "\n".join([
             "set -e",
             f"f={shlex.quote(env_file)}",
@@ -530,11 +564,27 @@ async def run_deploy(ctx: JobCtx) -> None:
             (f'if grep -q "^DSH_IMAGE=" "$f"; then '
              f'sed -i "s|^DSH_IMAGE=.*|DSH_IMAGE={image}|" "$f"; '
              f'else printf "DSH_IMAGE=%s\\n" {shlex.quote(image)} >> "$f"; fi'),
-            'grep -E "^(HOST_PORT|TRUSTED_HOSTS|PUBLIC_URL|DSH_IMAGE|DATA_DIR)=" "$f"',
+            # 值可能含 / & 等 sed 分隔符，一律"删行 + 追加"，不用 sed 替换
+            ("put() { grep -v '^$1=' \"$f\" > \"$f.tmp\" || true; "
+             "mv \"$f.tmp\" \"$f\"; printf '%s=%s\\n' \"$1\" \"$2\" >> \"$f\"; }"),
+            f'put LLM_BASE_URL {shlex.quote(llm["base_url"])}',
+            # 密钥从 stdin 进来：命令行会进任务日志，也在目标机 ps 里裸奔
+            "read -r llm_api_key",
+            "read -r search_api_key",
+            'put LLM_API_KEY "$llm_api_key"',
+            'if [ -n "$search_api_key" ]; then put SEARCH_API_KEY "$search_api_key"; fi',
+            (f'put LLM_MODEL_ID {shlex.quote(llm["model_id"])}'
+             if llm["model_id"] else ":"),
+            # 回显白名单里刻意没有 LLM_API_KEY / SEARCH_API_KEY
+            ('grep -E "^(HOST_PORT|TRUSTED_HOSTS|PUBLIC_URL|DSH_IMAGE|DATA_DIR'
+             '|LLM_BASE_URL|LLM_MODEL_ID)=" "$f"'),
+            ('if grep -q "^LLM_API_KEY=." "$f"; then echo "LLM_API_KEY 已写入（值不回显）"; '
+             'else echo "LLM_API_KEY 缺失"; exit 1; fi'),
         ])
-        r = await ctx.ssh(f"sh -c {shlex.quote(patch)}", timeout=120)
+        r = await ctx.ssh(f"sh -c {shlex.quote(patch)}", timeout=120,
+                          stdin=f"{llm['api_key']}\n{llm['search_key']}\n")
         if not r.ok:
-            raise StepFailed(f"给实例 .env 追加公网配置失败: {r.tail()}")
+            raise StepFailed(f"给实例 .env 写公网/模型配置失败: {r.tail()}")
         for line in (r.stdout or "").splitlines():
             if line.strip():
                 await ctx.log("info", f"[env] {line.strip()}"[:200])
