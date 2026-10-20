@@ -1,0 +1,198 @@
+"""外部系统适配器的冻结接口。
+
+后端编排只依赖这个文件里的类型，不直接 import 具体实现。三个实现
+（frp_panel / aliyun_dns / ng_panel）与 SSH 执行器都实现这里的 Protocol，
+方法签名以本文件为准；要改签名先改 docs/ARCHITECTURE.md。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
+
+LineSink = Callable[[str, str], None]  # (level: stdout|stderr, line)
+
+
+class IntegrationError(RuntimeError):
+    """外部系统返回非成功，或触发了 managed_only 白名单保护。"""
+
+    def __init__(self, message: str, *, code: str = "", detail: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
+
+
+class NotManaged(IntegrationError):
+    """试图操作不属于本控制台创建的对象。必须抛这个，调用方据此中止整条流程。"""
+
+
+@dataclass(slots=True)
+class DnsRecord:
+    record_id: str
+    rr: str
+    type: str
+    value: str
+    status: str = ""
+
+
+@runtime_checkable
+class DnsProvider(Protocol):
+    zone: str
+
+    async def find(self, rr: str) -> DnsRecord | None: ...
+    async def create(self, rr: str, value: str, ttl: int = 600) -> DnsRecord: ...
+    async def delete(self, record_id: str) -> None:
+        """record_id 必须来自本控制台登记过的记录，否则抛 NotManaged。"""
+        ...
+
+
+@dataclass(slots=True)
+class Tunnel:
+    proxy_id: int
+    name: str
+    client_id: str
+    server_id: str
+    type: str = "tcp"
+    local_ip: str = "127.0.0.1"
+    local_port: int = 0
+    remote_port: int = 0
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class FrpProvider(Protocol):
+    async def list(self, client_id: str | None = None) -> list[Tunnel]: ...
+    async def get(self, proxy_id: int) -> Tunnel | None: ...
+    async def find_by_name(self, name: str, client_id: str) -> Tunnel | None: ...
+    async def ensure(self, *, name: str, client_id: str, server_id: str, local_ip: str,
+                     local_port: int, remote_port: int) -> Tunnel:
+        """幂等：同名同客户端存在就核对端口，不一致抛 IntegrationError（不许静默改别人的门）。"""
+        ...
+    async def delete(self, proxy_id: int, *, expect_name: str) -> None:
+        """expect_name 必须以 dshctl_ 或 dsh_ 开头且与读回的 name 相等，否则抛 NotManaged。"""
+        ...
+    async def remote_port_taken(self, port: int) -> bool:
+        """在 frps 所在主机上探测该公网端口是否已被占用或已被某条隧道声明。"""
+        ...
+
+
+@dataclass(slots=True)
+class NgSite:
+    server_id: int
+    server_name: str
+    upstream_id: int | None = None
+    location_id: int | None = None
+    header_host: str = "$host"
+    websocket: bool = True
+
+
+@runtime_checkable
+class NgProvider(Protocol):
+    async def find_site(self, server_name: str) -> NgSite | None: ...
+    async def ensure_site(self, *, server_name: str, upstream_name: str,
+                          upstream_server: str, listen_port: int = 443,
+                          cert_name: str | None = None,
+                          header_host: str = "$host",
+                          websocket: bool = True) -> NgSite:
+        """幂等创建 upstream + 反代站点。
+
+        header_host 必须是 "$host"，不能带端口：DSH 要求 Origin 的 authority 与 Host
+        完全相等，带端口会 403 掉 WebSocket（见 ARCHITECTURE §5.4）。
+        """
+        ...
+    async def delete_site(self, server_id: int, *, expect_name: str) -> None: ...
+    async def reload(self) -> None: ...
+
+
+@dataclass(slots=True)
+class ExecResult:
+    code: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.code == 0
+
+    def tail(self, n: int = 800) -> str:
+        return (self.stderr or self.stdout).strip()[-n:]
+
+
+@runtime_checkable
+class Executor(Protocol):
+    async def run(self, *, host: str, port: int, user: str, private_key_pem: str,
+                  command: str, timeout: float = 300,
+                  line_sink: LineSink | None = None) -> ExecResult: ...
+
+
+@dataclass(slots=True)
+class ContainerState:
+    name: str
+    state: str
+    health: Literal["healthy", "unhealthy", "starting", "none"]
+    image: str
+    image_id: str
+    restart_count: int
+    ip: str
+    cpu_pct: float | None = None
+    mem_usage_bytes: int | None = None
+    mem_limit_bytes: int | None = None
+    failures: int = 0
+
+
+DOCKER_INSPECT_SNIPPET = """
+docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|\\\
+{{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \\
+  {name} 2>/dev/null || echo absent
+"""
+
+
+@runtime_checkable
+class DshRuntime(Protocol):
+    """被管主机上的 DSH 容器操作。实现方负责把命令拼成单条 SSH 调用。"""
+
+    async def inspect(self, container: str) -> ContainerState | None: ...
+    async def restart(self, container: str,
+                      line_sink: LineSink | None = None) -> ExecResult: ...
+    async def stop(self, container: str,
+                   line_sink: LineSink | None = None) -> ExecResult:
+        """只 stop。任何实现里都不允许出现 rm / volume prune / 删数据目录。"""
+        ...
+    async def latest_token(self, container: str) -> tuple[str, str] | None:
+        """从容器日志里取最后一条含 ?token= 的地址，返回 (token, url)。"""
+        ...
+    async def version(self, container: str) -> str: ...
+
+
+@dataclass(slots=True)
+class ProbeResult:
+    ok: bool
+    status_code: int
+    verdict: Literal["ok", "host_origin_mismatch", "unreachable", "unexpected"]
+    hint: str = ""
+
+
+@runtime_checkable
+class PublicProbe(Protocol):
+    async def check(self, base_url: str) -> ProbeResult:
+        """打两次：首页期望 200；无 token 打 /api/remote.mux 带正确 Origin。
+
+        401 = 反代头形状正确（拦在没登录）；403 = Host 与 Origin 又不等了，
+        提示去 nginxWebUI 把该站 location 的 Header Host 改成 $host。
+        """
+        ...
+
+
+ProviderMode = Literal["live", "dry_run"]
+
+
+def redact(obj: Any) -> Any:
+    """日志安全：把这些键的值换成 ***。任何往日志/事件里塞 dict 的地方都要先过这里。"""
+    sensitive = {"token", "secret", "password", "pass", "ak", "sk", "accesskeyid",
+                 "accesskeysecret", "private_key_pem", "privatekeypem", "key",
+                 "authorization", "cookie", "config"}
+    if isinstance(obj, dict):
+        return {k: ("***" if k.lower() in sensitive else redact(v)) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact(x) for x in obj]
+    return obj
