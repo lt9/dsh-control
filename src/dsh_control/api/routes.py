@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -104,10 +105,14 @@ async def login(request: Request, body: LoginRequest) -> JSONResponse:
         raise HTTPException(status_code=401, detail={"ok": False, "error": "bad_key"})
     limiter.record_success(ip)
 
-    resp = JSONResponse(status_code=200, content={"ok": True, "expires_at": None})
-    expires_at = set_session_cookie(resp, state.settings.session_secret,
-                                    state.settings.session_days)
-    resp.body = json.dumps({"ok": True, "expires_at": iso(expires_at)}).encode()
+    # 响应体必须**一次成型**：JSONResponse 在构造时就把 content-length 定死了，
+    # 之后再改 resp.body 会让实际字节数超过声明长度，uvicorn 直接掐断连接
+    # （"Response content longer than Content-Length"）。TestClient 不校验这个，
+    # 所以只有真机上会炸——登录成功分支曾因此对所有真实客户端不可用。
+    expires_at = datetime.now(UTC) + timedelta(days=state.settings.session_days)
+    resp = JSONResponse(status_code=200, content={"ok": True, "expires_at": iso(expires_at)})
+    set_session_cookie(resp, state.settings.session_secret,
+                       state.settings.session_days, expires_at=expires_at)
     return resp
 
 

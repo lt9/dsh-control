@@ -119,8 +119,15 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def set_session_cookie(response: JSONResponse, secret: str, days: int) -> datetime:
-    expires_at = datetime.now(UTC) + timedelta(days=days)
+def set_session_cookie(response: JSONResponse, secret: str, days: int,
+                       *, expires_at: datetime | None = None) -> datetime:
+    """给响应挂会话 cookie。
+
+    ``expires_at`` 可由调用方传入：登录响应体里也要回这个时间，两边必须是同一个值，
+    不能让调用方算一次、这里再算一次（差一秒就是两个不同的过期时间）。
+    """
+    if expires_at is None:
+        expires_at = datetime.now(UTC) + timedelta(days=days)
     response.set_cookie(
         COOKIE_NAME,
         make_session_cookie(secret, expires_at),
