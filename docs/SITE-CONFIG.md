@@ -29,6 +29,7 @@ ingress_ip = "203.0.113.10"          # A 记录指向的入口（frps 所在机�
 dns_zone = "example.com"
 domain_prefix = "dsh-"               # 一级子域，受证书通配层级约束
 frp_port_start = 4893
+dsh_image = "dsh-family:local"      # 开通时用的镜像标签；本机必须已有，控制台不构建
 
 [providers]                           # 换厂商只改这里，见下
 dns = "aliyun"                        # aliyun | noop
@@ -79,6 +80,8 @@ credential_name = "console-ed25519"
 `integrations/registry.py` 按 `providers` 的名字取实现，业务层（jobs / watcher / api）
 只依赖 `integrations/base.py` 里的 Protocol。新增一个厂商 = 新增一个实现文件 +
 在 registry 注册一行，不改调用方。
+
+镜像同理：具体标签不许出现在代码里，只有站点配置里有。控制台不构建镜像，只在开通前检查目标机上是否已有，缺失时用 `cli images ship` 从另一台搬过来。
 
 硬约束：入口 IP 不许出现在代码里（探活、建记录、拼 upstream 地址都从 `site` 段取）；
 证书通配层级决定域名只能是 `<前缀><序号>.<zone>` 这种一级子域，这条与厂商无关，

@@ -274,11 +274,11 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 | seq | key | 做什么 | 失败怎么办 |
 |---|---|---|---|
 | 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
-| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位 | 无副作用 |
+| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就失败并提示用 `cli images ship` 传过来。本步骤**永不构建镜像** | 无副作用 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
 | 40 | `frp_create` | 建隧道（remotePort 从 4893 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
 | 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket） | 删刚建的站点/upstream |
-| 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `PUBLIC_URL`/`TRUSTED_HOSTS` | 保留现场，标 error |
+| 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS` | 保留现场，标 error |
 | 70 | `token_capture` | 从容器日志抓一键地址 | 标 error，可重试 |
 | 80 | `probe_public` | 公网探测：首页 200 + 无 token 打 `/api/remote.mux` 期望 401（403 说明反代 Host 又错了） | 标 degraded，给出修正提示 |
 | 90 | `verify` | 跑 kit 的 `verify.sh <slug>`，收条目数 | 记录，不推翻成功 |
@@ -303,6 +303,21 @@ Base：`http://8.134.168.14:18180`，账号在 `credentials(ng_panel)`。`/api/*
 - 派生名一律从 slug 出：容器名 `dsh-NN`、隧道名 `dsh_NN`（点换下划线）、NG upstream
   `DSH_NN`、NG 站点 `server_name` 用完整域名。
 - 历史遗留的 `dshsub1` 不参与推导也不改名，它由人工拆除（docs/SEED.md §2）。
+
+#### 6.1.2 镜像是准备好的，不是现场构建的
+
+镜像生命周期与实例生命周期分开：
+
+- **构建**发生在 kit 仓库里（`dsh-family/scripts/build.sh`），由人触发，不在本控制台。
+- **传输**用 `cli images ship --tag T --from <host> --to <host>`：控制台在两台主机之间
+  流式搬运（源机 `docker save` 的 stdout 接目标机 `docker load` 的 stdin），
+  不落盘、不要求两台机器互相配信任——控制台已经有两边的 SSH 凭据，借一道。
+- **使用**：开通时镜像标签来自站点配置 `dsh_image`（默认 `dsh-family:local`），
+  代码里不许出现任何具体标签。第 20 步检查它在本机存在，不存在就失败。
+- **多版本**（以后做）：镜像标签的候选来自"目标机上 `docker images` 实际有哪些"，
+  在新建确认卡上做成一次点击的选项，仍然不输入；实例行上记 `image_tag`，
+  详情页显示"这个实例跑在哪个镜像上"。升级是"用新标签重新部署一个实例并迁移数据"，
+  不是把老容器就地换镜像——首期不做，但表结构已经留了 `image_tag` 与 `config_version`。
 
 ### 6.2 释放 `release`（二次确认后）
 
