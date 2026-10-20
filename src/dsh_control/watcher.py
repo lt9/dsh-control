@@ -42,6 +42,9 @@ class WatcherState:
     """进程内的连续失败计数。进程重启即清零——方向是安全的（宁可少重启）。"""
 
     failures: dict[int, int] = field(default_factory=dict)
+    # error → running 的确认计数：连续两轮看到 running+healthy 才恢复。
+    # 一轮就改状态会被"重启那一瞬间的假 healthy"糊弄。
+    recovered_votes: dict[int, int] = field(default_factory=dict)
     last_restart_count: dict[int, int] = field(default_factory=dict)
     # 已经提示过"容器不存在"的实例：这条只在状态跳变时记一次，别每轮刷屏
     absent_noted: set[int] = field(default_factory=set)
@@ -178,6 +181,24 @@ async def scan_once(
                     wstate.failures[inst.id] = 0
                 if inst.state == "unhealthy":
                     await repo.set_instance_state(s, inst, "running")
+                elif inst.state == "error":
+                    # error 是"上一次动作失败"留下的痕迹，不是容器现在的样子。
+                    # 容器明明 running+healthy 却一直挂着 error，页面就在说假话
+                    # （现网 dsh-01：容器 healthy，详情却写着"仍未恢复健康"）。
+                    # 连续两轮确认才恢复，并把恢复写进事件流，旧错误留在事件里。
+                    votes = wstate.recovered_votes.get(inst.id, 0) + 1
+                    if votes >= 2:
+                        wstate.recovered_votes.pop(inst.id, None)
+                        prev_err = (inst.last_error or "")[:400]
+                        inst.last_error = ""
+                        await repo.set_instance_state(s, inst, "running")
+                        await repo.add_event(
+                            s, "state_recovered", instance_id=inst.id,
+                            message="容器连续两轮 running/healthy，状态从 error 恢复为"
+                                    f" running。上次失败记录：{prev_err[:160] or '（无）'}",
+                            data={"previous_error": prev_err})
+                    else:
+                        wstate.recovered_votes[inst.id] = votes
                 continue
 
             if snap is not None and snap.state == "running" and snap.health == "starting":

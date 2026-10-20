@@ -177,3 +177,44 @@ async def test_absent_container_never_auto_restarts(env):
     env.runtime.exists = True
     await scan(env, wstate)
     assert wstate.absent_noted == set()
+
+
+async def test_error_recovers_when_container_is_actually_healthy(env):
+    """上次动作失败留下的 error 不许永远挂在 healthy 的容器上：页面就在说假话。
+    （现网 dsh-01：容器 running/healthy、重启 0 次，详情却写着"仍未恢复健康"。）"""
+    iid = await make_running_instance(env)
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        inst.state = "error"
+        inst.last_error = "[20:wait_healthy] 180s 内容器仍未恢复健康"
+        await s.commit()
+
+    wstate = WatcherState()
+    await scan(env, wstate)                      # 第一轮：只记账，不改状态
+    async with env.db.session() as s:
+        assert (await repo.get_instance(s, iid)).state == "error"
+    await scan(env, wstate)                      # 第二轮：确认恢复
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        assert inst.state == "running"
+        assert not inst.last_error, "恢复后别把旧错误留在实例行上，事件里才有"
+    evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
+    rec = next(e for e in evs if e["kind"] == "state_recovered")
+    assert "wait_healthy" in str(rec["data"].get("previous_error")), "旧错误要留在事件里"
+
+
+async def test_error_stays_when_container_really_is_gone(env):
+    """容器真不在：error 不许被"恢复"掉——那是还没救活的现场，不是恢复。"""
+    iid = await make_running_instance(env)
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, iid)
+        inst.state = "error"
+        await s.commit()
+    env.runtime.exists = False
+    wstate = WatcherState()
+    for _ in range(3):
+        await scan(env, wstate, now=IN_WINDOW)
+    async with env.db.session() as s:
+        assert (await repo.get_instance(s, iid)).state == "error"
+    evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
+    assert not any(e["kind"] == "state_recovered" for e in evs)
