@@ -468,7 +468,7 @@ async def run_deploy(ctx: JobCtx) -> None:
                 "headerHost=$host，websocket=true\n"
                 f"  证书：{ctx.settings.wildcard_cert_name}"
                 "（443 必须挂证书，否则面板配置过不了 nginx -t）\n"
-                "（headerHost 带端口会让 /api/remote.mux 403，见 docs/NG-API.md）"
+                "（headerHost 带端口会让 /api/remote.mux 403，见 docs/site/NG-API.md）"
                 + _drained(ctx, "ng")
             )
             await ctx.s.commit()

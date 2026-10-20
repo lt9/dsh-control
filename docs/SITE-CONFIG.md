@@ -58,6 +58,11 @@ kind = "ssh_key"
 name = "console-ed25519"
 env_file = { private_key_pem = "DSHC_SSH_KEY_FILE" }   # 指向一个私钥文件路径
 
+[[credentials]]
+kind = "llm_key"
+name = "family-llm"
+secret = { api_key = "……", search_api_key = "……（可空）" }
+
 [[hosts]]
 name = "nas-1"
 ssh_host = "192.0.2.10"
@@ -89,3 +94,39 @@ credential_name = "console-ed25519"
 
 `noop` provider 是通用性的另一半：没有阿里云也能用（DNS 自己指），没有 nginxWebUI 也能用
 （反代自己配），只有被管主机与 SSH 是必需的。
+
+## 模型端点与密钥（开通时必须就位）
+
+```toml
+[site]
+llm_base_url = "http://192.0.2.20:8000/v1"   # 实例必须只往这里发（也是安全门的判据）
+llm_model_id = ""                             # 留空则用镜像内默认
+```
+
+`.env` 侧对应 `DSHC_LLM_BASE_URL` / `DSHC_LLM_MODEL_ID`；密钥放
+`credentials(kind=llm_key)`，`secret.api_key` 必填、`secret.search_api_key` 可空。
+
+开通第 60 步把这三样写进实例的 `.env`（`LLM_BASE_URL` / `LLM_API_KEY` / `SEARCH_API_KEY`）。
+**密钥走 stdin 下发，不进命令行**：命令行进任务日志，也会在目标机的 `ps` 里被看见。
+
+两处名字陷阱（kit 的历史包袱，别按容器里看到的名字去改 `.env`）：
+`.env` 的 `LLM_API_KEY` 在容器里叫 `LLAMA_API_KEY`，`SEARCH_API_KEY` 叫 `DEEPSEEK_API_KEY`。
+
+## 安全门（不通过就不算开通成功）
+
+第 90 步读**容器生效配置**（`docker exec … dsh web --dump-config`，不是仓库模板）逐条核对：
+
+- 必须 `disabled: true`：`llm-deepseek`、`llm-deepseek-account`、`deepseek-account`、
+  `session-log-deepseek`、`plugin-package-inventory-deepseek`、`authorization`
+  —— 少一条都算没过（**条目不存在也按没过处理**），因为这几条是往云端发请求、会
+  产生账单或把内容外传的路径。
+- 必须**没被**禁用：`web-deepseek-api`（联网搜索走它，禁了她的实例会静默失去搜索）。
+- `providers.local.baseURL` 必须等于本站 `llm_base_url`，空值或指向别处都不过。
+- 拿不到配置（输出为空）= 不过。
+
+条目块读到下一个 `- id:` 为止，不按固定行数开窗：`grep -A8` 那种会把下一条目的
+`disabled: true` 算到这一条头上。
+
+判定权在控制台，不在 kit 的 `verify.sh`：现网出现过同一份配置两台机器结论相反
+（脚本在 `set -uo pipefail` 下被 `printf | grep -q` 的 SIGPIPE 骗出假警报）。kit 的
+检查项现在只作为参考，不通过时发 `verify_warnings` 事件，不影响开通结论。
