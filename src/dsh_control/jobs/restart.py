@@ -80,5 +80,5 @@ async def run_restart(ctx: JobCtx) -> None:
         await ctx.s.commit()
         if res.verdict == "host_origin_mismatch":
             hint = res.hint or "检查 nginxWebUI 该站 location 的 Header Host 是否为 $host"
-            await ctx.event("probe_degraded", f"重启后探活异常: {res.verdict}",
+            await ctx.event("probe_degraded", f"重启后公网探活没通过：{_PROBE_MEANING.get(res.verdict, res.verdict)}",
                             {"status_code": res.status_code, "hint": hint})

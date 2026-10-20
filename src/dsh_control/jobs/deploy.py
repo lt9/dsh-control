@@ -739,7 +739,7 @@ async def run_deploy(ctx: JobCtx) -> None:
             hint = res.hint or "检查反代 location 的 Header Host 是否为 $host"
             # 契约：标 degraded + 修正提示。state 枚举里没有 degraded，
             # 用 event + step detail 承载，不影响部署成功判定。
-            await ctx.event("probe_degraded", f"公网探活异常: {res.verdict}",
+            await ctx.event("probe_degraded", f"公网探活没通过：{_PROBE_MEANING.get(res.verdict, res.verdict)}",
                             {"status_code": res.status_code, "hint": hint})
 
     # ---- 90 verify：kit 的 verify.sh <slug>，收条目数，不推翻成功

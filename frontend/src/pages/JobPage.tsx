@@ -190,7 +190,8 @@ function DonePanel({ instanceId, restart = false }: { instanceId: number; restar
   return (
     <div className="card done-panel" style={{ marginBottom: 16 }}>
       <h2>{restart ? "已重启，密钥已换新" : "开通完成"}</h2>
-      <p className="mut small">{restart ? "旧密钥已失效，下面这串是新的。" : "把这串地址发给他：手机打开就能用，不用再登录。"}</p>
+      {!gone && <p className="mut small">{restart ? "旧密钥已失效，下面这串是新的。"
+        : "把这串地址发给他：手机打开就能用，不用再登录。"}</p>}
       {det && <p className="small">{det.owner_label || det.slug} · <span className="mono">{det.network?.dns_name}</span></p>}
       {gone
         ? <p className="mut small" style={{ marginTop: 12 }}>这台已回收：公网入口注销、容器已停，
