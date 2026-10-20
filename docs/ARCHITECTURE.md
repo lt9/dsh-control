@@ -249,7 +249,13 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 抓 token：`docker logs <container>` 里匹配 `https?://[^[:space:]]+\?token=[^[:space:]]+`，
 取最后一条。
 
-### 5.2 frp-panel `integrations/frp_panel.py`
+### 5.2 frp
+> **实测坑**：`list_configs` 带 `clientId` 过滤时返回**空集**而不是筛选结果（同一时刻
+> 不带过滤 59 条、带过滤 0 条）。所以过滤必须在本地做。这条不是性能问题：只要经由
+> 面板过滤，`find_by_name` 就永远查不到，`ensure` 会重复建门，创建后的回读校验也永远
+> 失败——第一次真实开通就是这样把已经建好的隧道判成"不存在"的。
+
+-panel `integrations/frp_panel.py`
 
 Base：`http://203.0.113.10:9000`（VPS，`frp-panel`，无文档，以下均已实测）。
 登录：`POST /api/v1/auth/login {username,password}` → cookie `frp-panel-cookie`（JWT，

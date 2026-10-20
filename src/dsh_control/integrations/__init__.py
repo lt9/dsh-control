@@ -28,7 +28,12 @@ from .base import (
     redact,
 )
 from .dry_run import DryRunEntry, DryRunRecorder
-from .frp_panel import FrpPanel
+from .frp_panel import (
+    PROXY_CONFIG_FIELDS,
+    FrpPanel,
+    build_config_envelope,
+    tunnel_config_payload,
+)
 from .ng_panel import NgPanel
 from .noop import ManualAction, NoopDns, NoopFrp, NoopNg
 from .probe import HttpPublicProbe
@@ -43,6 +48,7 @@ from .registry import (
 from .shell import SshDshRuntime, SshExecutor
 
 __all__ = [
+    "PROXY_CONFIG_FIELDS",
     "AliyunDns",
     "ContainerState",
     "DnsProvider",
@@ -73,9 +79,11 @@ __all__ = [
     "SshDshRuntime",
     "SshExecutor",
     "Tunnel",
+    "build_config_envelope",
     "build_providers",
     "redact",
     "register_dns",
     "register_frp",
     "register_ng",
+    "tunnel_config_payload",
 ]
