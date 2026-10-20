@@ -19,6 +19,8 @@ export interface Host {
 export interface Overview {
   running: number; unhealthy: number; released: number;
   hosts: number; by_host: unknown[];
+  /** 站点统一域名后缀（确认卡显示完整域名用；字段名以后端为准，前端防御式读取）。 */
+  dns_zone?: string | null;
 }
 
 export interface InstanceRow {
@@ -91,14 +93,26 @@ async function http<T>(path: string, init?: RequestInit & { json?: unknown }): P
   try { body = await res.json(); } catch { /* 无 JSON 体 */ }
   if (!res.ok) {
     const b = body as { detail?: unknown; error?: string; message?: string } | null;
-    const detail = typeof b?.detail === "string" ? b.detail
-      : typeof b?.error === "string" ? b.error
-      : typeof b?.message === "string" ? b.message
-      : Array.isArray(b?.detail) ? "提交内容没有通过校验。" : null;
-    throw new ApiError(res.status, detail ?? `请求失败（HTTP ${res.status}）`);
+    const d = b?.detail;
+    const one = (s: string) => (s && /[。.！]$/.test(s) ? s : s + "。");
+    const detail = typeof d === "string" ? d
+      : d && typeof d === "object" && !Array.isArray(d)
+        ? (() => {
+            const o = d as { error?: string; message?: string };
+            return o.message ? one(o.message) : o.error ? one(ERR_ZH[o.error] ?? `出错：${o.error}`) : null;
+          })()
+        : typeof b?.error === "string" ? one(ERR_ZH[b.error] ?? b.error)
+        : typeof b?.message === "string" ? one(b.message)
+        : Array.isArray(d) ? "提交内容没有通过校验。" : null;
+    throw new ApiError(res.status, detail ?? `请求失败（HTTP ${res.status}）。`);
   }
   return body as T;
 }
+
+/** 后端返回机器码时翻成人话；未知码原样带出（好过 [object Object]）。 */
+const ERR_ZH: Record<string, string> = {
+  bad_key: "运维密钥不对",
+};
 
 // —— 列表/概览的响应形状契约未逐字给出：做防御性归一（见回报「契约疑问」）。 ——
 

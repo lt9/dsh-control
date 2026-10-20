@@ -193,7 +193,7 @@ export default function DetailPage() {
           <details className="card" style={{ padding: "10px 16px" }}>
             <summary className="mut small" style={{ cursor: "pointer", letterSpacing: ".08em" }}>台账明细（给排障用的原始值）</summary>
             <dl className="kv" style={{ marginTop: 10 }}>
-              <dt>镜像</dt><dd className="mono">{d.image_tag ?? "—"}{d.image_id ? ` · ${d.image_id}` : ""}</dd>
+              <dt>镜像 id</dt><dd className="mono">{d.image_id ?? "—"}</dd>
               <dt>frp 隧道</dt><dd className="mono">{d.network?.frp_remote_port ?? "—"} · 记录 id {d.network?.frp_proxy_id ?? "—"}</dd>
               <dt>DNS 记录</dt><dd className="mono">{d.network?.dns_record_id ?? "—"}</dd>
               <dt>状态机</dt><dd className="mono">{d.state} → {d.desired_state}</dd>
@@ -257,6 +257,11 @@ export default function DetailPage() {
                 <dt>公网端口</dt><dd className="num">{d.network?.frp_remote_port ?? "—"}</dd>
                 <dt>容器 IP</dt><dd className="mono">{d.network?.container_ip ?? "—"}</dd>
                 <dt>DSH 版本</dt><dd className="mono">{d.dsh_version ?? "—"}</dd>
+                {/* 镜像只读一行，跟版本放一起；本期无任何切换入口（多版本后置）。 */}
+                <dt>镜像</dt>
+                <dd className="mono" title="镜像是事先构建好传到那台机器上的，控制台不构建；换版本是以后的能力，现在固定用站点配置的默认版本。">
+                  {d.image_tag ?? d.image_id ?? "—"}<span className="mut small"> 站点默认 · 不可切换</span>
+                </dd>
               </dl>
             </div>
           </section>

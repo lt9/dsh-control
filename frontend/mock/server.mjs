@@ -6,7 +6,7 @@ let SEQ = 10, tok = {}, jobs = {};
 const hosts = [{ id: 1, name: "nas-1", enabled: true, data_root: "/mnt/hdd/dsh-family", note: "机械盘，剩 1.7 T" }, { id: 2, name: "host-2", enabled: true, data_root: "/home/u/dsh-data", note: "主控台自己这台" }];
 let insts = process.env.MOCK === "empty" ? [] : [
   { id: 1, slug: "dsh-probe", owner_label: null, host_id: 2, state: "released", dsh_version: "1.14.2", config_version: "v1", dns_name: "dsh-probe.example.com", released_at: iso(-86400 * 6), updated_at: iso(-86400 * 6), err: null },{ id: 2, slug: "dsh-01", owner_label: "老婆", host_id: 1, state: "running", dsh_version: "1.14.2", config_version: "v1", dns_name: "dsh-01.example.com", released_at: null, updated_at: iso(-3600), err: null },{ id: 3, slug: "dsh-02", owner_label: null, host_id: 1, state: "unhealthy", dsh_version: "1.13.8", config_version: "v1", dns_name: "dsh-02.example.com", released_at: null, updated_at: iso(-900), err: "健康检查连续 3 次失败：站点返回 502；距上次自动重启不足 10 分钟，先不重启" }];
-const CFG = [{ key: "documentsDirectory", value: "/data", label: "工作区根目录", help: "DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配" }, { key: "trustedHosts", value: "", label: "准入域名", help: "Origin 和 Host 不完全相等就拒绝——「能打开但一直重连」都是它的锅" },
+const CFG = [{ key: "image", value: "dsh-family:local", label: "镜像", help: "镜像是事先构建好传到那台机器上的，控制台不构建；换版本是以后的能力，现在固定用站点配置的默认版本" }, { key: "documentsDirectory", value: "/data", label: "工作区根目录", help: "DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配" }, { key: "trustedHosts", value: "", label: "准入域名", help: "Origin 和 Host 不完全相等就拒绝——「能打开但一直重连」都是它的锅" },
 { key: "TZ", value: "Asia/Shanghai", label: "时区", help: "定时任务和备份都按北京时间走" }, { key: "backupWindow", value: "03:20-04:00", label: "备份窗口", help: "窗口内不自动重启，免得把正在跑的备份腰斩" }];
 const STEPS = { deploy: [[10, "域名规划"], [20, "主机预检"], [30, "添加解析"], [40, "开隧道"], [50, "建反代站点"], [60, "部署容器"], [70, "抓登录密钥"], [80, "公网探活"], [90, "验收复核"]],
 restart: [[10, "重启容器"], [20, "等待健康"], [30, "抓登录密钥"], [40, "公网探活"]], release: [[10, "核对确认词"], [20, "注销 nginx 站点"], [30, "注销 frp 隧道"], [40, "注销解析记录"], [50, "停止容器（只停不删）"], [60, "标记已释放"]] };
@@ -33,7 +33,7 @@ http.createServer(async (req, res) => {
   if (p === "/api/session") return send(200, { ok: true, expires_at: iso(7 * 86400) });
   if (p === "/api/logout") return send(200, { ok: true });
   if (p === "/api/hosts") return send(200, hosts);
-  if (p === "/api/overview") return send(200, { running: insts.filter((i) => i.state === "running").length, unhealthy: insts.filter((i) => ["unhealthy", "restarting", "error"].includes(i.state)).length, released: insts.filter((i) => i.state === "released").length, hosts: hosts.length, by_host: hosts.map((h) => ({ host: h.name, note: h.note, total: insts.filter((i) => i.host_id === h.id).length, free_gb: h.id === 1 ? 1740 : 42 })) });
+  if (p === "/api/overview") return send(200, { dns_zone: "example.com", running: insts.filter((i) => i.state === "running").length, unhealthy: insts.filter((i) => ["unhealthy", "restarting", "error"].includes(i.state)).length, released: insts.filter((i) => i.state === "released").length, hosts: hosts.length, by_host: hosts.map((h) => ({ host: h.name, note: h.note, total: insts.filter((i) => i.host_id === h.id).length, free_gb: h.id === 1 ? 1740 : 42 })) });
 if (p === "/api/instances" && req.method === "GET") { const q = (u.searchParams.get("q") ?? "").toLowerCase(); return send(200, insts.filter((i) => !q || [i.slug, i.owner_label, i.dns_name].some((v) => v?.toLowerCase().includes(q))).map((i) => ({ ...i, host: hosts.find((h) => h.id === i.host_id), err: undefined }))); }
 if (p === "/api/instances" && req.method === "POST") { const nid = Math.max(0, ...insts.map((i) => i.id)) + 1, slug = "dsh-" + String(Math.max(...insts.map((i) => Number(/^dsh-(\d+)$/.exec(i.slug)?.[1] ?? 0)), 0) + 1).padStart(2, "0");
 insts.push({ id: nid, slug, owner_label: null, host_id: b.host_id ?? 2, state: "deploying", dsh_version: null, config_version: "v1", dns_name: slug + ".example.com", released_at: null, updated_at: iso(), err: null });
@@ -55,4 +55,4 @@ return send(200, { instance_id: nid, dns_name: slug + ".example.com", job_id: mk
     push(); t = setInterval(push, 1200); req.on("close", () => clearInterval(t)); return; }
   if (m(/^\/api\/jobs\/\d+$/)) { const v = jobView(jid); return v ? send(200, v) : send(404, { detail: "工单不存在" }); }
   send(404, { detail: "接口不存在：" + p });
-}).listen(13300, "127.0.0.1", () => console.log("dsh-control mock → http://127.0.0.1:13300 (key: dshc-demo)"));
+}).listen(Number(process.env.PORT ?? 13300), "127.0.0.1", () => console.log("dsh-control mock → http://127.0.0.1:13300 (key: dshc-demo)"));

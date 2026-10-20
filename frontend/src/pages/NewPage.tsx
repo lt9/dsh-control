@@ -12,14 +12,19 @@ export default function NewPage() {
   const nav = useNavigate();
   const hosts = useAsync(() => api.hosts(), []);
   const rows = useAsync(() => api.instances(), []);
+  const ov = useAsync(() => api.overview(), []);
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // 域名后缀首选站点配置（overview.dns_zone 等字段，防御式读），退而求其次从既有实例反推。
   const zone = useMemo(() => {
+    const o = ov.data as unknown as Record<string, unknown> | null;
+    const z = (o?.dns_zone ?? o?.zone ?? o?.domain_suffix ?? null) as string | null;
+    if (z) return "." + String(z).replace(/^\.+/, "");
     const withDns = (rows.data ?? []).map((r) => r.dns_name).find(Boolean);
     return withDns?.includes(".") ? withDns.slice(withDns.indexOf(".")) : null;
-  }, [rows.data]);
+  }, [ov.data, rows.data]);
   const nextSlug = useMemo(() => {
     let max = 0;
     for (const r of rows.data ?? []) {

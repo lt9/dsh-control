@@ -44,7 +44,7 @@ export default function LoginPage({ onDone }: { onDone: () => void }) {
         {error && (
           <div className="alert alert-err" role="alert">
             <Icon name="cross" />
-            <span>{error}。密钥原样留着，改完直接再试。</span>
+            <span>{error.replace(/[。.]$/, "")}——密钥原样留着，改完直接再试。</span>
           </div>
         )}
         <button type="submit" className="btn btn-primary btn-lg" disabled={busy || !key}>
