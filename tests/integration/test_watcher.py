@@ -225,3 +225,34 @@ async def test_error_stays_when_container_really_is_gone(env):
         assert (await repo.get_instance(s, iid)).state == "error"
     evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
     assert not any(e["kind"] == "state_recovered" for e in evs)
+
+
+async def test_snapshot_carries_cpu_and_memory(env):
+    """运行态那两格一直是"—"的真因：采样只跑 `docker inspect`，而那条命令
+    根本没有 CPU/内存。现在必须来自 docker stats。"""
+    from sqlalchemy import select
+
+    from dsh_control.db.models import InstanceSnapshot
+
+    iid = await make_running_instance(env)
+    await scan(env, WatcherState())
+    async with env.db.session() as s:
+        snap = (await s.scalars(select(InstanceSnapshot)
+                                .where(InstanceSnapshot.instance_id == iid)
+                                .order_by(InstanceSnapshot.id.desc()))).first()
+    assert snap.cpu_pct == 3.75, snap.cpu_pct
+    assert snap.mem_usage_bytes == 1 << 30, snap.mem_usage_bytes
+    assert snap.mem_limit_bytes == 2 << 30, snap.mem_limit_bytes
+
+
+async def test_stats_failure_does_not_break_health_chain(env):
+    """资源采样只是锦上添花；它炸了不能连健康判定一起拖走（那是自动重启的依据）。"""
+    iid = await make_running_instance(env)
+    wstate = WatcherState()
+
+    async def boom(container):
+        raise TimeoutError("docker stats 卡住")
+
+    env.runtime.stats = boom
+    await scan(env, wstate)
+    assert wstate.failures.get(iid, 0) == 0   # 健康判定照常，没算失败

@@ -294,6 +294,14 @@ class FakeRuntime:
                               cpu_pct=1.5, mem_usage_bytes=1 << 30,
                               mem_limit_bytes=1 << 34)
 
+    async def stats(self, container: str):
+        """`docker stats` 的替身：只在容器真在跑时给数，停了就是全 None。"""
+        from dsh_control.integrations.base import ContainerStats
+        if self.state != "running":
+            return ContainerStats()
+        return ContainerStats(cpu_pct=3.75, mem_usage_bytes=1 << 30,
+                              mem_limit_bytes=2 << 30)
+
     async def restart(self, container: str, line_sink=None) -> ExecResult:
         self.journal.add("runtime.restart", container)
         self.restart_count += 1

@@ -156,11 +156,33 @@ docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.S
 """
 
 
+DOCKER_STATS_SNIPPET = """
+docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' \
+  __NAME__ 2>/dev/null || echo absent
+"""
+
+
+@dataclass
+class ContainerStats:
+    """一次 `docker stats` 采样。
+
+    `docker inspect` 里**没有** CPU 与内存，所以运行态卡片的这两格从建库第一天
+    起就一直是空的——不是"没采到"，是那条命令根本给不出这个值。
+    """
+
+    cpu_pct: float | None = None
+    mem_usage_bytes: int | None = None
+    mem_limit_bytes: int | None = None
+
+
 @runtime_checkable
 class DshRuntime(Protocol):
     """被管主机上的 DSH 容器操作。实现方负责把命令拼成单条 SSH 调用。"""
 
     async def inspect(self, container: str) -> ContainerState | None: ...
+    async def stats(self, container: str) -> ContainerStats:
+        """CPU / 内存。取不到就返回全 None，不许拿 0 冒充"没负载"。"""
+        ...
     async def restart(self, container: str,
                       line_sink: LineSink | None = None) -> ExecResult: ...
     async def stop(self, container: str,

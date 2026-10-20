@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import repo
 from .db.models import Credential, Host, Instance
 from .domain.timeutil import in_window
-from .integrations.base import redact
+from .integrations.base import ContainerStats, redact
 from .jobs.capture import TokenNotFound, capture_token
 from .jobs.runner import HostEndpoint, make_runtime, redact_text
 from .settings import Settings, get_settings
@@ -134,14 +134,24 @@ async def scan_once(
                             redact_text(str(exc)))
                 continue
 
+            # CPU/内存只能问 `docker stats`（inspect 里没有这两个值）。
+            # 单独 try：采样失败绝不能拖累健康判定那条链——那是自动重启的依据。
+            stats = ContainerStats()
+            if snap and snap.state == "running":
+                try:
+                    stats = await runtime.stats(inst.container_name or inst.slug)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("采样 %s 资源占用失败（不影响健康判定）: %s",
+                             inst.slug, redact_text(str(exc)))
+
             prev_snap = await repo.latest_snapshot(s, inst.id)
             await repo.add_snapshot(
                 s, inst.id, docker_state=snap.state if snap else "absent",
                 health=snap.health if snap else "none",
                 restart_count=snap.restart_count if snap else 0,
-                cpu_pct=snap.cpu_pct if snap else None,
-                mem_usage_bytes=snap.mem_usage_bytes if snap else None,
-                mem_limit_bytes=snap.mem_limit_bytes if snap else None,
+                cpu_pct=stats.cpu_pct,
+                mem_usage_bytes=stats.mem_usage_bytes,
+                mem_limit_bytes=stats.mem_limit_bytes,
                 raw=redact({"image_id": snap.image_id if snap else "",
                             "ip": snap.ip if snap else ""}),
             )

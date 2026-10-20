@@ -340,6 +340,15 @@ table.tbl { width: 100%; min-width: 940px; border-collapse: separate; border-spa
 .cfg-item-help { margin-top: 3px; color: var(--ink-2); font-size: 13px; }
 
 /* 事件时间线 */
+/* 事件流收进定高滚动区：条数一多，页面本体不该跟着无限长。
+   overscroll-behavior 防止滚到底把整页一起拖着走；scrollbar-gutter 留位，
+   免得出现滚动条那一刻内容横向跳一下。 */
+.feed-scroll {
+  max-height: 360px; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-gutter: stable; padding-right: 8px; margin: 0 -4px;
+}
+@media (max-width: 720px) { .feed-scroll { max-height: 300px; } }
+
 .timeline { margin: 0; padding: 0 0 0 18px; list-style: none; border-left: 1px dashed var(--line-2); }
 .timeline li { position: relative; padding: 0 0 16px 14px; }
 .timeline li::before {

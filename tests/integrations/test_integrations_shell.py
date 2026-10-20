@@ -208,3 +208,32 @@ def test_executor_dry_run_records_only():
     assert res.ok and res.stdout == ""
     assert len(rec.entries) == 1
     assert rec.entries[0].payload == {"command": "docker stop c"}
+
+
+def test_parse_stats_normal():
+    st = SshDshRuntime._parse_stats("dsh-dsh-02|3.75%|1.5GiB / 7.4GiB")
+    assert st.cpu_pct == 3.75
+    assert st.mem_usage_bytes == int(1.5 * 1024 ** 3)
+    assert st.mem_limit_bytes == int(7.4 * 1024 ** 3)
+
+
+def test_parse_stats_stopped_is_none_not_zero():
+    """容器停了 docker stats 不吐行。返回 0 会被画成"这机器闲着"，是骗人。"""
+    st = SshDshRuntime._parse_stats("")
+    assert (st.cpu_pct, st.mem_usage_bytes, st.mem_limit_bytes) == (None, None, None)
+    st2 = SshDshRuntime._parse_stats("absent")
+    assert st2.cpu_pct is None
+
+
+def test_parse_stats_na_and_missing_limit():
+    st = SshDshRuntime._parse_stats("dsh-dsh-02|N/A|512MiB / N/A")
+    assert st.cpu_pct is None
+    assert st.mem_usage_bytes == 512 * 1024 ** 2
+    assert st.mem_limit_bytes is None
+
+
+def test_parse_stats_kb_units_and_garbage():
+    st = SshDshRuntime._parse_stats("c|0.10%|900KB / 2GB")
+    assert st.mem_usage_bytes == 900_000
+    assert st.mem_limit_bytes == 2_000_000_000
+    assert SshDshRuntime._parse_stats("c|abc|xyz").cpu_pct is None

@@ -19,7 +19,9 @@ from contextlib import suppress
 
 from .base import (
     DOCKER_INSPECT_SNIPPET,
+    DOCKER_STATS_SNIPPET,
     ContainerState,
+    ContainerStats,
     ExecResult,
     IntegrationError,
     LineSink,
@@ -40,6 +42,40 @@ def _feed(line_sink: LineSink | None, level: str, line: str) -> None:
         line_sink(level, line)
     except Exception:  # noqa: BLE001, S110 — 日志回调不许把主流程带崩
         pass
+
+
+def _parse_pct(text: str) -> float | None:
+    s = (text or "").strip().rstrip("%").replace("N/A", "").strip()
+    if not s:
+        return None
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return None
+
+
+_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
+          "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+
+
+def _parse_size(text: str) -> int | None:
+    """`123MiB` / `1.5GiB` / `--` → 字节数，读不出一律 None。"""
+    s = (text or "").strip().upper().replace("N/A", "")
+    if not s or s in ("--", "-"):
+        return None
+    num, unit = "", ""
+    for ch in s:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        else:
+            unit += ch
+    unit = unit.strip().replace(" ", "") or "B"
+    if not num or unit not in _UNITS:
+        return None
+    try:
+        return int(float(num) * _UNITS[unit])
+    except ValueError:
+        return None
 
 
 class SshExecutor:
@@ -231,6 +267,40 @@ class SshDshRuntime:
         if not result.ok:
             return None
         return self._parse_inspect(container, result.stdout)
+
+    async def stats(self, container: str) -> ContainerStats:
+        if self.dry_run:
+            return ContainerStats()
+        command = DOCKER_STATS_SNIPPET.replace("__NAME__", shlex.quote(container))
+        # docker stats --no-stream 要开一个采样窗口，1~2 秒是常态；别按 60s 等
+        result = await self._run(command, timeout=45)
+        if not result.ok:
+            return ContainerStats()
+        return self._parse_stats(result.stdout)
+
+    @staticmethod
+    def _parse_stats(stdout: str) -> ContainerStats:
+        """解析 `Name|1.23%|123MiB / 1GiB`。
+
+        这里的坑是"把没读到当成 0"：容器停了、docker 版本不认这个 format、
+        权限不够，输出都可能是空或 N/A——一律返回 None，让页面显示"读不到"，
+        不要画一条贴着零的曲线骗人。
+        """
+        for line in reversed(stdout.splitlines()):
+            line = line.strip().replace("\\", "")
+            if not line or line == "absent":
+                continue
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) < 3:
+                continue
+            cpu = _parse_pct(parts[1])
+            usage, _, limit = parts[2].partition("/")
+            return ContainerStats(
+                cpu_pct=cpu,
+                mem_usage_bytes=_parse_size(usage),
+                mem_limit_bytes=_parse_size(limit),
+            )
+        return ContainerStats()
 
     @staticmethod
     def _parse_inspect(container: str, stdout: str) -> ContainerState | None:

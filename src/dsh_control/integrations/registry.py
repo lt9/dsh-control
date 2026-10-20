@@ -322,6 +322,9 @@ class RuntimeBinder(DshRuntime):
     async def inspect(self, container: str):
         self._refuse()
 
+    async def stats(self, container: str):
+        self._refuse()
+
     async def restart(self, container: str, line_sink=None):
         self._refuse()
 

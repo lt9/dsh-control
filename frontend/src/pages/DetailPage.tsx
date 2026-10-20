@@ -301,21 +301,32 @@ export default function DetailPage() {
           {/* —— 异常与事件 —— */}
           {(d.last_error || (events.data?.length ?? 0) > 0) && (
             <section className="card" aria-label="异常与事件">
-              <div className="card-head"><h2>{d.last_error ? "异常与最近事件" : "最近事件"}</h2></div>
+              <div className="card-head">
+                <h2>{d.last_error ? "异常与最近事件" : "最近事件"}</h2>
+                {(events.data?.length ?? 0) > 0 && (
+                  <span className="mut small">{(events.data ?? []).length} 条</span>
+                )}
+              </div>
               <div className="card-body">
                 {d.last_error && (
                   <div className="alert alert-err" style={{ marginTop: 0 }}>
                     <Icon name="cross" /><span>{d.last_error}</span>
                   </div>
                 )}
-                <ul className="timeline" style={{ marginTop: d.last_error ? 14 : 0 }}>
-                  {(events.data ?? []).map((ev) => (
-                    <li key={ev.id} className={/fail|错误|不健康|unhealthy/i.test(ev.message + ev.kind) ? "hot" : ""}>
-                      <div className="t" title={fmtFull(ev.created_at)}>{fmtRel(ev.created_at)}</div>
-                      <div className="m">{ev.message}</div>
-                    </li>
-                  ))}
-                </ul>
+                {/* 事件能攒到上百条，以前整条摊在页面上，详情页一打开就得滚半天。
+                    收进一个定高滚动区：异常提示留在外面（那条不能被藏起来），
+                    列表自己滚。tabIndex/role 是滚动区必须能用键盘滚的规矩。 */}
+                <div className="feed-scroll scroll-light" tabIndex={0} role="region"
+                     aria-label={`最近事件，共 ${(events.data ?? []).length} 条，可滚动`}>
+                  <ul className="timeline" style={{ marginTop: d.last_error ? 14 : 0 }}>
+                    {(events.data ?? []).map((ev) => (
+                      <li key={ev.id} className={/fail|错误|不健康|unhealthy/i.test(ev.message + ev.kind) ? "hot" : ""}>
+                        <div className="t" title={fmtFull(ev.created_at)}>{fmtRel(ev.created_at)}</div>
+                        <div className="m">{ev.message}</div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               </div>
             </section>
           )}
