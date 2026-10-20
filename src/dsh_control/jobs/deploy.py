@@ -168,6 +168,10 @@ async def run_deploy(ctx: JobCtx) -> None:
         kit = host.kit_path
         r = await ctx.ssh(
             f"set -e; echo '[conn] ok'; "
+            # 数据根目录归控制台建：缺目录时 df 报错、第 60 步挂载也会失败，
+            # 不该让人先手动 mkdir 才能开通（零输入要求）。
+            f"mkdir -p '{host.data_root}' && test -w '{host.data_root}' "
+            f"&& echo '[dir] writable'; "
             f"df -P '{host.data_root}' | tail -1; "
             f"test -x '{kit}/scripts/new-instance.sh' && echo '[kit] new-instance.sh ok'; "
             f"test -x '{kit}/scripts/deploy.sh' && echo '[kit] deploy.sh ok'; "

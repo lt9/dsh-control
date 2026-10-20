@@ -164,6 +164,22 @@ async def token_exists(s: AsyncSession, instance_id: int, token: str) -> bool:
 async def add_config_snapshot(
     s: AsyncSession, instance_id: int, version: str, rendered: dict[str, Any]
 ) -> InstanceConfig:
+    """同 (instance_id, version) 只留一行：已存在就地更新 ``rendered`` 并返回。
+
+    重试开通会从第 10 步重跑，裸 INSERT 会撞唯一键
+    ``instance_configs_instance_id_version_key``（2026-10-21 dsh-01 续建实测崩在这）。
+    配置文档按版本号定稿，同版本重算出来的内容就是要替换旧内容。
+    """
+    existing = await s.scalar(
+        select(InstanceConfig)
+        .where(InstanceConfig.instance_id == instance_id,
+               InstanceConfig.version == version)
+        .order_by(InstanceConfig.id)
+    )
+    if existing is not None:
+        existing.rendered = rendered
+        await s.commit()
+        return existing
     row = InstanceConfig(instance_id=instance_id, version=version, rendered=rendered)
     s.add(row)
     await s.commit()

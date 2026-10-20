@@ -264,3 +264,45 @@ async def test_dirty_both_warns_in_log_but_deploy_continues(env):
     lines = logs["items"] if isinstance(logs, dict) and "items" in logs else logs
     text = " ".join(x["line"] for x in lines)
     assert "体检提醒" in text and "office.example.test" in text
+
+
+async def test_retry_after_reload_failure_does_not_duplicate_config_snapshot(env):
+    """现网形状的第一次失败：DNS/隧道/站点都建好了，第 50 步 reload 与面板并发写撞车。
+    此时配置快照已提交，续建从第 10 步重跑必须**覆盖**同版本快照，不能再 INSERT——
+    2026-10-21 dsh-01 实测崩在 duplicate key instance_configs_instance_id_version_key。"""
+    from sqlalchemy import select
+
+    from dsh_control.db.models import InstanceConfig
+
+    env.providers.ng.fail_reload = True
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    body = r.json()
+    iid = body["instance_id"]
+    await wait_job(env.app, body["job_id"])
+    assert (await env.client.get(f"/api/instances/{iid}")).json()["state"] == "error"
+    async with env.db.session() as s:
+        first = (await s.scalars(select(InstanceConfig)
+                                 .where(InstanceConfig.instance_id == iid))).all()
+        assert len(first) == 1, "第一次开通就该留下一份配置快照"
+
+    env.providers.ng.fail_reload = False
+    r2 = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r2.status_code == 200, r2.text
+    await wait_job(env.app, r2.json()["job_id"])
+    d2 = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d2["state"] == "running", d2["last_error"]
+    async with env.db.session() as s:
+        rows = (await s.scalars(select(InstanceConfig)
+                                .where(InstanceConfig.instance_id == iid))).all()
+        assert len(rows) == 1, f"续建把配置快照插重了：{len(rows)} 行"
+
+
+async def test_host_prepare_creates_missing_data_root(env):
+    """数据根目录不存在时由控制台 mkdir -p：不该让人先手动建目录才能开通。
+    现网 host-109 的 /home/twan/dsh-data 就是这么把第一次开通卡住的。"""
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    cmds = env.providers.executor.commands
+    assert any("mkdir -p '/hdd1/dsh-data'" in c for c in cmds), \
+        "预检没创建数据根目录，第 60 步挂载会失败"
+    assert any("test -w '/hdd1/dsh-data'" in c for c in cmds), "没校验目录可写"
