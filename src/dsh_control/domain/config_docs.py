@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-CONFIG_VERSION = "v1"
+# v2：第 66 步开始往快照里写 "DSH" 这一组（模型/压缩/插件/技能/预设）。
+# add_config_snapshot 按 (instance_id, version) upsert，沿用 v1 会让旧快照
+# 在新文案下渲染出一屏空值，所以语义变了就必须升版本号。
+CONFIG_VERSION = "v2"
 
 _ITEMS: list[dict[str, Any]] = [
     {
@@ -83,6 +86,13 @@ _ITEMS: list[dict[str, Any]] = [
         "help": "默认 unless-stopped：宿主机重启后 Docker 自动拉起容器。"
                 "自动拉起会轮换登录 token，watcher 检测到 restart_count 增长后会"
                 "重新从容器日志抓最新 token 落库。",
+    },
+    {
+        "key": "LLM_MODEL_ID",
+        "label": "实例模型名",
+        "help": "写进实例 .env、由 kit 渲染进 DSH 配置的那个名字，要对的是推理服务真实"
+                "在服务的模型名（别名是给旧客户端兼容用的，不是真实模型）。"
+                "换名只改这一个值，重启容器生效。",
     },
     {
         "key": "TZ",

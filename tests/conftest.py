@@ -266,6 +266,76 @@ class FakeExecutor:
         return ExecResult(0, "ok\n", "")
 
 
+
+FAKE_DUMP = """\
+# == @deepseek-ai/dsh-base
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      local:
+        displayName: 家里的小模型
+        baseURL: http://192.0.2.10:8080/v1
+        apiKeyEnv: LLAMA_API_KEY
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        timeoutMs: 1800000
+# == @deepseek-ai/dsh-base, patched by /data/profiles/web/cordis.patch.yml
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: local
+    model: Qwen3.8-Flash-Next
+    reasoningEffort: xhigh
+- id: agent-preset-registry
+  name: '@deepseek-ai/dsh-agent-preset-registry'
+  config:
+    default: standard
+- id: preset-standard
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: standard
+    plugins:
+      - id: compaction-basic
+        name: '@deepseek-ai/dsh-compaction-basic'
+        config:
+          thresholdRatio: 0.8
+          maxTokens: 8192
+- id: agent-team
+  name: '@deepseek-ai/dsh-experimental-agent-team'
+  config:
+    maxMembers: 4
+    maxTasks: 256
+# 家庭版实例是控制台铺过 home 层补丁的，替身里就按"团队已开"给
+- id: skill-office
+  name: '@deepseek-ai/dsh-skill-office'
+  config:
+    assetRoot: /opt/dsh/office/assets
+- id: web-runtime
+  name: '@deepseek-ai/dsh-web-runtime'
+  config:
+    openBrowser: false
+    publicUrl: https://dsh-01.example.test
+- id: connection
+  name: '@deepseek-ai/dsh-connection'
+  config:
+    cookieMaxAgeDays: 3650
+- id: permission
+  name: '@deepseek-ai/dsh-permission'
+  config:
+    defaultPreset: danger-full-access
+"""
+
+FAKE_FACTS = """@@HOME@@ /data
+@@PATCH@@ yes
+@@BUNDLES@@
+{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}
+@@SKILLS@@
+comfy-image
+@@END@@
+"""
+
+
 class FakeRuntime:
     def __init__(self, journal: Journal) -> None:
         self.journal = journal
@@ -293,6 +363,13 @@ class FakeRuntime:
                               restart_count=self.restart_count, ip="172.17.0.9",
                               cpu_pct=1.5, mem_usage_bytes=1 << 30,
                               mem_limit_bytes=1 << 34)
+
+    async def dump_config(self, container: str) -> str:
+        """容器里生效的 DSH 配置替身（地址用 RFC 5737 的文档段，不写现网值）。"""
+        return "" if not self.exists else FAKE_DUMP
+
+    async def container_facts(self, container: str) -> str:
+        return "" if not self.exists else FAKE_FACTS
 
     async def stats(self, container: str):
         """`docker stats` 的替身：只在容器真在跑时给数，停了就是全 None。"""

@@ -161,6 +161,20 @@ docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' \
   __NAME__ 2>/dev/null || echo absent
 """
 
+# 一次调用取回"她能用些什么"的三件事：技能目录、profile 组合包、home 层补丁。
+# 分段落用 @@标记@@ 隔开，是因为这几样东西分散在不同路径，拼成 JSON 反而要在
+# 容器里装 jq；行扫描在我们这边做，容器侧只跑 POSIX sh。
+DOCKER_FACTS_SNIPPET = """
+h="${DSH_HOME:-/data}"
+echo "@@HOME@@ $h"
+echo "@@PATCH@@ $([ -f "$h/cordis.patch.yml" ] && echo yes || echo no)"
+echo "@@BUNDLES@@"
+cat "$h/profiles/web/package.json" 2>/dev/null || true
+echo "@@SKILLS@@"
+ls -1 "$h/skills" 2>/dev/null || true
+echo "@@END@@"
+"""
+
 
 @dataclass
 class ContainerStats:
@@ -193,6 +207,12 @@ class DshRuntime(Protocol):
         """从容器日志里取最后一条含 ?token= 的地址，返回 (token, url)。"""
         ...
     async def version(self, container: str) -> str: ...
+    async def dump_config(self, container: str) -> str:
+        """`dsh web --dump-config` 原文（容器里实际生效的那份）。取不到给空串。"""
+        ...
+    async def container_facts(self, container: str) -> str:
+        """技能目录 / profile 组合包 / home 层补丁，一次 SSH 往返取回分段文本。"""
+        ...
 
 
 @dataclass(slots=True)

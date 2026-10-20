@@ -40,7 +40,7 @@ JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
 CREDENTIAL_KINDS = ("ssh_key", "ssh_password", "aliyun_ak", "frp_panel",
-                    "ng_panel", "operator_key", "site", "llm_key")
+                    "ng_panel", "operator_key", "site", "llm_key", "image_key")
 
 
 def _in(col: str, values: tuple[str, ...]) -> CheckConstraint:
@@ -69,7 +69,7 @@ class Credential(Base):
     kind: Mapped[str] = mapped_column(
         String(32),
         comment="类别：ssh_key/ssh_password/aliyun_ak/frp_panel/ng_panel"
-                               "/operator_key/site/llm_key")
+                               "/operator_key/site/llm_key/image_key")
     name: Mapped[str] = mapped_column(String(128), unique=True,
                                       comment="唯一名称，如 console-ed25519")
     secret: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict,

@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     llm_base_url: str = ""            # DSHC_LLM_BASE_URL：自部署 provider 的 /v1 地址
     llm_model_id: str = ""            # DSHC_LLM_MODEL_ID：留空则用 kit 默认模型
 
+    # ---- 生图（DSH 没有原生生图入口，靠技能调 ComfyUI；地址在这，token 在 credentials）
+    image_api_url: str = ""           # DSHC_IMAGE_API_URL：门卫地址（内网优先）
+    image_backup_url: str = ""        # DSHC_IMAGE_BACKUP_URL：备用入口，主入口不通时自动换
+    team_max_members: int = 4         # DSHC_TEAM_MAX_MEMBERS：智能体团队人数上限
+
     # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
     # 默认部署镜像标签（准备好的版本，如 registry.local/dsh:stable）
     dsh_image: str = Field(default="",
@@ -116,6 +121,8 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
         "dsh_image": "dsh_image", "console_host": "console_host",
         "wildcard_cert_name": "wildcard_cert_name",
         "llm_base_url": "llm_base_url", "llm_model_id": "llm_model_id",
+        "image_api_url": "image_api_url", "image_backup_url": "image_backup_url",
+        "team_max_members": "team_max_members",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
     }
     for src, dst in mapping.items():

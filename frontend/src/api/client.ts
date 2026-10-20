@@ -38,6 +38,8 @@ export interface InstanceDetail {
   dsh_version: string | null; image_tag: string | null; image_id: string | null;
   config_version: string | null;
   config: { items: { key: string; value: string; label: string; help: string }[] } | null;
+  /** DSH 自己那套（模型/压缩/插件/技能/预设）。老快照没这一组 → null */
+  dsh_config?: DshConfig | null;
   network: {
     dns_name: string | null; public_url: string | null;
     frp_remote_port: number | null; frp_proxy_id: number | string | null;
@@ -55,6 +57,17 @@ export interface InstanceDetail {
   } | null;
   last_error: string | null; released_at: string | null;
   actions: { restart: boolean; release: boolean; deploy: boolean };
+}
+
+/** 详情页「DSH 配置」卡：后端把 `dsh web --dump-config` 读成分组事实。 */
+export interface DshConfigGroup {
+  title: string;
+  items: { key: string; value: string; note: string }[];
+}
+export interface DshConfig {
+  captured_at: string; dsh_version: string; model: string; base_url: string;
+  agent_team: boolean; office_skills: boolean; skills: string[]; bundles: string[];
+  groups: DshConfigGroup[]; source: string;
 }
 
 export interface TokenResp { token: string | null; url: string | null; captured_at: string | null }
@@ -180,6 +193,8 @@ export const api = {
   /** §4 现取：SSH 抓容器日志里的最新一键地址，落库后返回 {token,url,captured_at}。
    *  这是"GET 但会改动服务器状态"的接口，必须 rw:true 带上 X-Requested-With。 */
   token: (id: number | string) => http<Partial<TokenResp>>(`/instances/${id}/token`, { rw: true }),
+  /** 现取 DSH 生效配置并刷新快照。同 /token：GET 但会改动服务器状态，rw:true。 */
+  dshConfig: (id: number | string) => http<DshConfig>(`/instances/${id}/dsh-config`, { rw: true }),
   rename: (id: number | string, owner_label: string) =>
     http<unknown>(`/instances/${id}`, { method: "PATCH", json: { owner_label } }),
   restart: (id: number | string) =>

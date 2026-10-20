@@ -10,7 +10,12 @@ from __future__ import annotations
 import asyncio
 
 from ..db import repo
+from ..domain.config_docs import CONFIG_VERSION
+from ..domain.dsh_config import annotate_model_drift
+from ..integrations.base import ContainerStats
+from .capabilities import apply_capabilities, capabilities_ready, read_dsh_config
 from .capture import capture_token
+from .deploy import env_facts
 from .runner import JobCtx, StepFailed
 
 _PROBE_MEANING = {
@@ -26,6 +31,17 @@ async def run_restart(ctx: JobCtx) -> None:
     inst = ctx.instance
     container = inst.container_name or inst.slug
     rt = ctx.runtime()
+
+    # ---- 5 capabilities：重启前重铺能力，让这次重启就把它们带上
+    # 智能体团队开在 home 层补丁里，DSH 只在启动时组合一次配置，所以"铺完必须重启
+    # 才生效"；而 entrypoint 每次启动会重写 profile 层，唯独不碰 home 层与技能目录
+    # ——放在这里重铺，既幂等也正好卡在生效前一刻。
+    async with ctx.step(5, "capabilities", "重铺技能与智能体团队") as st:
+        if await capabilities_ready(ctx, container):
+            st.detail = "技能与 home 层补丁都已就位，跳过重铺"
+        else:
+            caps = await apply_capabilities(ctx, container)
+            st.detail = f"{caps.get('team', '')}；{caps.get('image', '')}"[:500]
 
     # ---- 10 container_restart
     async with ctx.step(10, "container_restart", f"docker restart {container}"):
@@ -52,10 +68,19 @@ async def run_restart(ctx: JobCtx) -> None:
         assert snap is not None
         inst.image_tag = snap.image or inst.image_tag
         inst.dsh_version = await rt.version(container)
+        # 这里必须单独采一次 stats：`docker inspect` 里根本没有 CPU 与内存，而这一行
+        # 是"重启完"那一刻写进快照的——拿 inspect 的 None 覆盖上去，详情页运行态
+        # 就整片变空（2026-10-21 现网实测：重启之后 CPU / 内存双双显示 —）。
+        stats = ContainerStats()
+        if snap.state == "running":
+            try:
+                stats = await rt.stats(container)
+            except Exception as exc:  # noqa: BLE001 - 取不到占用不影响重启成功
+                await ctx.log("warn", f"采样资源占用失败（不影响重启）: {exc}")
         await repo.add_snapshot(
             ctx.s, inst.id, docker_state=snap.state, health=snap.health,
-            restart_count=snap.restart_count, cpu_pct=snap.cpu_pct,
-            mem_usage_bytes=snap.mem_usage_bytes, mem_limit_bytes=snap.mem_limit_bytes,
+            restart_count=snap.restart_count, cpu_pct=stats.cpu_pct,
+            mem_usage_bytes=stats.mem_usage_bytes, mem_limit_bytes=stats.mem_limit_bytes,
             raw={"image_id": snap.image_id, "ip": snap.ip},
         )
         await ctx.s.commit()
@@ -66,6 +91,37 @@ async def run_restart(ctx: JobCtx) -> None:
         await ctx.log("info", "已抓到重启后的最新一键地址")
         await ctx.event("token_captured", "重启后重新抓到登录密钥",
                         {"source": "restart", "url": tok.url, "token": tok.token})
+
+    # ---- 35 dsh_config：重启后把 DSH 生效配置刷新进快照（详情页那格的最新值）
+    try:
+        dsh = await read_dsh_config(rt, container, dsh_version=inst.dsh_version or "")
+    except Exception as exc:  # noqa: BLE001 - 读配置失败不该把重启判失败
+        dsh = {}
+        await ctx.log("warn", f"重启后读取 DSH 配置失败（不影响服务本身）: {exc}")
+    if dsh:
+        cfg = await repo.latest_config(ctx.s, inst.id)
+        merged = dict((cfg.rendered if cfg else None) or {})
+        # 顺手把 .env 的**当前**生效值刷进快照：配置卡上「实例模型名」这类条目，
+        # 只靠开通那一次读回填，之后手工改过 .env 就一直是旧值（现网就撞上过一次：
+        # 改了模型名、重建了容器，卡上还写着开通那天抄的值）。读不到就保留原值。
+        try:
+            facts = await env_facts(ctx, inst.slug)
+        except Exception as exc:  # noqa: BLE001 - 读 .env 失败不该让重启失败
+            facts = {}
+            await ctx.log("warn", f"重启后回读 .env 失败（配置卡沿用旧值）: {exc}")
+        merged.update({k: v for k, v in facts.items() if v not in (None, "")})
+        # .env 写的值与容器里生效的值对账：`docker restart` **不会**重读 .env，
+        # 只有 compose 重建容器才会把新值注进环境变量。这个差异常被当成
+        # "改了没用"，页面上说破比让人猜强。
+        dsh = annotate_model_drift(dsh, merged.get("LLM_MODEL_ID"))
+        merged["DSH"] = dsh
+        # 卡头上的版本号取自实例行；只写 v2 快照不改这一列，页面就会一边显示
+        # "v1"一边渲染 v2 的内容，看着像快照串了台。
+        inst.config_version = CONFIG_VERSION
+        await repo.add_config_snapshot(ctx.s, inst.id, CONFIG_VERSION, merged)
+        await ctx.log("info", f"DSH 配置已刷新：模型 {dsh['model']}，"
+                              f"智能体团队{'已开' if dsh['agent_team'] else '未开'}，"
+                              f"技能 {len(dsh['skills'])} 个")
 
     # ---- 40 probe_public：没配公网地址（还没部署完）则标记 skipped
     if not inst.public_url:

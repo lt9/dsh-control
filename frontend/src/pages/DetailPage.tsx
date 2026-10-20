@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, type TokenResp } from "../api/client";
+import { api, type DshConfig, type TokenResp } from "../api/client";
 import { fmtBytes, fmtFull, fmtRel, maskMiddle, maskUrlToken } from "../lib/format";
 import { useAsync } from "../lib/hooks";
 import { CopyButton, HoldButton, Icon, Modal, StateChip } from "../components/ui";
@@ -20,6 +20,10 @@ export default function DetailPage() {
   const [tok, setTok] = useState<TokenResp | null>(null);
   const [tokErr, setTokErr] = useState<string | null>(null);
   const [tokBusy, setTokBusy] = useState(false);
+  // DSH 配置：进页面只读快照（读一次要 ssh 进容器 0.6s+），要新值请点「重新读取」
+  const [dsh, setDsh] = useState<DshConfig | null>(null);
+  const [dshErr, setDshErr] = useState<string | null>(null);
+  const [dshBusy, setDshBusy] = useState(false);
 
   // §9：每次进入 / 手动刷新都走 /token 强制现取——重启后密钥会变，这里是当前最新的。
   const fetchToken = useCallback(async (): Promise<Partial<TokenResp> | null> => {
@@ -36,8 +40,20 @@ export default function DetailPage() {
   }, [id]);
   useEffect(() => { void fetchToken(); }, [fetchToken]);
 
+  const refreshDsh = useCallback(async () => {
+    if (!id) return;
+    setDshBusy(true); setDshErr(null);
+    try {
+      setDsh(await api.dshConfig(id));
+      void det.reload();          // 快照已落库，台账那份也要跟着新
+    } catch (e) {
+      setDshErr(e instanceof Error ? e.message : "读不到 DSH 配置（容器没起来或 ssh 不通）");
+    } finally { setDshBusy(false); }
+  }, [id, det.reload]);
+
   const refreshAll = () => { void det.reload(); void events.reload(); void fetchToken(); };
   const d = det.data;
+  useEffect(() => { setDsh(d?.dsh_config ?? null); setDshErr(null); }, [d?.dsh_config]);
   const released = d?.state === "released";
 
   const doRestart = async () => {
@@ -188,6 +204,44 @@ export default function DetailPage() {
                   </dd>
                 </dl>
               )}
+            </div>
+          </section>
+
+          {/* —— DSH 配置：她问的是"用的哪个模型、能不能生图、团队开没开" —— */}
+          <section className="card" aria-label="DSH 配置">
+            <div className="card-head">
+              <h2>DSH 配置</h2>
+              <span className="mut small">{dsh ? `读取于 ${dsh.captured_at}` : "未读取"}</span>
+              <span className="spacer" />
+              <button type="button" className="btn btn-sm" onClick={() => void refreshDsh()}
+                disabled={dshBusy} aria-busy={dshBusy}
+                title="进容器读一次实际生效的配置（约 1 秒）">
+                <Icon name="refresh" size={14} />{dshBusy ? "读取中…" : "重新读取"}
+              </button>
+            </div>
+            <div className="card-body">
+              {dshErr && <p className="mut small" role="alert" style={{ color: "var(--bad)" }}>{dshErr}</p>}
+              {!dsh && !dshErr && (
+                <p className="mut small">
+                  这台实例还没读过 DSH 内部的配置（旧快照）。点「重新读取」进容器读一次实际生效的值。
+                </p>
+              )}
+              {dsh && dsh.groups.map((g) => (
+                <div className="dsh-group" key={g.title}>
+                  <h3>{g.title}</h3>
+                  <dl className="kv dsh-kv">
+                    {g.items.map((it) => (
+                      <div key={it.key} style={{ display: "contents" }}>
+                        <dt title={it.note || undefined}>{it.key}</dt>
+                        <dd className="mono">
+                          {it.value || "—"}
+                          {it.note && <span className="mut small" style={{ display: "block" }}>{it.note}</span>}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              ))}
             </div>
           </section>
 

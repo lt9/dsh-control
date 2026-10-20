@@ -18,9 +18,11 @@ from sqlalchemy import select
 from ..db import repo
 from ..db.models import Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
+from ..domain.dsh_config import annotate_model_drift
 from ..domain.frp_port import pick_free_port
 from ..domain.safety import MUST_BE_DISABLED, config_violations
 from ..domain.slug import derive, dns_rr
+from .capabilities import apply_capabilities, read_dsh_config
 from .capture import capture_token
 from .release import EXTERNAL_ID_FIELDS, clear_external_ids, delete_ng_upstream, idempotent_delete
 from .runner import JobCtx, StepFailed
@@ -192,7 +194,7 @@ _PROBE_TRIES = 5
 _PROBE_GAP = 6.0
 
 
-async def _env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
+async def env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
     """把实例目录里 .env 的**生效值**读回来（只取白名单键）。
 
     配置快照原本在第 10 步按猜测写：端口只能填 0，数据目录按 data_root 拼。
@@ -202,7 +204,8 @@ async def _env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
     密钥类键名一律不取：这行命令的 stdout 会回到本进程，快照要写进库。
     """
     env_path = f"{ctx.host.kit_path}/instances/{slug}/.env"
-    keys = ("HOST_PORT", "DATA_DIR", "DSH_IMAGE", "PUBLIC_URL", "TRUSTED_HOSTS")
+    keys = ("HOST_PORT", "DATA_DIR", "DSH_IMAGE", "PUBLIC_URL", "TRUSTED_HOSTS",
+            "LLM_MODEL_ID")   # 模型名是页面要讲清的事实，不是密钥
     grep = " ".join(f"-e '^{k}='" for k in keys)   # 空格拼接（写成 " | " 会把 -e 当命令执行）
     r = await ctx.ssh(f"cat {shlex.quote(env_path)} 2>/dev/null | grep {grep}",
                       timeout=60, quiet=True)
@@ -679,7 +682,7 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 65 config_backfill：把第 10 步那份"开工前的猜测"换成机器上的事实
     async with ctx.step(65, "config_backfill", "回填生效配置") as st:
-        facts = await _env_facts(ctx, slug)
+        facts = await env_facts(ctx, slug)
         if not facts:
             # 读不回事实不该让开通失败（容器已经起来了），但也不许把估算值当事实
             # 摆在详情页上：快照里明写来源，页面上就看得见这是开工前的推测。
@@ -699,6 +702,7 @@ async def run_deploy(ctx: JobCtx) -> None:
             image_tag=facts.get("DSH_IMAGE") or image,
         )
         rendered["HOST_PORT"] = hport or int(facts.get("HOST_PORT") or 0)
+        rendered["LLM_MODEL_ID"] = facts.get("LLM_MODEL_ID") or ""
         if facts and cport:
             rendered["CONFIG_SOURCE"] = "生效值（实例 .env + docker 端口映射）"
         elif facts or cport:
@@ -711,6 +715,29 @@ async def run_deploy(ctx: JobCtx) -> None:
                      f"容器内 {rendered['CONTAINER_PORT']} ← 宿主机 "
                      f"{rendered['HOST_PORT']} ← 公网 {rendered['FRP_REMOTE_PORT']}；"
                      f"数据目录 {rendered['DOCUMENTS_DIRECTORY']}")
+
+    # ---- 66 capabilities：铺生图技能与智能体团队，并读回 DSH 自己那套配置
+    # 放在配置快照之后、抓 token 之前：技能铺完，快照里"她能用些什么"才是真的；
+    # 智能体团队走 home 层补丁（官方留给个人例外的层），不重建镜像也能开。
+    async with ctx.step(66, "capabilities", "铺生图技能与智能体团队") as st:
+        rt = ctx.runtime()
+        container = inst.container_name or names.container
+        caps = await apply_capabilities(ctx, container)
+        st.detail = f"{caps.get('team', '')}；{caps.get('image', '')}"[:500]
+        dsh = await read_dsh_config(rt, container, dsh_version=inst.dsh_version or "")
+        if dsh:
+            cfg = await repo.latest_config(ctx.s, inst.id)
+            merged = dict((cfg.rendered if cfg else None) or {})
+            dsh = annotate_model_drift(dsh, merged.get("LLM_MODEL_ID"))
+            merged["DSH"] = dsh
+            await repo.add_config_snapshot(ctx.s, inst.id, CONFIG_VERSION, merged)
+            st.detail += (f"；DSH 配置已读取：默认模型 {dsh['model']}，"
+                          f"智能体团队{'已开' if dsh['agent_team'] else '未开'}，"
+                          f"技能 {len(dsh['skills'])} 个")
+        else:
+            await ctx.log("warn", "读不到 DSH 配置（dsh web --dump-config 空返回），"
+                                  "详情页的 DSH 配置卡会是空的，可以事后点「重新读取」")
+        await ctx.s.commit()
 
     # ---- 70 token_capture：从容器日志抓一键地址（标 error，可重试）
     async with ctx.step(70, "token_capture", "从容器日志抓登录密钥"):

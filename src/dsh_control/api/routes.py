@@ -19,7 +19,10 @@ from ..db import repo
 from ..db.models import Credential, Host, Instance
 from ..domain import host_pick
 from ..domain import slug as slug_mod
+from ..domain.config_docs import CONFIG_VERSION
+from ..domain.dsh_config import annotate_model_drift
 from ..domain.timeutil import iso
+from ..jobs.capabilities import read_dsh_config
 from ..jobs.capture import TokenNotFound, capture_token
 from ..jobs.runner import HostEndpoint, get_executor, make_runtime, redact_text
 from . import serialize
@@ -315,6 +318,54 @@ async def recapture_token(request: Request, instance_id: int) -> dict[str, Any]:
                              data={"source": "manual", "url": tok.url, "token": tok.token})
         return {"token": tok.token, "url": tok.url, "source": tok.source,
                 "captured_at": iso(tok.captured_at)}
+
+
+@router.get("/instances/{instance_id}/dsh-config")
+async def refresh_dsh_config(request: Request, instance_id: int) -> dict[str, Any]:
+    """现取：SSH 进容器读 DSH 实际生效的那套配置，刷新快照后返回。
+
+    与 /token 同一套规矩：形式是 GET，实质是写式操作，必须带 X-Requested-With。
+    读失败一律 502 并且**不动旧快照**——详情页宁可显示"上次读取于 03:12"，
+    也不能因为一次 ssh 超时就把她已经配好的东西显示成没配。
+    这条接口刻意不放进详情接口本身：台账页一次 ssh 都不做才能秒开，
+    而 dump-config 在 NAS 上要 0.6 秒以上。
+    """
+    if request.headers.get(XRW_HEADER) != XRW_VALUE:
+        raise HTTPException(status_code=403,
+                            detail={"ok": False, "error": "missing_x_requested_with"})
+    state = _state(request)
+    async with state.db.session() as s:
+        inst = await _load_instance(s, instance_id)
+        host = await repo.get_host(s, inst.host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail={"ok": False, "error": "host_not_found"})
+        pem = await _host_ssh_pem(s, host)
+        runtime = _runtime_for_host(state.providers, host, pem)
+        container = inst.container_name or inst.slug
+        try:
+            dsh = await read_dsh_config(runtime, container,
+                                        dsh_version=inst.dsh_version or "")
+        except Exception as exc:
+            raise HTTPException(status_code=502,
+                                detail={"ok": False, "error": "dsh_config_unavailable",
+                                        "message": redact_text(str(exc))[:300]}) from exc
+        if not dsh:
+            raise HTTPException(status_code=502, detail={
+                "ok": False, "error": "dsh_config_unavailable",
+                "message": "容器里 dsh web --dump-config 没吐出内容"
+                           "（容器没起来、镜像里没有 dsh，或 DSH_HOME 不是 /data）"})
+        cfg = await repo.latest_config(s, inst.id)
+        merged = dict((cfg.rendered if cfg else None) or {})
+        dsh = annotate_model_drift(dsh, merged.get("LLM_MODEL_ID"))
+        merged["DSH"] = dsh
+        inst.config_version = CONFIG_VERSION   # 与快照版本同步，卡头才不会对不上
+        await repo.add_config_snapshot(s, inst.id, CONFIG_VERSION, merged)
+        await repo.add_event(s, "config_refreshed", message="手动刷新 DSH 配置",
+                             instance_id=inst.id,
+                             data={"model": dsh.get("model", ""),
+                                   "agent_team": bool(dsh.get("agent_team")),
+                                   "skills": len(dsh.get("skills") or [])})
+        return dsh
 
 
 @router.get("/instances/{instance_id}/events")

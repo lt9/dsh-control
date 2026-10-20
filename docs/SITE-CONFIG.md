@@ -112,6 +112,55 @@ llm_model_id = ""                             # 留空则用镜像内默认
 两处名字陷阱（kit 的历史包袱，别按容器里看到的名字去改 `.env`）：
 `.env` 的 `LLM_API_KEY` 在容器里叫 `LLAMA_API_KEY`，`SEARCH_API_KEY` 叫 `DEEPSEEK_API_KEY`。
 
+两处名字陷阱（kit 的历史包袱，别按容器里看到的名字去改 `.env`）：
+`.env` 的 `LLM_API_KEY` 在容器里叫 `LLAMA_API_KEY`，`SEARCH_API_KEY` 叫 `DEEPSEEK_API_KEY`。
+
+`llm_model_id` 要写**推理服务真实在服务的模型名**。服务端可能同时挂着几个名字
+（有的是为了旧客户端不报错而留的别名），控制台不做映射也不做校验——写别名就发别名，
+日后排查"她那边变笨了"时，第一个要看的值就是这个。
+
+## 生图与「能力铺设」（第 66 步 / 重启第 5 步）
+
+DSH 本身**没有**生图入口（0.2.1-rc.2 全量扫过 170 个插件的 config schema，
+`providers` 的 api 枚举里也没有 images 通道），所以生图只能以**技能**的形式落地：
+控制台把 `src/dsh_control/skills/comfy-image/` 铺到实例数据卷的
+`$DSH_HOME/skills/`（DSH 会自动发现，不用重启），里面三个文件：
+
+| 文件 | 作用 | 权限 |
+|---|---|---|
+| `SKILL.md` | 教模型怎么一条命令出图、尺寸/步数/种子的硬规矩、失败对照表 | 0644 |
+| `comfy_generate.py` | 零依赖单文件客户端（提交 → 轮询 → 取图），只吃环境变量 | 0644 |
+| `config.env` | 服务地址与 Bearer token | **0600** |
+
+```toml
+[site]
+image_api_url = "http://192.0.2.20:8188"       # 门卫地址，内网优先
+image_backup_url = "http://198.51.100.2:23400" # 备用入口，主入口不通时客户端自己换
+team_max_members = 4                            # 智能体团队人数上限（官方默认 8）
+```
+
+`.env` 侧是 `DSHC_IMAGE_API_URL` / `DSHC_IMAGE_BACKUP_URL` / `DSHC_TEAM_MAX_MEMBERS`；
+token 放 `credentials(kind=image_key)` 的 `secret.token`。**两项任一为空就跳过铺技能**
+（只记一行 warn，不挡住开通）——生图没配不该让一个实例开不出来。
+
+地址选哪个是有讲究的：如果生图机器和实例宿主机在同一内网，**用内网那条**。
+公共域名入口可能绕机房外再绕回来（本站实测域名 147 ms / 内网 3 ms），而域名链路的
+穿透客户端恰好就跑在 NAS 上，等于「本机 → 机房外 → 本机」。
+
+同一批「能力」里还有**智能体团队**。它是官方实验组合包，默认关闭，开它只有两条路：
+
+- 改镜像里的 profile 组合包清单 → 要重新构建镜像（把没人审过的东西烙进生产镜像）；
+- 写 DSH 的 **home 层补丁** `$DSH_HOME/cordis.patch.yml` → 官方就是留给"给某个人开
+  例外"用的，文件在数据卷里，entrypoint 每次启动只重写 profile 层、**不碰 home 层**。
+
+这里选第二条，并且补丁正文**不在本仓库里抄一份**：运行时从镜像里读官方那份
+`dsh-experimental-agent-team-profile/cordis.patch.yml`，DSH 升级后配置自动跟着变，
+控制台只追加一条同 id 的条目把 `maxMembers` 压到站点设定值。
+
+开启后 DSH 会显式 disable `tool-subagent*` 四条（团队协作取代了直接委派），
+所以 kit 里压的 `MAX_SUBAGENTS` 不再管她，改由 `team_max_members` 管——
+并发保护换了口径，排障时别再去翻 `MAX_SUBAGENTS`。
+
 ## 安全门（不通过就不算开通成功）
 
 第 90 步读**容器生效配置**（`docker exec … dsh web --dump-config`，不是仓库模板）逐条核对：

@@ -77,6 +77,9 @@ async def instance_detail(
         "image_id": image_id,
         "config_version": inst.config_version or config_docs.CONFIG_VERSION,
         "config": {"items": config_docs.config_items(rendered)},
+        # DSH 自己那套（模型/压缩/插件/技能/预设）。老快照没有这一组 → null，
+        # 前端据此显示「重新读取」，而不是让她以为"什么都没配"
+        "dsh_config": (rendered or {}).get("DSH"),
         "network": {
             "dns_name": inst.dns_name,
             "public_url": inst.public_url,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from tests.conftest import XRW, create_instance, wait_job
 
 STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_create",
-                    "container_deploy", "config_backfill", "token_capture",
+                    "container_deploy", "config_backfill", "capabilities", "token_capture",
                     "probe_public", "verify"]
 
 
@@ -205,7 +205,7 @@ async def test_list_lean_and_searchable(env):
     for lean_gone in ("public_url", "last_error", "token", "image_tag", "created_at"):
         assert lean_gone not in it
     assert it["slug"] == "dsh-01" and it["state"] == "running"
-    assert it["dsh_version"] == "0.9.9" and it["config_version"] == "v1"
+    assert it["dsh_version"] == "0.9.9" and it["config_version"] == "v2"
     # 域名搜索
     r = await env.client.get("/api/instances", params={"q": "dsh-01"})
     assert len(r.json()["items"]) == 1

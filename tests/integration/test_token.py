@@ -52,8 +52,11 @@ async def test_restart_steps_order_and_token_capture_failure(env):
     job_id = r.json()["job_id"]
     await wait_job(env.app, job_id)
     job = (await env.client.get(f"/api/jobs/{job_id}")).json()
-    assert [st["key"] for st in job["steps"]] == ["container_restart", "wait_healthy",
-                                                  "token_capture", "probe_public"]
+    # 第 5 步 capabilities 在重启之前：智能体团队开在 home 层补丁里，
+    # DSH 只在启动时组合一次配置，铺完必须紧跟这次重启才带上。
+    assert [st["key"] for st in job["steps"]] == ["capabilities", "container_restart",
+                                                  "wait_healthy", "token_capture",
+                                                  "probe_public"]
     assert job["state"] == "succeeded"
 
 

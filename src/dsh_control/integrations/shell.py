@@ -18,6 +18,7 @@ import tempfile
 from contextlib import suppress
 
 from .base import (
+    DOCKER_FACTS_SNIPPET,
     DOCKER_INSPECT_SNIPPET,
     DOCKER_STATS_SNIPPET,
     ContainerState,
@@ -372,3 +373,31 @@ class SshDshRuntime:
             timeout=60,
         )
         return result.stdout.strip() if result.ok else ""
+
+    async def dump_config(self, container: str) -> str:
+        """容器里实际生效的 DSH 配置原文。
+
+        要在 $DSH_HOME 下跑：DSH 按 cwd 找项目层的配置，跑错地方读到的就不是
+        她正在用的那份（部署第 90 步的安全门同理）。
+        """
+        if self.dry_run:
+            return ""
+        q = shlex.quote(container)
+        result = await self._run(
+            f"docker exec {q} sh -c "
+            + shlex.quote('cd "${DSH_HOME:-/data}" && dsh web --dump-config'),
+            timeout=180,
+        )
+        # 这条命令偶尔会往 stderr 写诊断但 stdout 是好的，所以只认退出码不认 stderr
+        return result.stdout or ""
+
+    async def container_facts(self, container: str) -> str:
+        if self.dry_run:
+            return ""
+        q = shlex.quote(container)
+        result = await self._run(
+            f"docker exec {q} sh -c {shlex.quote(DOCKER_FACTS_SNIPPET)}", timeout=60,
+        )
+        if not result.ok:
+            return ""
+        return result.stdout or ""
