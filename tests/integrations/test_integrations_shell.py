@@ -24,9 +24,9 @@ class FakeExecutor:
         self.results = deque(results)
 
     async def run(self, *, host, port, user, private_key_pem, command,
-                  timeout=300, line_sink=None):
+                  timeout=300, line_sink=None, stdin=None):
         self.calls.append({"host": host, "command": command, "user": user,
-                           "port": port})
+                           "port": port, "stdin": stdin})
         if self.results:
             return self.results.popleft()
         return ExecResult(code=0, stdout="", stderr="")
@@ -69,6 +69,32 @@ def test_inspect_tolerates_continuation_backslashes():
 def test_inspect_absent_returns_none():
     fake = FakeExecutor([ExecResult(0, "absent", "")])
     assert run(runtime(fake).inspect("nope")) is None
+
+
+def test_inspect_command_keeps_go_template_braces_intact():
+    """Go 模板的 `{{…}}` 必须原样到 docker 手里。
+
+    曾经用 str.format 渲染这条命令，`{{` 被收成 `{`，docker 拿到残缺模板不报错，
+    把原文当值打出来——页面上镜像/IP/状态就成了 `{.Config.Image}`，好容器被误判
+    成 error。这里把命令文本钉住，别让"顺手改回 format"再犯一次。
+    """
+    fake = FakeExecutor([ExecResult(0, "absent", "")])
+    run(runtime(fake).inspect("dsh-01"))
+    cmd = fake.calls[0]["command"]
+    assert "{{.State.Status}}" in cmd
+    assert "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" in cmd
+    assert "{.State.Status}" not in cmd.replace("{{.State.Status}}", "")
+    assert "__NAME__" not in cmd
+    assert " dsh-01 " in cmd                      # 名字落在命令里（shlex 认为安全就不加引号）
+    run(runtime(fake).inspect("dsh 01;rm -rf /"))
+    assert "'dsh 01;rm -rf /'" in fake.calls[1]["command"], "带空格/分号的名字必须整体引起来"
+
+
+def test_inspect_refuses_unrendered_template_output():
+    """模板原文一律按"看不到"处理：写进库就是把好容器判成死容器。"""
+    fake = FakeExecutor([ExecResult(0, "{.State.Status}|none|{.Config.Image}"
+                                       "|{.Image}|{.RestartCount}|", "")])
+    assert run(runtime(fake).inspect("dsh-01")) is None
 
 
 def test_inspect_garbage_returns_none():

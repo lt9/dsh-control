@@ -225,7 +225,8 @@ class SshDshRuntime:
     async def inspect(self, container: str) -> ContainerState | None:
         if self.dry_run:
             return None
-        command = DOCKER_INSPECT_SNIPPET.format(name=shlex.quote(container))
+        # 用 replace 不用 format：format 会吃掉 Go 模板的 {{…}}（见 base 的注释）
+        command = DOCKER_INSPECT_SNIPPET.replace("__NAME__", shlex.quote(container))
         result = await self._run(command, timeout=60)
         if not result.ok:
             return None
@@ -243,6 +244,10 @@ class SshDshRuntime:
                 return None
             parts = line.split("|")
             if len(parts) < 6:
+                return None
+            if any("{" in p or "}" in p for p in parts):
+                # 模板没渲染成值（docker 把原文打出来了）。宁可报"看不到"，
+                # 也不要把 `{.State.Status}` 当状态写进库——那会把好容器判成死容器。
                 return None
             status, health, image, image_id, restart_count, ip = parts[:6]
             image_id = image_id.removeprefix("sha256:")[:12]

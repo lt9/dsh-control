@@ -145,10 +145,14 @@ class ContainerState:
     failures: int = 0
 
 
+# 占位符用 __NAME__，**不要用 str.format**：这段里全是 Go 模板的 {{…}}，
+# `.format()` 会把 `{{` 收成 `{`，docker 拿到 `{.State.Status}` 这种残缺模板
+# 不报错，直接把原文打出来（2026-10-21 现网：镜像、IP、状态在页面上全是
+# `{.Config.Image}` 这类模板原文，好端端跑着的实例因此被误判成 error）。
 DOCKER_INSPECT_SNIPPET = """
 docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|\\\
 {{.Config.Image}}|{{.Image}}|{{.RestartCount}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \\
-  {name} 2>/dev/null || echo absent
+  __NAME__ 2>/dev/null || echo absent
 """
 
 
