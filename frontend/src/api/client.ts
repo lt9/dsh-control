@@ -28,6 +28,7 @@ export interface InstanceRow {
   state: InstanceState; dsh_version: string | null; config_version: string | null;
   host_id: number | null; host_name: string | null;
   dns_name: string | null; updated_at: string | null;
+  released_at: string | null;
 }
 
 export interface InstanceDetail {
@@ -49,6 +50,7 @@ export interface InstanceDetail {
   } | null;
   access: {
     has_token: boolean; token_masked: string | null; url: string | null;
+    url_masked?: string | null;
     captured_at: string | null;
   } | null;
   last_error: string | null; released_at: string | null;
@@ -71,15 +73,22 @@ export class ApiError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
-async function http<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
+async function http<T>(
+  path: string,
+  init?: RequestInit & { json?: unknown; rw?: boolean },
+): Promise<T> {
   const headers: Record<string, string> = {};
-  const opts: RequestInit = { method: init?.method ?? "GET", credentials: "same-origin", headers };
+  const method = (init?.method ?? "GET").toUpperCase();
+  const opts: RequestInit = { method, credentials: "same-origin", headers };
   if (init?.json !== undefined) {
     headers["Content-Type"] = "application/json";
-    // §4：写操作要求 X-Requested-With: 1。GET 不带，避免无谓 preflight。
-    if ((init.method ?? "GET").toUpperCase() !== "GET") headers["X-Requested-With"] = "1";
     opts.body = JSON.stringify(init.json);
   }
+  // §4：写操作要求 X-Requested-With: 1。普通 GET 不带（省一次 preflight），
+  // 但"方法写着 GET、其实会改动服务器状态"的接口必须显式传 rw:true——
+  // 现取登录密钥就是这种（SSH 进容器抓日志再落库）。漏带头时详情页每次进页
+  // 都吃 422 missing_x_requested_with，用户只看到"现取失败"四个字。
+  if (method !== "GET" || init?.rw) headers["X-Requested-With"] = "1";
   let res: Response;
   try {
     res = await fetch(`/api${path}`, opts);
@@ -135,6 +144,7 @@ function toRow(raw: Record<string, unknown>): InstanceRow {
     host_id: h.id ?? (raw.host_id as number) ?? null,
     host_name: h.name ?? (raw.host_name as string) ?? null,
     dns_name: (raw.dns_name as string) ?? null,
+    released_at: (raw.released_at as string) ?? null,
     updated_at: (raw.updated_at as string) ?? null,
   };
 }
@@ -165,8 +175,9 @@ export const api = {
     http<{ instance_id: number; dns_name: string; job_id: number }>("/instances",
       { method: "POST", json: body }),
   instance: (id: number | string) => http<InstanceDetail>(`/instances/${id}`),
-  /** §4 现取：SSH 抓容器日志里的最新一键地址，落库后返回。响应形状按 {token,url,captured_at} 假设。 */
-  token: (id: number | string) => http<Partial<TokenResp>>(`/instances/${id}/token`),
+  /** §4 现取：SSH 抓容器日志里的最新一键地址，落库后返回 {token,url,captured_at}。
+   *  这是"GET 但会改动服务器状态"的接口，必须 rw:true 带上 X-Requested-With。 */
+  token: (id: number | string) => http<Partial<TokenResp>>(`/instances/${id}/token`, { rw: true }),
   rename: (id: number | string, owner_label: string) =>
     http<unknown>(`/instances/${id}`, { method: "PATCH", json: { owner_label } }),
   restart: (id: number | string) =>

@@ -15,6 +15,7 @@ export default function NewPage() {
   const ov = useAsync(() => api.overview(), []);
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
+  const [armed, setArmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // 域名后缀首选站点配置（overview.dns_zone 等字段，防御式读），退而求其次从既有实例反推。
@@ -100,10 +101,19 @@ export default function NewPage() {
               </div>
             )}
             <div className="confirm-foot">
-              <button type="button" className="btn btn-primary btn-lg" disabled={busy} onClick={start}>
-                {busy ? "已提交，正在装船…" : "开始部署"}
+              <button type="button" className="btn btn-primary btn-lg" disabled={busy}
+                onClick={() => {
+                  // 二次确认：这一步会新建 DNS／隧道／反代并在机器上起容器，
+                  // 一戳就开工单太危险（页面上没有"取消"，误触就是真部署）。
+                  if (!armed) { setArmed(true); window.setTimeout(() => setArmed(false), 8000); return; }
+                  void start();
+                }}>
+                {busy ? "已提交，正在装船…" : armed ? "再点一次：确认开始部署" : "开始部署"}
               </button>
-              <span className="mut small">九步开通，随时可回台账看进度</span>
+              <span className="mut small">
+                {armed ? "确认：会新建 DNS、隧道、反代站点并起容器。8 秒内不再点就作废。"
+                       : "十步开通，随时可回台账看进度"}
+              </span>
             </div>
           </div>
         </div>

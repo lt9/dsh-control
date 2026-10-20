@@ -238,7 +238,9 @@ function Row({ r, released = false, onOpen }: { r: InstanceRow; released?: boole
       <td className="mono">{r.config_version ?? "—"}</td>
       <td>{r.host_name ?? "—"}</td>
       <td className="mono">{r.dns_name ?? "—"}</td>
-      <td className="num" title={fmtFull(r.updated_at)}>{released ? "—" : fmtRel(r.updated_at)}</td>
+      <td className="num" title={fmtFull(released ? r.released_at : r.updated_at)}>
+        {released ? (r.released_at ? fmtRel(r.released_at) : "—") : fmtRel(r.updated_at)}
+      </td>
     </tr>
   );
 }
@@ -254,7 +256,7 @@ function FirstRun({ onNew }: { onNew: () => void }) {
       </p>
       <ol className="steps-guide">
         <li><b>点「新建实例」</b><span>确认卡会自动填好——名字、域名、主机都不用你挑。</span></li>
-        <li><b>看它装船</b><span>九步开通逐条点亮，日志实时滚动，出错当场标出来。</span></li>
+        <li><b>看它装船</b><span>十步开通逐条点亮，日志实时滚动，出错当场标出来。</span></li>
         <li><b>把一键地址发给他</b><span>部署完成后大字给出，手机打开就能用，不用再登录。</span></li>
       </ol>
       <button type="button" className="btn btn-primary btn-lg" onClick={onNew}>

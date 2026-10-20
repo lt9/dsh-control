@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 
 from dsh_control.db import repo
-from dsh_control.db.models import DeployJob, Instance
+from dsh_control.db.models import DeployJob, Event, Instance
 from dsh_control.watcher import WatcherState, maybe_auto_restart, scan_once
 from tests.conftest import make_settings
 
@@ -96,9 +96,16 @@ async def test_suppressed_within_cooldown(env):
     async with env.db.session() as s:
         await repo.add_event(s, "auto_restart", instance_id=iid, message="上次自动重启")
         inst = await repo.get_instance(s, iid)
-        # 刚重启过（now 与事件时间几乎相同）：冷却中。库内读回的是 naive UTC，
-        # watcher 会补 UTC tz——所以 now 也用 UTC，与线上一致。
-        now = datetime.now(UTC)
+        # 事件时间必须自己钉住，不能用 datetime.now()：真实时钟爬到本地 03:20–04:00
+        # （备份窗口）时，"放行"那一步会被窗口抑制掉，测试就在半夜莫名变红。
+        # 库内读回的是 naive UTC，watcher 会补 UTC tz——这里同口径。
+        last = datetime(2026, 10, 20, 4, 0, tzinfo=UTC)   # 12:00 本地，稳在窗口外
+        ev = (await s.execute(
+            select(Event).where(Event.instance_id == iid, Event.kind == "auto_restart")
+        )).scalar_one()
+        ev.created_at = last.replace(tzinfo=None)
+        await s.commit()
+        now = last + timedelta(seconds=5)
         assert await maybe_auto_restart(s, inst, wstate, settings, None, now) is False
         # 超过 10 分钟后：放行
         assert await maybe_auto_restart(s, inst, wstate, settings, None,

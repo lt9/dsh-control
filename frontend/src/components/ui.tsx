@@ -51,23 +51,33 @@ export function ToneChip({ tone, children }: { tone: Tone; children: ReactNode }
 }
 
 /** 一键复制：成功后按钮文案变化 + 绿色成功态 1.6s（§9 明确反馈）。 */
-export function CopyButton({ text, label = "复制", big = false, title }: {
+export function CopyButton({ text, label = "复制", big = false, title, provide }: {
   text: string | null; label?: string; big?: boolean; title?: string;
+  provide?: () => Promise<string | null>;
 }) {
   const [ok, setOk] = useState(false);
   const [fail, setFail] = useState(false);
+  const [busy, setBusy] = useState(false);
   const timer = useRef<number>();
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = async () => {
-    if (!text) return;
+    // 打码串绝不能进剪贴板：屏上显示的是 aftb…FFI，复制出来也必须是 aftb…FFI
+    // 那种事绝对不能发生（他会把剪贴板里的东西直接粘给对方）。所以没有明文时
+    // 先走 provide 现取一次，取不到就什么都不做，而不是把打码串塞出去。
+    let val = text;
+    if (!val && provide) {
+      setBusy(true);
+      try { val = await provide(); } finally { setBusy(false); }
+    }
+    if (!val) return;
     let done = false;
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(val);
       done = true;
     } catch {
       try {
         const ta = document.createElement("textarea");
-        ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        ta.value = val; ta.style.position = "fixed"; ta.style.opacity = "0";
         document.body.appendChild(ta); ta.select();
         done = document.execCommand("copy");
         ta.remove();
@@ -80,9 +90,9 @@ export function CopyButton({ text, label = "复制", big = false, title }: {
   return (
     <button type="button"
       className={`btn btn-copy${big ? " btn-lg" : ""}${ok ? " is-ok" : ""}${fail ? " is-fail" : ""}`}
-      onClick={copy} disabled={!text} title={title}>
+      onClick={copy} disabled={(!text && !provide) || busy} title={title}>
       <Icon name={ok ? "check" : fail ? "cross" : "copy"} />
-      {fail ? "复制失败" : ok ? "已复制" : label}
+      {fail ? "复制失败" : ok ? "已复制" : busy ? "现取中…" : label}
     </button>
   );
 }

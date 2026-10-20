@@ -47,9 +47,16 @@ async def instance_detail(
     snap = await repo.latest_snapshot(s, inst.id)
 
     rendered = (cfg.rendered if cfg else {}) or {}
+    # 一键地址平时只给打码版：库里存的是含 token 的完整地址，详情页默认不外送，
+    # 点"再取一次"（GET /token，带 X-Requested-With）才给明文。缺了这行时
+    # 页面只能显示"还没抓到过"，其实密钥就在库里。
+    masked_url = ""
+    if token and token.url:
+        masked_url = token.url.replace(token.token, token_mask(token.token))
     access: dict[str, Any] = {
         "has_token": token is not None,
         "token_masked": token_mask(token.token) if token else "",
+        "url_masked": masked_url,
         "captured_at": iso(token.captured_at) if token else None,
     }
 

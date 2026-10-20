@@ -22,14 +22,16 @@ export default function DetailPage() {
   const [tokBusy, setTokBusy] = useState(false);
 
   // §9：每次进入 / 手动刷新都走 /token 强制现取——重启后密钥会变，这里是当前最新的。
-  const fetchToken = useCallback(async () => {
-    if (!id) return;
+  const fetchToken = useCallback(async (): Promise<Partial<TokenResp> | null> => {
+    if (!id) return null;
     setTokBusy(true); setTokErr(null);
     try {
       const t = await api.token(id);
       setTok({ token: t.token ?? null, url: t.url ?? null, captured_at: t.captured_at ?? null });
+      return t;
     } catch (e) {
       setTokErr(e instanceof Error ? e.message : "取不到");
+      return null;
     } finally { setTokBusy(false); }
   }, [id]);
   useEffect(() => { void fetchToken(); }, [fetchToken]);
@@ -75,8 +77,10 @@ export default function DetailPage() {
 
   const fullToken = tok?.token ?? null;
   const fullUrl = tok?.url ?? null;
-  // 默认打码，点一下才展开（§9）；复制永远复制完整值。
-  const shownUrl = fullUrl ? (showToken ? fullUrl : maskUrlToken(fullUrl)) : (d.access?.url ?? null);
+  // 默认打码，点一下才展开（§9）。复制不再拿屏幕上的串——它给 CopyButton 传
+  // provide，点复制时现取真值，取不到就什么都不做。
+  const shownUrl = fullUrl ? (showToken ? fullUrl : maskUrlToken(fullUrl))
+    : (d.access?.url_masked ?? null);
   const shownToken = fullToken ? (showToken ? fullToken : maskMiddle(fullToken)) : (d.access?.token_masked ?? null);
   const label = d.owner_label;
   const cfgItems = d.config?.items ?? [];
@@ -126,18 +130,30 @@ export default function DetailPage() {
                 {tokErr && !fullUrl && <div className="alert alert-warn"><Icon name="triangle" /><span>现取失败：{tokErr}。下面是库里最后一次取到的（打码）。</span></div>}
                 <div className="secret-row">
                   <span className="cap">地址</span>
-                  <span className="val mono">{shownUrl ?? <span className="mut">还没抓到过</span>}</span>
+                  <span className="val mono">{shownUrl ?? <span className="mut">
+                    {d.access?.has_token ? "完整地址含登录密钥，点右边「再取一次」现取" : "还没抓到过"}
+                  </span>}</span>
                   <span className="ops">
-                    {fullUrl && <button type="button" className="btn btn-icon" aria-label={showToken ? "隐藏 token" : "展开完整地址"}
-                      onClick={() => setShowToken((v) => !v)}><Icon name={showToken ? "eye-off" : "eye"} size={15} /></button>}
-                    <CopyButton text={fullUrl ?? shownUrl} label="复制地址" title="发给他，打开就用" />
+                    {(fullUrl || d.access?.has_token) && (
+                      <button type="button" className="btn btn-icon"
+                        aria-label={showToken ? "隐藏 token" : "展开完整地址"}
+                        onClick={() => {
+                          if (!fullUrl && !showToken) { void fetchToken().then((r) => { if (r?.url) setShowToken(true); }); return; }
+                          setShowToken((v) => !v);
+                        }}>
+                        <Icon name={showToken ? "eye-off" : "eye"} size={15} />
+                      </button>
+                    )}
+                    <CopyButton text={fullUrl} provide={() => fetchToken().then((r) => r?.url ?? null)}
+                      label="复制地址" title="发给他，打开就用" />
                   </span>
                 </div>
                 <div className="secret-row">
                   <span className="cap">密钥</span>
                   <span className="val mono">{shownToken ?? <span className="mut">—</span>}</span>
                   <span className="ops">
-                    <CopyButton text={fullToken ?? shownToken} label="复制密钥" />
+                    <CopyButton text={fullToken} provide={() => fetchToken().then((r) => r?.token ?? null)}
+                      label="复制密钥" />
                   </span>
                 </div>
                 <div className="fresh-note">
