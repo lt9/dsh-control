@@ -74,6 +74,26 @@ async def test_release_order_stop_only_no_rm(env):
     assert d["network"]["frp_remote_port"] == 4893
 
 
+async def test_release_materializes_conf_after_upstream_delete(env):
+    """库删干净 ≠ 面板磁盘删干净。
+
+    面板的 reload() = check→replace→reload，replace 是唯一的"库→盘"物化器。
+    释放时先删站点、物化一次、再删 upstream，若就此收工，conf.d 里的
+    upstreams.DSH_xx.conf 会一直躺到下一次开通的 replace——2026-10-21 释放
+    dsh-03 就是这样留下死文件的。所以删完 upstream 必须再物化一次。"""
+    body = await deploy(env)
+    iid = body["instance_id"]
+    r = await env.client.post(f"/api/instances/{iid}/release",
+                              json={"confirm": "dsh-01"}, headers=XRW)
+    await wait_job(env.app, r.json()["job_id"])
+
+    j = list(env.journal)
+    i_up = _idx(j, "ng.delete_upstream")
+    assert i_up != -1, j
+    i_last_reload = len(j) - 1 - j[::-1].index("ng.reload")
+    assert i_up < i_last_reload, f"upstream 删完就没有物化了：{j}"
+
+
 async def test_release_events_record_each_deleted_object(env):
     body = await deploy(env)
     iid = body["instance_id"]

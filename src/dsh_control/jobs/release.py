@@ -175,6 +175,12 @@ async def run_release(ctx: JobCtx) -> None:
             up_name = inst.ng_upstream_name or names.upstream
             up_ok = await delete_ng_upstream(ctx.ng(), inst.ng_upstream_id,
                                              up_name, ctx.log)
+            if up_ok:
+                # upstream 行删完还得再物化一次。面板的 reload() = check → replace →
+                # reload，replace 是唯一的"库→盘"物化器：只删库不物化，磁盘上就留着
+                # upstreams.DSH_03.conf 这种死文件（2026-10-21 释放 dsh-03 实测残留，
+                # 要等下一次开通时的 replace 才顺手删——"三处真删"不能等到那时候）。
+                await ctx.ng().reload()
             await ctx.event(
                 "release_ng_deleted",
                 f"已删除 NG 站点 server_id={server_id} name={inst.dns_name}"
