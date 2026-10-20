@@ -217,7 +217,8 @@ async def run_expose(
 
     # ---- 4 探活 ----
     base_url = f"https://{hostname}"
-    res = await providers.probe.check(base_url)
+    # 门后面是控制台自己，不是 DSH：没有准入墙，别拿 DSH 的 401 去要它。
+    res = await providers.probe.check(base_url, expect="service")
     summary["probe"] = res.verdict
     if res.ok:
         await log("info", f"探活 ok：{base_url}（HTTP {res.status_code}）")
@@ -238,11 +239,15 @@ async def run_expose(
             await log("info", "dry-run：noop/假 provider 没有 recorder——"
                               "写请求将由真实适配器在 dry_run 下逐条记录")
 
-    # ---- 收尾打印（含人工确认项）----
+    # ---- 收尾打印 ----
     await log("info", f"入口 URL：{base_url}/?token=…（登录密钥走详情页 reveal）")
     await log("info", f"公网端口：{summary['frp_remote_port']}（frps -> "
                       f"{host.ssh_host}:{settings.listen_port}）")
-    await log("info", f"[人工确认] 云上安全组/防火墙需放行 TCP {summary['frp_remote_port']}"
-                      "——安全组不在我们的 API 管辖内，必须人工开；"
-                      "探活 unreachable 时先查这里，再查 DNS TTL")
+    await log("info", f"公网要放行的只有 {base_url} 的 443。隧道端口 "
+                      f"{summary['frp_remote_port']} 不必开进安全组：NG 用站点配置的"
+                      "内网地址回源，公网不直连它——把隧道端口开进公网等于绕过 TLS 与"
+                      "反代直接暴露内网服务，别这么干。")
+    await log("info", "探活不通时按序查：DNS 生效没有 → NG 那条站点有没有按库重建出 conf"
+                      "（在面板里保存一次即重建）→ 回源地址是不是隧道真正被服务的那一个"
+                      "（云上回环地址服务不了隧道端口）")
     return summary

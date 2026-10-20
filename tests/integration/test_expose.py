@@ -45,6 +45,8 @@ async def test_expose_order_and_registration(env):
     assert "ng.reload" in blob
     assert "203.0.113.10:4893" not in blob
     assert "probe https://console.example.test" in blob
+    # 门后面是控制台自己，不是 DSH：探活不能拿"mux 必须 401"去要它
+    assert "probe https://console.example.test ok expect=service" in blob
     assert summary == {**summary, "dns": "created", "frp": "created",
                        "ng": "created", "probe": "ok", "frp_remote_port": 4893}
 

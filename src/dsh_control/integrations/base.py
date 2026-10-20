@@ -175,11 +175,14 @@ class ProbeResult:
 
 @runtime_checkable
 class PublicProbe(Protocol):
-    async def check(self, base_url: str) -> ProbeResult:
+    async def check(self, base_url: str, *, expect: str = "dsh") -> ProbeResult:
         """打两次：首页期望 200；无 token 打 /api/remote.mux 带正确 Origin。
 
         401 = 反代头形状正确（拦在没登录）；403 = Host 与 Origin 又不等了，
         提示去 nginxWebUI 把该站 location 的 Header Host 改成 $host。
+
+        ``expect="service"`` 用于门后面不是 DSH 的场合（比如主控台自己的入口）：
+        那里没有 DSH 的准入墙，mux 的状态码不作判据，首页 2xx 即通。
         """
         ...
 

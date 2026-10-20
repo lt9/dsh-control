@@ -241,8 +241,8 @@ class FakeProbe:
         self.journal = journal
         self.result = result or ProbeResult(True, 200, "ok")
 
-    async def check(self, base_url: str) -> ProbeResult:
-        self.journal.add("probe", base_url, self.result.verdict)
+    async def check(self, base_url: str, *, expect: str = "dsh") -> ProbeResult:
+        self.journal.add("probe", base_url, self.result.verdict, f"expect={expect}")
         return self.result
 
 

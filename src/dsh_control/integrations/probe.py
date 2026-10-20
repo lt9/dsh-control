@@ -58,7 +58,7 @@ class HttpPublicProbe:
         if self._owns_client:
             await self._client.aclose()
 
-    async def check(self, base_url: str) -> ProbeResult:
+    async def check(self, base_url: str, *, expect: str = "dsh") -> ProbeResult:
         origin = browser_origin(base_url)
         root = origin
         try:
@@ -76,6 +76,17 @@ class HttpPublicProbe:
             return ProbeResult(
                 ok=False, status_code=home.status_code, verdict="unreachable",
                 hint=f"首页可达但 {_MUX_PATH} 连不上",
+            )
+
+        if expect != "dsh":
+            # 门后面不是 DSH（比如主控台自己的入口）：那里没有准入墙，拿 DSH 的
+            # "mux 必须 401" 去量它，只会报出一条指着别的服务的假警报。
+            if 200 <= home.status_code < 300:
+                return ProbeResult(ok=True, status_code=home.status_code, verdict="ok")
+            return ProbeResult(
+                ok=False, status_code=home.status_code, verdict="unexpected",
+                hint=f"首页 HTTP {home.status_code}，不是 2xx——查容器在不在跑、"
+                     f"NG 上游地址填的是不是隧道真正监听的那一个",
             )
 
         if mux.status_code == 401:
