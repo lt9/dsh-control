@@ -40,13 +40,22 @@ _ITEMS: list[dict[str, Any]] = [
         "key": "DOCUMENTS_DIRECTORY",
         "label": "工作区根目录",
         "help": "DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配。"
-                "约定为 <host.data_root>/<slug>，落在机械盘上。",
+                "真实路径由 kit 的 new-instance.sh 决定："
+                "<DATA_ROOT>/dsh-family/<实例名>/data，所以 data_root 该给一个挂载点"
+                "（例如 /mnt/hdd2），别给已经带项目名的目录，否则会多出一层。",
     },
     {
         "key": "DATA_DIR",
         "label": "实例数据目录",
         "help": "宿主机侧的数据根（挂进容器）。释放实例只停容器，"
                 "这个目录连同容器、镜像一律保留，绝不删除。",
+    },
+    {
+        "key": "CONFIG_SOURCE",
+        "label": "配置来源",
+        "help": "「生效值」= 部署完成后从实例目录的 .env 读回来的真实值；"
+                "「估算」= 没读到 .env，只能沿用开通前的推测值（端口与目录都是算出来的，"
+                "别当成现场事实）。",
     },
     {
         # 展示条目：镜像的来龙去脉（值与 IMAGE_TAG 同源，都是站点配置的默认版本）

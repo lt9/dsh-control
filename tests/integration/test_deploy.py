@@ -5,7 +5,8 @@ from __future__ import annotations
 from tests.conftest import XRW, wait_job
 
 STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_create",
-                    "container_deploy", "token_capture", "probe_public", "verify"]
+                    "container_deploy", "config_backfill", "token_capture",
+                    "probe_public", "verify"]
 
 
 async def create(env, body=None):
@@ -538,3 +539,46 @@ async def test_safety_gate_does_not_flood_job_log(env):
     logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
     assert not any("填充行" in it["line"] for it in logs), "配置正文不许进日志"
     assert any("安全门" in it["line"] for it in logs), "但判定结论必须留一行"
+
+
+async def test_config_snapshot_reports_effective_values(env):
+    """详情页的端口与数据目录必须是机器上的事实。第 10 步只能猜：端口只能填 0，
+    目录按 data_root 硬拼——现网因此写着 CONTAINER_PORT=0 和一个不存在的路径，
+    而她真正的数据在 /mnt/hdd2/dsh-family/dsh-family/dsh-01/data。"""
+    from dsh_control.integrations.base import ExecResult
+
+    env_txt = ("HOST_PORT=4895\nPUBLIC_URL=https://dsh-01.example.test\n"
+               "DATA_DIR=/mnt/hdd2/dsh-family/dsh-family/dsh-01/data\n"
+               "DSH_IMAGE=dsh-family:0.2.1-rc.3\n"
+               "LLM_API_KEY=sk-SECRET-不许进快照\n")
+    env.providers.executor.handlers.insert(
+        0, ("cat /srv/dsh-family/instances/dsh-01/.env", ExecResult(0, env_txt, "")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    kv = {i["key"]: i["value"] for i in d["config"]["items"]}
+    assert str(kv["CONTAINER_PORT"]) == "4895", kv
+    assert kv["DOCUMENTS_DIRECTORY"] == "/mnt/hdd2/dsh-family/dsh-family/dsh-01/data"
+    assert str(kv["FRP_REMOTE_PORT"]) != "0"
+    assert str(kv["CONFIG_SOURCE"]).startswith("生效值"), kv.get("CONFIG_SOURCE")
+    blob = str(kv)
+    assert "sk-SECRET" not in blob, "读 .env 只取白名单键，密钥不许进快照"
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
+    assert not any("sk-SECRET" in it["line"] for it in logs), "也不许进任务日志"
+
+
+async def test_config_snapshot_labels_estimates_when_env_unreadable(env):
+    """读不到 .env 不该让开通失败（容器已经起来了），但快照必须自报"这是估算"，
+    否则详情页把开工前的推测当事实摆着，比空着更坏。"""
+    from dsh_control.integrations.base import ExecResult
+
+    env.providers.executor.handlers.insert(
+        0, ("cat /srv/dsh-family/instances/dsh-01/.env", ExecResult(1, "", "cat: 不存在")))
+    body = await create(env)
+    await wait_job(env.app, body["job_id"])
+    assert (await env.client.get(f"/api/jobs/{body['job_id']}")).json()["state"] == "succeeded"
+    d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
+    kv = {i["key"]: i["value"] for i in d["config"]["items"]}
+    assert str(kv["CONFIG_SOURCE"]).startswith("估算")
+    logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs?after=0")).json()["items"]
+    assert any("估算" in it["line"] for it in logs)

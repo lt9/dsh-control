@@ -184,6 +184,31 @@ async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, 
     return int(prior.remote_port or 0), prior
 
 
+async def _env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
+    """把实例目录里 .env 的**生效值**读回来（只取白名单键）。
+
+    配置快照原本在第 10 步按猜测写：端口只能填 0，数据目录按 data_root 拼。
+    现网详情页因此写着 CONTAINER_PORT=0、DOCUMENTS_DIRECTORY=/mnt/hdd2/dsh-family/
+    dsh-02，而她真正的数据在 /mnt/hdd2/dsh-family/dsh-family/dsh-02/data——
+    kit 的公式是 DATA_ROOT/dsh-family/<名>/data，拼出来的和落盘的不是一回事。
+    密钥类键名一律不取：这行命令的 stdout 会回到本进程，快照要写进库。
+    """
+    env_path = f"{ctx.host.kit_path}/instances/{slug}/.env"
+    keys = ("HOST_PORT", "DATA_DIR", "DSH_IMAGE", "PUBLIC_URL", "TRUSTED_HOSTS")
+    grep = " ".join(f"-e '^{k}='" for k in keys)   # 空格拼接（写成 " | " 会把 -e 当命令执行）
+    r = await ctx.ssh(f"cat {shlex.quote(env_path)} 2>/dev/null | grep {grep}",
+                      timeout=60, quiet=True)
+    out: dict[str, str] = {}
+    for line in (r.stdout or "").splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k in keys:
+            out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -607,6 +632,27 @@ async def run_deploy(ctx: JobCtx) -> None:
         except Exception:  # noqa: BLE001, S110 —— 版本取不到不推翻部署
             pass
         await ctx.s.commit()
+
+    # ---- 65 config_backfill：把第 10 步那份"开工前的猜测"换成机器上的事实
+    async with ctx.step(65, "config_backfill", "回填生效配置") as st:
+        facts = await _env_facts(ctx, slug)
+        if not facts:
+            # 读不回事实不该让开通失败（容器已经起来了），但也不许把估算值当事实
+            # 摆在详情页上：快照里明写来源，页面上就看得见这是开工前的推测。
+            await ctx.log("warn", "读不到实例 .env，配置快照沿用开通前的估算值（已在快照里标注）")
+        rendered = default_rendered(
+            slug=slug, public_url=public_url, trusted_hosts=[dns_name],
+            container_port=int(facts.get("HOST_PORT") or inst.container_port or 0),
+            frp_remote_port=int(inst.frp_remote_port or port or 0),
+            data_dir=facts.get("DATA_DIR") or data_dir,
+            image_tag=facts.get("DSH_IMAGE") or image,
+        )
+        rendered["CONFIG_SOURCE"] = "生效值（实例 .env）" if facts else "估算（未读到实例 .env）"
+        await repo.add_config_snapshot(ctx.s, inst.id, CONFIG_VERSION, rendered)
+        await ctx.s.commit()
+        st.detail = (f"配置快照来源：{rendered['CONFIG_SOURCE']}；"
+                     f"端口 {rendered['CONTAINER_PORT']}，"
+                     f"数据目录 {rendered['DOCUMENTS_DIRECTORY']}")
 
     # ---- 70 token_capture：从容器日志抓一键地址（标 error，可重试）
     async with ctx.step(70, "token_capture", "从容器日志抓登录密钥"):
