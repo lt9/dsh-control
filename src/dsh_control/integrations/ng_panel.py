@@ -213,13 +213,18 @@ class NgPanel:
                 **({"id": kw["id"]} if kw.get("id") else {}),
             }
         if kind == "upstream_server":
-            return {
+            payload = {
                 "upstreamId": kw["upstream_id"],
                 "server": kw["server"],
                 "port": kw["port"],
                 "status": "none",
                 "param": "",
             }
+            # 带 id 就是原地改这条后端。地址变了必须改而不是再加一条：
+            # 两条后端是轮询关系，留着旧地址就等于一半请求打到死地址上。
+            if kw.get("id") not in (None, "", 0):
+                payload["id"] = kw["id"]
+            return payload
         if kind == "server":
             cert_name = kw.get("cert_name")
             payload: dict[str, Any] = {
@@ -375,14 +380,47 @@ class NgPanel:
         backends = await self._api("/api/upstream/getServerByUpstreamId",
                                    {"upstreamId": upstream_id}, write=False,
                                    action="upstreamServers") or []
-        exists = any(str(b.get("server")) == host and int(b.get("port") or 0) == int(port)
-                     for b in backends)
-        if not exists:
-            await self._api("/api/upstream/insertOrUpdateServer",
-                            self._build_payload("upstream_server",
-                                                upstream_id=upstream_id,
-                                                server=host, port=int(port)),
-                            write=True, action="upstream.insertOrUpdateServer")
+        def _match(b: dict[str, Any]) -> bool:
+            return str(b.get("server")) == host and int(b.get("port") or 0) == int(port)
+
+        ours = [b for b in backends if _match(b)]
+        others = [b for b in backends if not _match(b)]
+
+        if ours and others:
+            # 轮询语义：多挂一条死地址，就是一半请求随机打空。不猜，交回人处理。
+            raise IntegrationError(
+                f"upstream {upstream_name} 同时挂着 {len(ours)} 条 {upstream_server} 与 "
+                f"{len(others)} 条其它后端 "
+                f"{[(b.get('server'), b.get('port')) for b in others]}；"
+                "轮询会把一半请求打到死地址，请先在面板里删掉多余后端再重跑",
+                code="ng_backend_drift",
+            )
+        if not ours:
+            if len(others) > 1:
+                raise IntegrationError(
+                    f"upstream {upstream_name} 下已有 {len(others)} 条非本控制台后端 "
+                    f"{[(b.get('server'), b.get('port')) for b in others]}，不敢自动合并",
+                    code="ng_backend_drift",
+                )
+            payload = self._build_payload("upstream_server", upstream_id=upstream_id,
+                                          server=host, port=int(port))
+            action = "upstream.insertOrUpdateServer"
+            if len(others) == 1:
+                # 只是地址换了（改了 frps 上游地址、端口重分配）：原地改这一条
+                payload["id"] = others[0].get("id")
+                action = "upstream.insertOrUpdateServer(改地址)"
+            await self._api("/api/upstream/insertOrUpdateServer", payload,
+                            write=True, action=action)
+            if not self.dry_run:
+                after = await self._api("/api/upstream/getServerByUpstreamId",
+                                        {"upstreamId": upstream_id}, write=False,
+                                        action="upstreamServers") or []
+                if not any(_match(b) for b in after):
+                    raise IntegrationError(
+                        f"upstream {upstream_name} 的后端写成 {upstream_server} 后回读不到，"
+                        f"面板现回 {[(b.get('server'), b.get('port')) for b in after]}",
+                        code="ng_verify_failed",
+                    )
         return upstream_id
 
     async def ensure_site(

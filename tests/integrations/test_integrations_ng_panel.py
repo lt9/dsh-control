@@ -130,7 +130,11 @@ class FakeNg:
                 if path.endswith("/upstream/insertOrUpdate"):
                     self.upstream = dict(UPSTREAM_FIXTURE)
                 elif path.endswith("/upstream/insertOrUpdateServer"):
-                    self.backends = [dict(BACKEND_FIXTURE)]
+                    # 带 id 就是原地改这条，不带 id 才是新增一条
+                    self.backends = [dict(BACKEND_FIXTURE,
+                                          id=params.get("id") or BACKEND_FIXTURE["id"],
+                                          server=params.get("server", ""),
+                                          port=int(params.get("port") or 0))]
                 elif path.endswith("/api/server/insertOrUpdate"):
                     self.server = dict(SITE_FIXTURE)
                 elif path.endswith("/insertOrUpdateLocation"):
@@ -279,6 +283,40 @@ def test_all_matching_writes_nothing():
     assert api.writes == []                             # 全一致：一个字都不写
     assert (site.server_id, site.location_id) == (1310000000000000001,
                                                   1310000000000000003)
+
+
+def test_backend_address_change_updates_in_place_and_never_appends():
+    """换了 frps 上游地址：必须带 id 原地改那一条。
+
+    两条后端是轮询关系——留着旧地址就等于一半请求打到死地址上，而且这种坏法
+    是间歇性的，最难查。真机就配错过一次（回环地址在云上根本不通）。
+    """
+    stale = dict(BACKEND_FIXTURE, server="198.51.100.9")
+    api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
+                 backends=[stale], locations=[dict(LOCATION_FIXTURE)], growth=True)
+    site = run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
+                                       upstream_server="198.51.100.10:4894",
+                                       cert_name=CERT))
+    back = write_for(api, "/upstream/insertOrUpdateServer")
+    assert back is not None and str(back["id"]) == BACKEND_FIXTURE["id"]  # 带 id 改
+    assert back["server"] == "198.51.100.10"
+    assert len(api.backends) == 1                                  # 没有第二条
+    assert api.backends[0]["server"] == "198.51.100.10"
+    assert site.server_id == 1310000000000000001
+
+
+def test_two_stale_backends_refuse_without_any_write():
+    """同时挂多条非本控制台地址的后端时不猜，直接报，且零写请求。"""
+    two = [dict(BACKEND_FIXTURE, server="198.51.100.9"),
+           dict(BACKEND_FIXTURE, id="1310000000000000099", server="198.51.100.11")]
+    api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
+                 backends=two, locations=[dict(LOCATION_FIXTURE)])
+    with pytest.raises(IntegrationError) as got:
+        run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
+                                    upstream_server="198.51.100.10:4894",
+                                    cert_name=CERT))
+    assert got.value.code == "ng_backend_drift"
+    assert api.writes == []
 
 
 def test_location_pointing_elsewhere_is_updated_with_its_id():
