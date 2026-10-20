@@ -225,7 +225,11 @@ async def create_instance(
         slugs = await repo.all_slugs(s)
         slug = slug_mod.next_slug(slugs, settings.dns_prefix)
         dns_name = f"{slug}.{settings.dns_zone}"
-        inst = Instance(slug=slug, host_id=host.id, container_name=slug,
+        inst = Instance(slug=slug, host_id=host.id,
+                        # 容器名由 kit 决定（dsh-<slug>），创建时就按同一条规则写，
+                        # 别留一个"要等第 10 步来纠正"的错值（2026-10-21 现网
+                        # 第 70 步抓不到 token 就是这么来的）。
+                        container_name=slug_mod.derive(slug, settings.dns_zone).container,
                         dns_name=dns_name, public_url=f"https://{dns_name}",
                         state="pending", desired_state="running")
         s.add(inst)

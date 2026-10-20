@@ -503,3 +503,16 @@ async def test_kit_verify_warnings_are_reported_but_not_fatal(env):
     evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
     warn = next(e for e in evs if e["kind"] == "verify_warnings")
     assert "数据目录" in warn["message"]
+
+
+async def test_created_row_already_carries_kit_container_name(env):
+    """创建那一刻容器名就得是 dsh-<slug>。留个错值"等第 10 步纠正"，中间任何
+    一次重启或抓 token 都指向一个不存在的容器。"""
+    from dsh_control.db import repo
+
+    r = await env.client.post("/api/instances", json={}, headers=XRW)
+    assert r.status_code == 200
+    async with env.db.session() as s:
+        inst = await repo.get_instance(s, r.json()["instance_id"])
+        assert inst.container_name == f"dsh-{inst.slug}"
+        assert inst.container_name != inst.slug
