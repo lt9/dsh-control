@@ -34,20 +34,51 @@ def test_noop_dns_returns_manual_marker_and_records():
     assert out.record_id == "manual" and out.status == "manual"
     run(dns.delete("whatever"))
     actions = dns.drain_manual_actions()
-    assert [a.step for a in actions] == ["dns_create", "dns_delete"]
+    assert [a.step for a in actions] == [
+        "manual.dns_needs_record", "manual.dns_needs_record_delete",
+    ]
     assert "人工" in actions[0].summary
     assert dns.drain_manual_actions() == []          # 取走即清空
     assert len(rec.entries) == 2
 
 
+def test_noop_recorder_actions_never_read_as_already_done():
+    """运维日志与 dry_run 同源：noop 的动作名必须是 manual.*_needs_*（还没做），
+    不许出现 dns.create 这类看似真建过的口吻；占位 id 必须在文案里点明。"""
+    rec = DryRunRecorder()
+    dns = NoopDns(zone="example.com", recorder=rec)
+    frp, ng = NoopFrp(recorder=rec), NoopNg(recorder=rec)
+    run(dns.create("dsh-x", "203.0.113.10"))
+    run(dns.delete("r1"))
+    run(frp.ensure(name="dsh-a", client_id="c@1", server_id="default",
+                   local_ip="127.0.0.1", local_port=1, remote_port=4893))
+    run(frp.remote_port_taken(4893))
+    run(frp.delete(0, expect_name="dsh-a"))
+    run(ng.ensure_site(server_name="dsh-a.example.com", upstream_name="DSH_A",
+                       upstream_server="127.0.0.1:1"))
+    run(ng.delete_site(0, expect_name="dsh-a.example.com"))
+    run(ng.reload())
+    assert len(rec.entries) == 8
+    for e in rec.entries:
+        assert e.action.startswith("manual."), e.action
+        assert "needs" in e.action, e.action
+        assert e.adapter.startswith("noop:") and e.method == "-"
+    joined = {a.step: " ".join(a.instructions) + " " + a.summary
+              for p in (dns, frp, ng) for a in p.manual_actions}
+    assert "什么都没建" in joined["manual.dns_needs_record"]
+    assert "占位" in joined["manual.dns_needs_record"]        # record_id="manual" 不是真 id
+    assert "占位" in joined["manual.frp_needs_tunnel"]        # proxy_id=0 不是真 id
+    assert "占位" in joined["manual.ng_needs_site"]           # server_id=0 不是真 id
+
+
 def test_noop_frp_and_ng_synthesize_clearly_fake_ids():
     frp, ng = NoopFrp(), NoopNg()
-    t = run(frp.ensure(name="dsh_a", client_id="c@1", server_id="default",
+    t = run(frp.ensure(name="dsh-a", client_id="c@1", server_id="default",
                        local_ip="127.0.0.1", local_port=1, remote_port=4893))
     assert t.proxy_id == 0 and t.raw["manual"] is True
     site = run(ng.ensure_site(server_name="dsh-a.example.com", upstream_name="DSH_A",
                               upstream_server="127.0.0.1:1"))
-    assert site.server_id == 0
+    assert site.server_id == 0 and site.location_id is None
     assert run(frp.list()) == [] and run(ng.find_site("x")) is None
     assert run(frp.remote_port_taken(4893)) is False  # 探测不了，宁可放行也不误报占用
     assert any("websocket" in i for i in ng.manual_actions[0].instructions)
