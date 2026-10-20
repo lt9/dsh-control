@@ -20,7 +20,10 @@ def test_next_slug_sequential_zero_padded():
 
 def test_derive_names():
     n = derive("dsh-07", "example.test")
-    assert n.container == "dsh-07"
+    # 容器名由 kit 说了算：compose 里 container_name: dsh-${INSTANCE_NAME}，
+    # INSTANCE_NAME 就是 slug，所以是 dsh-<slug>（现网实测 dsh-dsh-01、dsh-wife）。
+    # 名字错一个字符，看日志、抓 token、重启、停止就全指向一个不存在的容器。
+    assert n.container == "dsh-dsh-07"
     assert n.tunnel == "dsh_07"
     assert n.upstream == "DSH_07"
     assert n.server_name == "dsh-07.example.test"

@@ -57,7 +57,10 @@ class DerivedNames:
 def derive(slug: str, zone: str) -> DerivedNames:
     tunnel = slug.replace(".", "_").replace("-", "_")
     return DerivedNames(
-        container=slug,
+        # kit 的 compose 写的是 container_name: dsh-${INSTANCE_NAME}，INSTANCE_NAME
+        # 就是 slug，所以容器名是 dsh-<slug>（现网实测 dsh-dsh-01）。名字错一个字符，
+        # 看日志、抓 token、重启、停止全都指向不存在的容器（2026-10-21 第 70 步）。
+        container=f"dsh-{slug}",
         tunnel=tunnel,
         upstream=tunnel.upper(),
         server_name=f"{slug}.{zone}",
