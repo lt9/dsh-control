@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -16,15 +15,14 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ..db import repo
-from ..db.models import Instance
+from ..db.models import Credential, Host, Instance
+from ..domain import host_pick
 from ..domain import slug as slug_mod
 from ..domain.timeutil import iso
 from ..jobs.capture import TokenNotFound, capture_token
-from ..jobs.runner import HostEndpoint, make_runtime, redact_text
-from ..settings import get_settings
+from ..jobs.runner import HostEndpoint, get_executor, make_runtime, redact_text
 from . import serialize
 from .auth import (
-    COOKIE_NAME,
     XRW_HEADER,
     XRW_VALUE,
     clear_session_cookie,
@@ -33,7 +31,12 @@ from .auth import (
     session_from_request,
     set_session_cookie,
 )
-from .schemas import CreateInstanceRequest, LoginRequest, ReleaseRequest
+from .schemas import (
+    CreateInstanceRequest,
+    LoginRequest,
+    ReleaseRequest,
+    UpdateInstanceRequest,
+)
 
 public_router = APIRouter()
 router = APIRouter()
@@ -45,18 +48,11 @@ def _state(request: Request):
     return request.app.state
 
 
-async def require_auth(request: Request) -> datetime:
-    expires = session_from_request(request)
-    if expires is None:
-        raise HTTPException(status_code=401, detail={"ok": False, "error": "unauthenticated"})
-    return expires
-
-
 async def require_xrw(request: Request) -> None:
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        if request.headers.get(XRW_HEADER) != XRW_VALUE:
-            raise HTTPException(status_code=403,
-                                detail={"ok": False, "error": "missing_x_requested_with"})
+    if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and request.headers.get(XRW_HEADER) != XRW_VALUE):
+        raise HTTPException(status_code=403,
+                            detail={"ok": False, "error": "missing_x_requested_with"})
 
 
 async def _load_instance(s, instance_id: int) -> Instance:
@@ -71,11 +67,7 @@ def _runtime_for_host(providers, host, pem: str):
                                                 host.ssh_user, pem))
 
 
-async def _ssh_pem(s, host_id: int) -> str:
-    from ..db.models import Credential
-    host = await repo.get_host(s, host_id)
-    if host is None:
-        raise HTTPException(status_code=404, detail={"ok": False, "error": "host_not_found"})
+async def _host_ssh_pem(s, host: Host) -> str:
     if not host.ssh_credential_id:
         return ""
     cred = await s.get(Credential, host.ssh_credential_id)
@@ -100,19 +92,22 @@ async def login(request: Request, body: LoginRequest) -> JSONResponse:
         resp.headers["Retry-After"] = str(limiter.retry_after(ip))
         return resp
 
-    settings = get_settings()
     async with state.db.session() as s:
         cred = await repo.get_credential_by_kind(s, "operator_key")
     stored = ((cred.secret or {}).get("key", "") if cred else "")
-    if not stored or not constant_time_key_match(body.key, stored):
+    if not stored:
+        raise HTTPException(status_code=500,
+                            detail={"ok": False, "error": "not_initialized",
+                                    "message": "运维密钥未初始化：先跑 cli init"})
+    if not constant_time_key_match(body.key, stored):
         limiter.record_failure(ip)
         raise HTTPException(status_code=401, detail={"ok": False, "error": "bad_key"})
     limiter.record_success(ip)
 
-    resp = JSONResponse(content={"ok": True,
-                                 "expires_at": None})  # 占位，下面覆盖
-    expires_at = set_session_cookie(resp, settings.session_secret, settings.session_days)
-    resp.content = json.dumps({"ok": True, "expires_at": iso(expires_at)}).encode()
+    resp = JSONResponse(status_code=200, content={"ok": True, "expires_at": None})
+    expires_at = set_session_cookie(resp, state.settings.session_secret,
+                                    state.settings.session_days)
+    resp.body = json.dumps({"ok": True, "expires_at": iso(expires_at)}).encode()
     return resp
 
 
@@ -126,8 +121,9 @@ async def logout() -> JSONResponse:
 
 
 @router.get("/session")
-async def session(expires: datetime = Depends(require_auth)) -> dict[str, Any]:
-    return {"ok": True, "expires_at": iso(expires)}
+async def session(request: Request) -> dict[str, Any]:
+    expires = session_from_request(request)
+    return {"ok": True, "expires_at": iso(expires) if expires else None}
 
 
 # ---------------------------------------------------------------- 概览 / 主机
@@ -159,6 +155,7 @@ async def hosts(request: Request) -> dict[str, Any]:
 async def list_instances(request: Request, q: str = "", state: str = "") -> dict[str, Any]:
     async with _state(request).db.session() as s:
         rows = await repo.list_instances(s, q=q, state=state)
+        # §2.0 规矩二：不联表。单表取主机后 Python 组装（主机数量级很小）。
         host_cache: dict[int, Any] = {}
         items = []
         for inst in rows:
@@ -170,29 +167,67 @@ async def list_instances(request: Request, q: str = "", state: str = "") -> dict
     return {"items": items}
 
 
-@router.post("/instances", dependencies=[Depends(require_xrw)])
-async def create_instance(request: Request, body: CreateInstanceRequest) -> dict[str, Any]:
+async def _pick_host(request: Request, s) -> Host:
+    """§6.1.1：enabled 主机里 data_root 剩余空间最大（机械盘优先）的一台。
+    逐台 SSH 探测（`df -P` + rotational），全部探不到时退回第一台 enabled 主机。"""
     state = _state(request)
-    settings = get_settings()
+    settings = state.settings
+    hosts = [h for h in await repo.list_hosts(s) if h.enabled]
+    if not hosts:
+        raise HTTPException(status_code=422, detail={"ok": False,
+                                                     "error": "no_enabled_host"})
+    probes: list[host_pick.HostProbe] = []
+    for h in hosts:
+        pem = await _host_ssh_pem(s, h)
+        try:
+            r = await get_executor(state.providers).run(
+                host=h.ssh_host, port=h.ssh_port, user=h.ssh_user,
+                private_key_pem=pem, command=host_pick.probe_command(h.data_root),
+                timeout=15,
+            )
+            avail, rota = host_pick.parse_probe_output(r.stdout if r.ok else "")
+        except Exception:  # noqa: BLE001 —— 探不到不致命
+            avail, rota = None, None
+        probes.append(host_pick.HostProbe(h.id, avail, rota))
+    best = host_pick.rank(probes, prefer_hdd=settings.prefer_hdd)
+    chosen_id = best.host_id if best else hosts[0].id
+    host = await repo.get_host(s, chosen_id)
+    assert host is not None
+    return host
+
+
+@router.post("/instances", dependencies=[Depends(require_xrw)])
+async def create_instance(
+    request: Request, body: CreateInstanceRequest | None = None
+) -> dict[str, Any]:
+    state = _state(request)
+    settings = state.settings
+    if not settings.dns_zone:
+        raise HTTPException(status_code=422, detail={"ok": False, "error": "site_not_seeded",
+                                                     "message": "缺少站点配置：先 cli seed --site"})
     async with state.db.session() as s:
-        host = await repo.get_host(s, body.host_id)
-        if host is None or not host.enabled:
-            raise HTTPException(status_code=422,
-                                detail={"ok": False, "error": "host_not_available"})
-        # slug 由服务端生成（契约 §6.1）；DNS 占用复核在 job 的 plan 步骤
+        if body and body.host_id:
+            host = await repo.get_host(s, body.host_id)
+            if host is None or not host.enabled:
+                raise HTTPException(status_code=422,
+                                    detail={"ok": False, "error": "host_not_available"})
+        else:
+            host = await _pick_host(request, s)
+        # slug 服务端顺序生成（§6.1.1）；DNS 占用复核在 job 的 plan 步骤
         slugs = await repo.all_slugs(s)
         slug = slug_mod.next_slug(slugs, settings.dns_prefix)
         dns_name = f"{slug}.{settings.dns_zone}"
-        inst = Instance(slug=slug, owner_label=body.owner_label, host_id=host.id,
-                        container_name=slug, dns_name=dns_name,
-                        public_url=f"https://{dns_name}", config_version="",
+        inst = Instance(slug=slug, host_id=host.id, container_name=slug,
+                        dns_name=dns_name, public_url=f"https://{dns_name}",
                         state="pending", desired_state="running")
         s.add(inst)
         await s.commit()
         await s.refresh(inst)
         job = await repo.create_job(s, inst.id, "deploy")
-        await repo.add_event(s, "deploy_queued", f"新建实例 {slug}（{body.owner_label}）",
-                             {"slug": slug, "host": host.name, "note": body.note})
+        await repo.add_event(s, "deploy_queued",
+                             message=f"新建实例 {slug}（主机 {host.name}）",
+                             instance_id=inst.id, job_id=job.id,
+                             data={"slug": slug, "host": host.name})
     state.runner.spawn(job.id)
     return {"instance_id": inst.id, "dns_name": dns_name, "job_id": job.id}
 
@@ -205,14 +240,34 @@ async def instance_detail(request: Request, instance_id: int) -> dict[str, Any]:
         return await serialize.instance_detail(s, inst, host)
 
 
-@router.get("/instances/{instance_id}/token", dependencies=[Depends(require_xrw)])
+@router.patch("/instances/{instance_id}", dependencies=[Depends(require_xrw)])
+async def update_instance(request: Request, instance_id: int,
+                          body: UpdateInstanceRequest) -> dict[str, Any]:
+    """§6.1.1 铅笔就地编辑：只改备注名与备注，不碰域名/容器名/任何外部对象。"""
+    async with _state(request).db.session() as s:
+        inst = await _load_instance(s, instance_id)
+        await repo.update_instance_notes(s, inst, owner_label=body.owner_label,
+                                         note=body.note)
+        host = await repo.get_host(s, inst.host_id)
+        return await serialize.instance_detail(s, inst, host)
+
+
+@router.get("/instances/{instance_id}/token")
 async def recapture_token(request: Request, instance_id: int) -> dict[str, Any]:
-    """现取：SSH 抓容器日志里的最新一键地址，落库后返回（reveal 接口，完整值）。"""
+    """现取：SSH 抓容器日志里的最新一键地址，落库后返回（reveal 接口，完整值）。
+
+    虽是 GET 但属「取回密钥」的写式操作：必须带 X-Requested-With（契约 §0 鉴权）。
+    """
+    if request.headers.get(XRW_HEADER) != XRW_VALUE:
+        raise HTTPException(status_code=403,
+                            detail={"ok": False, "error": "missing_x_requested_with"})
     state = _state(request)
     async with state.db.session() as s:
         inst = await _load_instance(s, instance_id)
-        pem = await _ssh_pem(s, inst.host_id)
         host = await repo.get_host(s, inst.host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail={"ok": False, "error": "host_not_found"})
+        pem = await _host_ssh_pem(s, host)
         runtime = _runtime_for_host(state.providers, host, pem)
         try:
             tok = await capture_token(s, runtime, inst, "manual")
@@ -220,7 +275,7 @@ async def recapture_token(request: Request, instance_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=502,
                                 detail={"ok": False, "error": "token_not_found",
                                         "message": redact_text(str(exc))}) from exc
-        await repo.add_event(s, "token_captured", "手动重抓登录密钥",
+        await repo.add_event(s, "token_captured", message="手动重抓登录密钥",
                              instance_id=inst.id,
                              data={"source": "manual", "url": tok.url, "token": tok.token})
         return {"token": tok.token, "url": tok.url, "source": tok.source,
@@ -255,11 +310,13 @@ async def restart_instance(request: Request, instance_id: int) -> dict[str, Any]
 
 
 @router.post("/instances/{instance_id}/release", dependencies=[Depends(require_xrw)])
-async def release_instance(request: Request, instance_id: int, body: ReleaseRequest) -> dict[str, Any]:
+async def release_instance(request: Request, instance_id: int,
+                           body: ReleaseRequest) -> dict[str, Any]:
     state = _state(request)
     async with state.db.session() as s:
         inst = await _load_instance(s, instance_id)
-        # 确认词必须逐字等于 slug，否则 422（契约 §0.2 与用户故事）
+        # 确认词必须逐字等于 slug，否则 422（契约 §0.2）。
+        # 值由前端自己填（§9 按住确认），服务端校验不因体验放松。
         if body.confirm != inst.slug:
             raise HTTPException(status_code=422,
                                 detail={"ok": False, "error": "confirm_mismatch",
@@ -268,7 +325,7 @@ async def release_instance(request: Request, instance_id: int, body: ReleaseRequ
             raise HTTPException(status_code=409,
                                 detail={"ok": False, "error": "already_released"})
         job = await repo.create_job(s, inst.id, "release")
-        await repo.add_event(s, "release_queued", f"释放 {inst.slug} 已确认",
+        await repo.add_event(s, "release_queued", message=f"释放 {inst.slug} 已确认",
                              instance_id=inst.id, job_id=job.id, data={"slug": inst.slug})
     state.runner.spawn(job.id)
     return {"job_id": job.id}

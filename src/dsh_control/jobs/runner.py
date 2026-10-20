@@ -15,9 +15,10 @@ import asyncio
 import re
 import time
 import traceback
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Protocol
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from ..db import repo
 from ..db.models import DeployJob, Host, Instance, utcnow
@@ -33,16 +34,15 @@ from ..integrations.base import (
 )
 from ..settings import Settings, get_settings
 
-
 # ---------------------------------------------------------------- 日志安全
 
-_TOKEN_URL_RE = re.compile(r"(https?://[^\s'\"]*[?&]token=)[^\s'\\"&]+")
+_TOKEN_URL_RE = re.compile(r'(https?://[^\s\'"]*[?&]token=)[^\s\'"&]+')
 _SECRET_KV_RE = re.compile(
     r"((?:token|secret|password|passwd|pass|access[_-]?key(?:[_-]?(?:id|secret))?|ak|sk"
     r"|authorization|cookie)\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s'\"]+)",
     re.IGNORECASE,
 )
-_HEADER_RE = re.compile(r"(Authorization|Cookie)\s*:\s*\S+", re.IGNORECASE)
+_HEADER_RE = re.compile(r"(Authorization|Cookie)\s*:\s*[^\r\n]+", re.IGNORECASE)
 
 
 def redact_text(text: str) -> str:
@@ -77,15 +77,27 @@ class StepFailed(RuntimeError):
 class ProvidersLike(Protocol):
     """integrations/registry.build_providers(settings) 返回的 Providers 需满足的形状。
 
-    runtime 按主机绑定：DshRuntime 的方法签名里只有 container（base.py 冻结），
-    所以 registry 必须提供 runtime_for(...) 工厂（或裸 runtime 实例作为单主机回退）。
+    - dns / frp / ng / probe 四个属性直接是 Protocol 实例；
+    - SSH 执行器属性名 executor 或 exec（registry 用 exec，两者都认）；
+    - runtime 按主机绑定：DshRuntime 的方法签名里只有 container（base.py 冻结），
+      所以 registry 提供 bind(host=,port=,user=,private_key_pem=) 工厂
+      （RuntimeBinder），或 runtime_for/…；测试替身可直接给裸 runtime 实例。
+    - noop provider 带 manual_required=True 属性（jobs 层据此把步骤标 skipped）。
     """
 
     dns: DnsProvider
     frp: FrpProvider
     ng: NgProvider
-    executor: Executor
     probe: PublicProbe
+
+
+def get_executor(providers: Any) -> Executor:
+    ex = getattr(providers, "executor", None)
+    if ex is None:
+        ex = getattr(providers, "exec", None)
+    if ex is None or not hasattr(ex, "run"):
+        raise RuntimeError("providers 缺少 executor/exec（需有 run 方法）")
+    return ex
 
 
 # ---------------------------------------------------------------- 上下文
@@ -101,9 +113,10 @@ class HostEndpoint:
 def make_runtime(providers: Any, ep: HostEndpoint) -> DshRuntime:
     """从 Providers 拿绑定到具体主机的 DshRuntime。
 
-    registry.build_providers 返回的对象需要提供下面任一形状：
-    1. runtime_for(host=, port=, user=, private_key_pem=) -> DshRuntime（推荐，多主机）
-    2. 裸 runtime 属性（DshRuntime 实例，只适用单主机/测试替身）
+    按优先级找下面任一形状（registry.RuntimeBinder 命中 bind）：
+    1. runtime_for/runtime_factory/dsh_runtime_for(host=,port=,user=,private_key_pem=)
+    2. providers.runtime.bind(host=,port=,user=,private_key_pem=)（RuntimeBinder）
+    3. 裸 runtime 实例（DshRuntime，只适用单主机 / 测试替身）
     """
     for name in ("runtime_for", "runtime_factory", "dsh_runtime_for"):
         factory = getattr(providers, name, None)
@@ -113,9 +126,13 @@ def make_runtime(providers: Any, ep: HostEndpoint) -> DshRuntime:
                                private_key_pem=ep.private_key_pem)
             except TypeError:
                 return factory(ep.host, ep.port, ep.user, ep.private_key_pem)
-    rt = getattr(providers, "runtime", None)
-    if rt is not None and hasattr(rt, "inspect"):
-        return rt
+    binder = getattr(providers, "runtime", None)
+    bind = getattr(binder, "bind", None)
+    if callable(bind):
+        return bind(host=ep.host, port=ep.port, user=ep.user,
+                    private_key_pem=ep.private_key_pem)
+    if binder is not None and hasattr(binder, "inspect"):
+        return binder
     raise RuntimeError(
         "providers 未提供 DshRuntime：需要 runtime_for(host=,port=,user=,private_key_pem=) "
         "工厂或 runtime 实例（见 jobs/runner.ProvidersLike）"
@@ -164,7 +181,7 @@ class JobCtx:
                             self.host.ssh_user, self.ssh_key_pem)
 
     def executor(self) -> Executor:
-        return self.providers.executor
+        return get_executor(self.providers)
 
     def runtime(self) -> DshRuntime:
         return make_runtime(self.providers, self.endpoint())
@@ -216,7 +233,7 @@ class JobCtx:
         started = time.monotonic()
         try:
             yield step
-        except Exception as exc:  # noqa: BLE001 —— 步骤失败统一转 StepFailed
+        except Exception as exc:
             step.state = "failed"
             step.finished_at = utcnow()
             msg = redact_text(str(exc) or exc.__class__.__name__)
@@ -224,7 +241,7 @@ class JobCtx:
                 f"耗时 {time.monotonic() - started:.1f}s\n失败: {msg}"
             await self.s.commit()
             raise StepFailed(f"[{seq}:{key}] {msg}") from exc
-        step.state = "succeeded"
+        step.state = "succeeded" if step.state == "running" else step.state
         step.finished_at = utcnow()
         step.detail = (step.detail + "\n" if step.detail else "") + \
             f"耗时 {time.monotonic() - started:.1f}s"
@@ -324,6 +341,11 @@ class JobRunner:
                 await repo.set_instance_state(s, instance, "restarting")
             ctx = JobCtx(self.db, self.providers, self.settings, job, instance,
                          host, ssh_key_pem)
+            # 换绑到 ctx 自己的 session：flow 里的字段改动必须能被 ctx.s 刷出，
+            # 用外层 session 的实例对象会静默丢失 UPDATE。
+            ctx.job = await repo.get_job(ctx.s, job.id)
+            ctx.instance = await repo.get_instance(ctx.s, job.instance_id)
+            ctx.host = await repo.get_host(ctx.s, ctx.instance.host_id)
 
         error: str | None = None
         try:
@@ -336,7 +358,6 @@ class JobRunner:
                 await ctx.event("job_failed", error, {"kind": job.kind})
         except asyncio.CancelledError:
             error = "任务被取消（服务重启？）"
-            ctx_job = job
             async with self.db.session() as s2:
                 j2 = await repo.get_job(s2, job_id)
                 if j2:
@@ -350,7 +371,7 @@ class JobRunner:
         finally:
             try:
                 await ctx.s.close()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 —— 收尾关不上也不能掩盖真正的失败
                 pass
 
         async with self.db.session() as s:
@@ -358,6 +379,9 @@ class JobRunner:
             inst = await repo.get_instance(s, j.instance_id)
             if error is None:
                 j.state = "succeeded"
+                # deploy/restart 成功回到 running；release 由 mark_released 步骤收尾
+                if inst and j.kind in ("deploy", "restart"):
+                    await repo.set_instance_state(s, inst, "running")
             else:
                 j.state = "failed"
                 j.error = error[:4000]

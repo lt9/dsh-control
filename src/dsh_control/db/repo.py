@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,8 +38,14 @@ async def get_credential_by_kind(s: AsyncSession, kind: str) -> Credential | Non
 async def upsert_credential(
     s: AsyncSession, *, kind: str, name: str, secret: dict[str, Any], note: str = ""
 ) -> Credential:
-    cred = await get_credential_by_name(s, name)
+    # 按 (kind, name) 找——只按 name 找会跨 kind 撞车、静默覆盖别人的密钥
+    cred = await s.scalar(
+        select(Credential).where(Credential.kind == kind, Credential.name == name)
+    )
     if cred is None:
+        by_name = await get_credential_by_name(s, name)
+        if by_name is not None:
+            raise ValueError(f"credentials.name 已被 kind={by_name.kind} 占用: {name}")
         cred = Credential(kind=kind, name=name, secret=secret, note=note)
         s.add(cred)
     else:
@@ -51,7 +58,7 @@ async def upsert_credential(
 # ---------------------------------------------------------------- hosts
 
 async def list_hosts(s: AsyncSession) -> Sequence[Host]:
-    return await s.scalars(select(Host).order_by(Host.id)).all()
+    return (await s.scalars(select(Host).order_by(Host.id))).all()
 
 
 async def get_host(s: AsyncSession, host_id: int) -> Host | None:
@@ -75,7 +82,7 @@ async def list_instances(
         )
     if state:
         stmt = stmt.where(Instance.state == state)
-    return await s.scalars(stmt).all()
+    return (await s.scalars(stmt)).all()
 
 
 async def get_instance(s: AsyncSession, instance_id: int) -> Instance | None:
@@ -86,8 +93,26 @@ async def get_instance_by_slug(s: AsyncSession, slug: str) -> Instance | None:
     return await s.scalar(select(Instance).where(Instance.slug == slug))
 
 
+async def update_instance_notes(
+    s: AsyncSession, inst: Instance, *, owner_label: str | None = None,
+    note: str | None = None,
+) -> Instance:
+    """PATCH 专用：只允许改备注名与备注，不碰域名 / 容器名 / 任何外部对象。"""
+    if owner_label is not None:
+        inst.owner_label = owner_label
+    if note is not None:
+        inst.note = note
+    await s.commit()
+    return inst
+
+
+async def max_frp_remote_port(s: AsyncSession) -> int:
+    """公网端口分配起点用：包含 released 实例——已释放的端口不复用。"""
+    return (await s.scalar(select(func.max(Instance.frp_remote_port)))) or 0
+
+
 async def all_slugs(s: AsyncSession) -> list[str]:
-    return list(await s.scalars(select(Instance.slug)).all())
+    return list((await s.scalars(select(Instance.slug))).all())
 
 
 async def set_instance_state(
@@ -186,9 +211,9 @@ async def get_job(s: AsyncSession, job_id: int) -> DeployJob | None:
 
 
 async def list_steps(s: AsyncSession, job_id: int) -> Sequence[DeployStep]:
-    return await s.scalars(
+    return (await s.scalars(
         select(DeployStep).where(DeployStep.job_id == job_id).order_by(DeployStep.seq)
-    ).all()
+    )).all()
 
 
 async def add_step(
@@ -203,12 +228,12 @@ async def add_step(
 async def logs_after(
     s: AsyncSession, job_id: int, after: int, limit: int = 500
 ) -> Sequence[DeployLog]:
-    return await s.scalars(
+    return (await s.scalars(
         select(DeployLog)
         .where(DeployLog.job_id == job_id, DeployLog.id > after)
         .order_by(DeployLog.id)
         .limit(limit)
-    ).all()
+    )).all()
 
 
 async def add_log(
@@ -221,9 +246,9 @@ async def add_log(
 
 
 async def unfinished_jobs(s: AsyncSession) -> Sequence[DeployJob]:
-    return await s.scalars(
+    return (await s.scalars(
         select(DeployJob).where(DeployJob.state.in_(("pending", "running")))
-    ).all()
+    )).all()
 
 
 # ---------------------------------------------------------------- events
@@ -245,7 +270,7 @@ async def list_events(
     stmt = select(Event).order_by(Event.id.desc()).limit(limit)
     if instance_id is not None:
         stmt = stmt.where(Event.instance_id == instance_id)
-    return await s.scalars(stmt).all()
+    return (await s.scalars(stmt)).all()
 
 
 async def last_event_at(s: AsyncSession, kind: str, instance_id: int) -> datetime | None:
@@ -257,24 +282,29 @@ async def last_event_at(s: AsyncSession, kind: str, instance_id: int) -> datetim
 
 
 # ---------------------------------------------------------------- overview 聚合
+# §2.0 规矩二：不写联表。两张表各查各的，Python 里组装。
 
 async def instance_counts(s: AsyncSession) -> dict[str, Any]:
     rows = await s.execute(
         select(Instance.state, func.count()).group_by(Instance.state)
     )
     by_state = {state: n for state, n in rows.all()}
-    # 分主机统计：一次 join 聚合
-    rows = await s.execute(
-        select(Host.id, Host.name, Instance.state, func.count(Instance.id))
-        .join(Instance, Instance.host_id == Host.id, isouter=True)
-        .group_by(Host.id, Host.name, Instance.state)
+
+    hosts = await list_hosts(s)
+    host_rows = await s.execute(
+        select(Instance.host_id, Instance.state, func.count(Instance.id))
+        .group_by(Instance.host_id, Instance.state)
     )
-    by_host: dict[int, dict[str, Any]] = {}
-    for host_id, host_name, state, n in rows.all():
+    by_host: dict[int, dict[str, Any]] = {
+        h.id: {"host_id": h.id, "host_name": h.name, "total": 0, "running": 0,
+               "unhealthy": 0, "restarting": 0, "error": 0, "released": 0, "other": 0}
+        for h in hosts
+    }
+    for host_id, state, n in host_rows.all():
         entry = by_host.setdefault(
-            host_id, {"host_id": host_id, "host_name": host_name,
-                      "total": 0, "running": 0, "unhealthy": 0,
-                      "restarting": 0, "error": 0, "released": 0, "other": 0}
+            host_id, {"host_id": host_id, "host_name": "", "total": 0, "running": 0,
+                      "unhealthy": 0, "restarting": 0, "error": 0, "released": 0,
+                      "other": 0}
         )
         entry["total"] += n
         if state in ("running", "unhealthy", "restarting", "error", "released"):

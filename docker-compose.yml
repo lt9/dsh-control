@@ -1,0 +1,12 @@
+services:
+  dsh-control:
+    build: .
+    image: dsh-control:latest
+    container_name: dsh-control
+    ports:
+      - "13300:13300"
+    env_file: .env
+    volumes:
+      - ./data:/data                 # sqlite 或备份落盘（PG 时可不挂）
+      - ./secrets:/secrets:ro        # site.toml env_file 指向的私钥文件放这里（路径须在容器内可达）
+    restart: unless-stopped

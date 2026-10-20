@@ -17,17 +17,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import repo
 from .db.models import Credential, Host, Instance
+from .domain.timeutil import in_window
 from .integrations.base import redact
 from .jobs.capture import TokenNotFound, capture_token
 from .jobs.runner import HostEndpoint, make_runtime, redact_text
-from .domain.timeutil import in_window
 from .settings import Settings, get_settings
 
 log = logging.getLogger("dsh_control.watcher")
@@ -87,7 +87,7 @@ async def maybe_auto_restart(
     last = await _last_auto_restart_at(s, inst.id)
     if last is not None:
         if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
+            last = last.replace(tzinfo=UTC)
         if now - last < cooldown:
             log.info("实例 %s 距上次自动重启不足 %ss，冷却中", inst.slug, settings.restart_cooldown)
             return False
@@ -110,7 +110,7 @@ async def scan_once(
     wstate: WatcherState, now: datetime | None = None,
 ) -> None:
     settings = settings or get_settings()
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     async with db.session() as s:
         instances = await repo.list_instances(s)
         for inst in instances:
@@ -187,7 +187,7 @@ async def _recapture_after_auto_restart(
     try:
         inst.dsh_version = await runtime.version(inst.container_name or inst.slug)
         await s.commit()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 —— 版本号取不到不值得惊动
         pass
     await repo.add_event(
         s, kind, instance_id=inst.id, message=redact_text(message),
@@ -203,9 +203,10 @@ async def run_loop(db: Any, providers: Any, settings: Settings | None,
     while not stop_event.is_set():
         try:
             await scan_once(db, providers, settings, runner, wstate)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("watcher 轮次异常: %s", redact_text(str(exc)))
+        except Exception as exc:  # noqa: BLE001 —— 循环不能被任何单轮异常打死
+            # 不带 traceback：原始异常参数可能含密钥形态文本，只记打码后的一行
+            log.warning("watcher 轮次异常: %s", redact_text(str(exc)))
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=settings.poll_interval)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

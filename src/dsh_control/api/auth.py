@@ -16,7 +16,7 @@ import secrets
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -55,10 +55,10 @@ def verify_session_cookie(secret: str, value: str) -> datetime | None:
     try:
         padded = body + "=" * (-len(body) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded))
-        exp = datetime.fromtimestamp(int(payload["exp"]), timezone.utc)
+        exp = datetime.fromtimestamp(int(payload["exp"]), UTC)
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
-    if datetime.now(timezone.utc) >= exp:
+    if datetime.now(UTC) >= exp:
         return None
     return exp
 
@@ -120,7 +120,7 @@ def client_ip(request: Request) -> str:
 
 
 def set_session_cookie(response: JSONResponse, secret: str, days: int) -> datetime:
-    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    expires_at = datetime.now(UTC) + timedelta(days=days)
     response.set_cookie(
         COOKIE_NAME,
         make_session_cookie(secret, expires_at),
@@ -137,11 +137,15 @@ def clear_session_cookie(response: JSONResponse) -> None:
     response.delete_cookie(COOKIE_NAME, path="/")
 
 
-def session_from_request(request) -> datetime | None:
+def session_from_request(request, secret: str | None = None) -> datetime | None:
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
         return None
-    settings = get_settings()
-    if not settings.session_secret:
+    if secret is None:
+        secret = getattr(getattr(request.app, "state", None), "settings",
+                         None) and request.app.state.settings.session_secret
+    if not secret:
+        secret = get_settings().session_secret
+    if not secret:
         return None
-    return verify_session_cookie(settings.session_secret, raw)
+    return verify_session_cookie(secret, raw)

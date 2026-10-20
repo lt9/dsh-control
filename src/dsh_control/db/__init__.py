@@ -16,6 +16,7 @@ from .session import Db, make_db, make_session_factory
 __all__ = [
     "Base",
     "Credential",
+    "Db",
     "DeployJob",
     "DeployLog",
     "DeployStep",
@@ -25,7 +26,6 @@ __all__ = [
     "InstanceConfig",
     "InstanceSnapshot",
     "InstanceToken",
-    "Db",
     "make_db",
     "make_session_factory",
 ]

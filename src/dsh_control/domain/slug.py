@@ -2,16 +2,15 @@
 
 - slug = `dsh-NN`（两位零填充，服务端顺序生成，**任何接口不接受用户传入的名字**），
   同时是释放的二次确认词。
-- 只能一级子域：现成通配证书只覆盖 `*.pipboy.cn` 一层。
+- 只能一级子域：现成通配证书只覆盖 zone 这一层（`*.zone`）。
 - 派生名一律从 slug 出：容器 `dsh-NN`、隧道 `dsh_NN`、NG upstream `DSH_NN`、
   站点 server_name 用完整域名。
-- 历史遗留 dshsub1 不参与推导（由人工拆除，docs/SEED.md §2），这里不为它写任何代码。
+- 历史遗留的非 `dsh-NN` 命名实例不参与推导（由人工处理），这里不为它写任何代码。
 """
 
 from __future__ import annotations
 
 import re
-
 from dataclasses import dataclass
 
 # 一级子域标签：小写字母/数字/连字符，不以连字符开头结尾

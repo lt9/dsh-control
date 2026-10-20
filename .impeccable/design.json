@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-20T23:05:00+08:00",
+  "title": "Design System: dsh-control 控制台",
+  "extensions": {
+    "colorMeta": {
+      "one-voice": { "role": "primary", "displayName": "One-Voice Deep Teal", "canonical": "#0b6478", "tonalRamp": ["#062b34", "#08404d", "#094757", "#0a5467", "#0b6478", "#2e8395", "#7fb4c0", "#dcecef"] },
+      "dock": { "role": "neutral", "displayName": "Dock Night", "canonical": "#0f2731", "tonalRamp": ["#0a1c24", "#0f2731", "#16323d", "#20404e", "#2d5261", "#4f7686", "#9dbac5", "#e9f1f3"] },
+      "cool-paper": { "role": "neutral", "displayName": "Cool Paper", "canonical": "#edf1f2", "tonalRamp": ["#20323b", "#445a66", "#647986", "#8b9ba4", "#c1ccd1", "#d6dee1", "#edf1f2", "#f7f9fa"] },
+      "stamp-ok": { "role": "secondary", "displayName": "Stamp Ok Green", "canonical": "#0c7a4f", "tonalRamp": ["#063d28", "#085538", "#0a6744", "#0c7a4f", "#2f9a6e", "#74c19c", "#a9d2be", "#e2f1e9"] },
+      "stamp-warn": { "role": "secondary", "displayName": "Stamp Warn Amber", "canonical": "#8a5a00", "tonalRamp": ["#442c00", "#603f00", "#754d00", "#8a5a00", "#b07c17", "#d0a34d", "#dfc48d", "#f5ecd6"] },
+      "stamp-err": { "role": "secondary", "displayName": "Stamp Err Red", "canonical": "#b13124", "tonalRamp": ["#571812", "#75201a", "#932820", "#b13124", "#cb5347", "#dd8b81", "#edbfb8", "#f8e5e2"] },
+      "stamp-off": { "role": "neutral", "displayName": "Archive Gray", "canonical": "#5c6e77", "tonalRamp": ["#2d373d", "#3e4b52", "#4d5d66", "#5c6e77", "#7c8d95", "#a3b0b6", "#c8d2d6", "#e8edef"] }
+    },
+    "typographyMeta": {
+      "wordmark": { "displayName": "Wordmark (mono)", "purpose": "顶栏标识，唯一等宽标题。" },
+      "display": { "displayName": "Display", "purpose": "页级标题：工单号、任务名。" },
+      "body": { "displayName": "Body", "purpose": "全部正文，400/14px/1.65，tabular-nums 全局开。" },
+      "machine": { "displayName": "Machine Ink", "purpose": "域名/token/端口/RecordId/日志行。" }
+    },
+    "shadows": [
+      { "name": "shadow-1", "value": "0 1px 2px rgba(10,28,36,.07), 0 1px 1px rgba(10,28,36,.05)", "purpose": "纸面卡片的接桌感，唯一常态投影。" },
+      { "name": "shadow-2", "value": "0 4px 14px rgba(10,28,36,.14), 0 1px 3px rgba(10,28,36,.10)", "purpose": "仅弹窗（dialog.modal）。" }
+    ],
+    "motion": [
+      { "name": "hold-sign", "value": "1500ms linear scaleX progress", "purpose": "放行条签字进度；松手即回零。" },
+      { "name": "pulse", "value": "1.4s ease-in-out infinite", "purpose": "live/running 状态的呼吸点。" },
+      { "name": "copy-flash", "value": "1800ms", "purpose": "已复制/失败反馈自动回位时长。" },
+      { "name": "reduced-motion", "value": "@media (prefers-reduced-motion: reduce) 全停", "purpose": "脉冲与过渡全关。" }
+    ],
+    "breakpoints": [
+      { "name": "md", "value": "1020px" },
+      { "name": "sm", "value": "720px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "一屏唯一的主行动：开始部署 / 进入台账 / 新建实例。",
+      "html": "<button class=\"ds-btn-primary\">开始部署</button>",
+      "css": ".ds-btn-primary { background:#0b6478; color:#f2f7f8; border:1px solid #094757; padding:8px 18px; font:600 14px/1.5 -apple-system,'PingFang SC','Noto Sans CJK SC',sans-serif; border-radius:5px; cursor:pointer; transition:background .15s,border-color .15s; } .ds-btn-primary:hover { background:#0a5467; border-color:#094757; } .ds-btn-primary:focus-visible { outline:2px solid #0b6478; outline-offset:2px; } .ds-btn-primary:disabled { background:#c3d4da; border-color:#c3d4da; color:#5d737c; cursor:default; }"
+    },
+    {
+      "name": "Hold-to-Sign Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "释放签字：按住 1.5s 触发，进度条 scaleX，松手取消。",
+      "html": "<button class=\"ds-btn-hold\"><span class=\"ds-bar\"></span>按住签字释放</button>",
+      "css": ".ds-btn-hold { position:relative; overflow:hidden; background:#fff; color:#b13124; border:1px solid #edbfb8; padding:9px 20px; font:600 14px/1.5 -apple-system,'PingFang SC','Noto Sans CJK SC',sans-serif; border-radius:5px; cursor:pointer; } .ds-btn-hold:hover { background:#f8e5e2; border-color:#b13124; } .ds-btn-hold .ds-bar { position:absolute; inset:0; background:rgba(177,49,36,.18); transform:scaleX(0); transform-origin:left; } .ds-btn-hold:focus-visible { outline:2px solid #0b6478; outline-offset:2px; }"
+    },
+    {
+      "name": "State Stamp Chip",
+      "kind": "chip",
+      "refersTo": "chip-state",
+      "description": "状态印章：直角细框 + 几何符号 + 宽字距，颜色之外有形状冗余。",
+      "html": "<span class=\"ds-chip ds-ok\"><svg width=\"9\" height=\"9\" viewBox=\"0 0 16 16\"><circle cx=\"8\" cy=\"8\" r=\"4.6\" fill=\"currentColor\"/></svg>运行中</span>",
+      "css": ".ds-chip { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:3px; border:1px solid; font:600 12px/1.6 -apple-system,'PingFang SC',sans-serif; letter-spacing:.08em; } .ds-chip.ds-ok { color:#0c7a4f; background:#e2f1e9; border-color:#a9d2be; }"
+    },
+    {
+      "name": "Card Surface",
+      "kind": "card",
+      "refersTo": "card-surface",
+      "description": "纸面单据：白卡 + 1px 细线 + 卡头小注。",
+      "html": "<div class=\"ds-card\"><div class=\"ds-head\"><b>一键登录</b><span>上次取到 2 小时前</span></div><div class=\"ds-body\">…</div></div>",
+      "css": ".ds-card { background:#fff; border:1px solid #d6dee1; border-radius:5px; box-shadow:0 1px 2px rgba(10,28,36,.07),0 1px 1px rgba(10,28,36,.05); } .ds-card .ds-head { display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid #d6dee1; } .ds-card .ds-head b { font:650 16px/1.35 -apple-system,'PingFang SC',sans-serif; color:#14232c; } .ds-card .ds-head span { margin-left:auto; font-size:12.5px; color:#647986; } .ds-card .ds-body { padding:16px; color:#14232c; font:400 14px/1.65 -apple-system,'PingFang SC',sans-serif; }"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "description": "台账检索（全站唯一常规输入框之一），带放大镜与清空。",
+      "html": "<span class=\"ds-search\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"#647986\" stroke-width=\"1.6\"><circle cx=\"7\" cy=\"7\" r=\"4.4\"/><path d=\"M10.4 10.4 14 14\"/></svg><input placeholder=\"搜备注名 / 域名 / dsh-01…\"><button aria-label=\"清空\">×</button></span>",
+      "css": ".ds-search { position:relative; display:inline-flex; align-items:center; } .ds-search svg { position:absolute; left:10px; } .ds-search input { height:38px; width:340px; padding:0 30px 0 32px; border:1px solid #c1ccd1; border-radius:5px; background:#fff; color:#14232c; font:400 14px/1.5 -apple-system,'PingFang SC',sans-serif; } .ds-search input:focus { border-color:#0b6478; outline:2px solid rgba(11,100,120,.25); outline-offset:1px; } .ds-search button { position:absolute; right:6px; border:0; background:none; color:#647986; font-size:15px; cursor:pointer; }"
+    },
+    {
+      "name": "Dock Topbar",
+      "kind": "nav",
+      "description": "船坞壳顶栏：wordmark + 中文导航 + 登录态。",
+      "html": "<header class=\"ds-topbar\"><b class=\"ds-mark\">dsh<i>·</i>control</b><nav><a>台账</a><a class=\"on\">新建</a></nav><span>登录态到 2026-10-27 22:58</span></header>",
+      "css": ".ds-topbar { display:flex; align-items:center; gap:18px; height:52px; padding:0 20px; background:#0f2731; color:#e9f1f3; border-bottom:1px solid #0a1c24; font:400 14px/1.5 -apple-system,'PingFang SC',sans-serif; } .ds-mark { font:700 15px/1 ui-monospace,'SF Mono',monospace; } .ds-mark i { color:#6cc5d8; font-style:normal; } .ds-topbar nav a { color:#9dbac5; text-decoration:none; padding:5px 12px; border-radius:3px; font-weight:550; } .ds-topbar nav a:hover { color:#e9f1f3; background:#16323d; } .ds-topbar nav a.on { color:#e9f1f3; background:#20404e; } .ds-topbar > span { margin-left:auto; font-size:12.5px; color:#9dbac5; }"
+    },
+    {
+      "name": "Release Slip 放行条",
+      "kind": "custom",
+      "description": "签名组件：不可逆动作原地展开的编号放行单据。",
+      "html": "<div class=\"ds-slip\"><div class=\"t\"><h3>释 放 放 行 条</h3><span>NO.0002 · dsh-01</span></div><ul><li><i>注销解析</i><span>A dsh-01.example.com → RecordId 90000002</span></li><li><i>注销隧道</i><span>frp 公网 4894 · 隧道 id 702</span></li><li><i>注销站点</i><span>nginx https://dsh-01.example.com</span></li><li><i>停止容器</i><span>只 stop，不删容器、不碰数据目录和镜像</span></li></ul><p>签字之后<b>不可恢复</b>。</p></div>",
+      "css": ".ds-slip { border:1px dashed #b13124; border-radius:5px; padding:14px 16px; background:#fff; color:#14232c; font:400 14px/1.65 -apple-system,'PingFang SC',sans-serif; } .ds-slip .t { display:flex; align-items:baseline; gap:10px; border-bottom:1px dashed #c1ccd1; padding-bottom:8px; } .ds-slip .t h3 { margin:0; font:650 15px/1.4; letter-spacing:.28em; color:#b13124; } .ds-slip .t span { margin-left:auto; font:12.5px ui-monospace,monospace; color:#647986; } .ds-slip ul { list-style:none; margin:10px 0; padding:0; counter-reset:n; } .ds-slip li { display:flex; gap:12px; align-items:baseline; border-bottom:1px dashed #e2e9eb; padding:7px 0; } .ds-slip li i { font-style:normal; color:#b13124; white-space:nowrap; } .ds-slip li span { font:12.5px ui-monospace,monospace; } .ds-slip p { font-size:12.5px; color:#445a66; }"
+    },
+    {
+      "name": "Log Hold 日志舱",
+      "kind": "custom",
+      "description": "深色日志舱：等宽行 + 时间戳 + 级别列，固定高内滚。",
+      "html": "<pre class=\"ds-log\"><div><span class=\"lt\">22:43:21</span><span class=\"ll\">INFO</span>$ ssh nas-1 … # 域名规划</div></pre>",
+      "css": ".ds-log { height:340px; overflow:auto; padding:10px 12px; margin:0; background:#0a1c24; color:#c7d8dd; border-radius:0 0 5px 5px; font:12px/1.7 ui-monospace,'DejaVu Sans Mono',monospace; white-space:pre-wrap; } .ds-log .lt { color:#5f8090; margin-right:8px; } .ds-log .ll { margin-right:8px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "港务理货单（the cargo manifest desk）",
+    "overview": "深夜港务处：深蓝船坞壳压在冷调浅青纸的工作面上，每一条 DSH 实例是一张待理货的单据。界面为扫描、核对、签放行而存在；密度优先，色彩只服务状态语义，装饰止步于印章与虚线。最重的动作（释放）展开成实体放行条，操作员按住 1.5 秒签字。",
+    "keyCharacteristics": [
+      "双色分层：船坞壳只在顶栏/登录/日志舱，工作面永远是冷纸",
+      "状态=印章：直角细框+几何符号+宽字距，颜色之外永远有形状冗余",
+      "机器标识一律等宽，人话一律无衬线",
+      "全站数字 tabular-nums；时间一律 Asia/Shanghai",
+      "全站输入只有登录粘贴、检索框与备注名铅笔改，其余全是点按与长按"
+    ],
+    "rules": [
+      { "name": "The One Voice Rule", "body": "深青强调只给主行动、选中、焦点三件事；一屏至多一个主按钮。", "section": "colors" },
+      { "name": "The Two Docks Rule", "body": "深色壳面只允许出现在顶栏、登录门、日志舱；工作面上的卡片永远白纸。", "section": "colors" },
+      { "name": "The Machine Ink Rule", "body": "任何非人类输入的标识符必须等宽呈现。", "section": "typography" },
+      { "name": "The Even Digits Rule", "body": "全站 tabular-nums；数字列、计数、时钟必须竖排对齐。", "section": "typography" },
+      { "name": "The Flat Ledger Rule", "body": "台账面接近平面；阴影只回应状态。", "section": "elevation" },
+      { "name": "The Slip Rule", "body": "不可逆动作当场摊开放行条，按住 1.5 秒签字；确认词前端代填。", "section": "components" }
+    ],
+    "dos": [
+      "Do 状态色只用四语义且恒配形状冗余；灰=档案态",
+      "Do 机器标识等宽、数字 tabular、时间 Asia/Shanghai",
+      "Do 复制反馈双通道（文案+图标，1.8s 回位），失败也要说",
+      "Do 敏感值默认打码，进页现取最新并注明",
+      "Do 键盘可达：行 Tab/Enter、原生 dialog、/ 聚焦搜索"
+    ],
+    "donts": [
+      "Don't 工作面深色壳、大圆角、彩色投影、emoji/字体图标",
+      "Don't 主视图摆 image_id/状态机枚举/desired_state",
+      "Don't 释放前要求用户打字；也不要弹窗套弹窗",
+      "Don't 暖色纸当工作面底",
+      "Don't 公开产物里出现真实域名、IP 或站点标识"
+    ]
+  }
+}

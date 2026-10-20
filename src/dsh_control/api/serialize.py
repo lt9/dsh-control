@@ -18,22 +18,20 @@ _RESTARTABLE_STATES = {"running", "unhealthy", "restarting", "error"}
 
 
 def list_item(inst: Instance, host: Host | None) -> dict[str, Any]:
-    """列表项：运行状态 / DSH 版本 / 配置版本可见；token 绝不出现在这里。"""
+    """列表项——§9 交互做减法：保持精简（用途与 slug、状态、DSH 版本、配置版本、
+    所在主机、域名、更新时间）；token 与内部细节绝不出现在这里。"""
     return {
         "id": inst.id,
         "slug": inst.slug,
         "owner_label": inst.owner_label,
+        "note": inst.note,
         "dns_name": inst.dns_name,
-        "public_url": inst.public_url,
         "state": inst.state,
         "desired_state": inst.desired_state,
         "dsh_version": inst.dsh_version,
-        "image_tag": inst.image_tag,
         "config_version": inst.config_version,
         "host": {"id": host.id, "name": host.name} if host else None,
-        "last_error": inst.last_error,
         "released_at": iso(inst.released_at),
-        "created_at": iso(inst.created_at),
         "updated_at": iso(inst.updated_at),
     }
 
@@ -62,6 +60,7 @@ async def instance_detail(
         "id": inst.id,
         "slug": inst.slug,
         "owner_label": inst.owner_label,
+        "note": inst.note,
         "host": {"id": host.id, "name": host.name} if host else None,
         "state": inst.state,
         "desired_state": inst.desired_state,

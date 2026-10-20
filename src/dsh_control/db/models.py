@@ -10,7 +10,7 @@ PostgreSQL（生产）与 aiosqlite（单测）两边跑。JSON 列 PG 用 JSONB
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -40,7 +40,7 @@ JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
 CREDENTIAL_KINDS = ("ssh_key", "ssh_password", "aliyun_ak", "frp_panel",
-                    "ng_panel", "operator_key")
+                    "ng_panel", "operator_key", "site")
 
 
 def _in(col: str, values: tuple[str, ...]) -> CheckConstraint:
@@ -49,7 +49,7 @@ def _in(col: str, values: tuple[str, ...]) -> CheckConstraint:
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -67,7 +67,8 @@ class Credential(Base):
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     kind: Mapped[str] = mapped_column(
-        String(32), comment="类别：ssh_key/ssh_password/aliyun_ak/frp_panel/ng_panel/operator_key")
+        String(32),
+        comment="类别：ssh_key/ssh_password/aliyun_ak/frp_panel/ng_panel/operator_key/site")
     name: Mapped[str] = mapped_column(String(128), unique=True,
                                       comment="唯一名称，如 console-ed25519")
     secret: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict,
@@ -85,10 +86,10 @@ class Host(Base):
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     name: Mapped[str] = mapped_column(String(128), unique=True,
-                                      comment="主机名，如 nas-8 / host-109")
+                                      comment="主机名，如 nas-1")
     ssh_host: Mapped[str] = mapped_column(String(255), comment="SSH 地址")
     ssh_port: Mapped[int] = mapped_column(Integer, default=22, comment="SSH 端口（NAS 只有 2333）")
-    ssh_user: Mapped[str] = mapped_column(String(128), comment="SSH 用户（两台不同：tuan/twan）")
+    ssh_user: Mapped[str] = mapped_column(String(128), comment="SSH 用户（各主机可不同）")
     ssh_credential_id: Mapped[int | None] = mapped_column(
         BigInteger, comment="逻辑指向 credentials.id（ssh_key），无外键")
     docker_context: Mapped[str] = mapped_column(String(128), default="default",
@@ -280,7 +281,7 @@ class DeployLog(Base):
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True,
                                     comment="主键，即日志游标（after= 参数）")
-    job_id: Mapped[int] = mapped_column(BigInteger, index=True,
+    job_id: Mapped[int] = mapped_column(BigInteger,
                                         comment="逻辑指向 deploy_jobs.id，无外键")
     seq: Mapped[int] = mapped_column(Integer, default=0, comment="所属步骤 seq")
     level: Mapped[str] = mapped_column(String(8), default="stdout",
