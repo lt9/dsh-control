@@ -162,7 +162,7 @@ async def test_secure_cookie_only_over_tls(env):
     """走 https 进来那次必须给 Secure；内网 http 直连不能被 Secure 弄坏。"""
     from httpx import ASGITransport, AsyncClient
 
-    tls = ASGITransport(app=env.app, client=("192.168.3.109", 4444))
+    tls = ASGITransport(app=env.app, client=("10.0.0.10", 4444))
     async with AsyncClient(transport=tls, base_url="http://test") as c:
         r = await c.post("/api/login", json={"key": OP_KEY},
                          headers={"X-Forwarded-Proto": "https"})
@@ -172,7 +172,7 @@ async def test_secure_cookie_only_over_tls(env):
                           headers={"X-Forwarded-Proto": "http"})
         assert "Secure" not in r2.headers["set-cookie"], "明文链路不该标 Secure"
 
-    plain = ASGITransport(app=env.app, client=("192.168.3.77", 4444))
+    plain = ASGITransport(app=env.app, client=("10.0.0.77", 4444))
     async with AsyncClient(transport=plain, base_url="http://test") as c:
         r = await c.post("/api/login", json={"key": OP_KEY})
         assert r.status_code == 200

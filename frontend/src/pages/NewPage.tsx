@@ -15,7 +15,7 @@ export default function NewPage() {
   const ov = useAsync(() => api.overview(), []);
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
-  // 输入框收 slug（dsh-04）也收卡片上显示的那个完整域名（dsh-04.pipboy.cn）：
+  // 输入框收 slug（dsh-04）也收卡片上显示的那个完整域名（dsh-04.example.test）：
   // 上一版只认 slug，页面却写着"把域名打进输入框"，不懂技术的人打到第一步就卡住。
   const matchesTarget = (v: string) => {
     const s = v.trim().toLowerCase();

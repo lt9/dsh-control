@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # NG 回源地址（frps 监听地址，NG 容器视角可达的那一个）。
     # 不能由 ingress_ip 推：云上无 NAT 回环，公网入口 IP 在入口机上自己都出不去。
     frps_upstream_host: str = ""
-    frp_port_start: int = 4893        # DSHC_FRP_PORT_START：公网端口搜索起点
+    frp_port_start: int = 20000        # DSHC_FRP_PORT_START：公网端口搜索起点
     prefer_hdd: bool = True           # DSHC_PREFER_HDD：自动选主机时机械盘优先
 
     # ---- 主控台自身公网入口（cli expose 用；console_host 留空=hosts 恰好一台时自动选）

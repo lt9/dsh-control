@@ -5,11 +5,38 @@ const iso = (s = 0) => new Date(Date.now() + s * 1000).toISOString();
 let SEQ = 10, tok = {}, jobs = {};
 const hosts = [{ id: 1, name: "nas-1", enabled: true, data_root: "/mnt/hdd/dsh-family", note: "机械盘，剩 1.7 T" }, { id: 2, name: "host-2", enabled: true, data_root: "/home/u/dsh-data", note: "主控台自己这台" }];
 let insts = process.env.MOCK === "empty" ? [] : [
-  { id: 1, slug: "dsh-probe", owner_label: null, host_id: 2, state: "released", dsh_version: "1.14.2", config_version: "v1", dns_name: "dsh-probe.example.com", released_at: iso(-86400 * 6), updated_at: iso(-86400 * 6), err: null },{ id: 2, slug: "dsh-01", owner_label: "家人", host_id: 1, state: "running", dsh_version: "1.14.2", config_version: "v1", dns_name: "dsh-01.example.com", released_at: null, updated_at: iso(-3600), err: null },{ id: 3, slug: "dsh-02", owner_label: null, host_id: 1, state: "unhealthy", dsh_version: "1.13.8", config_version: "v1", dns_name: "dsh-02.example.com", released_at: null, updated_at: iso(-900), err: "健康检查连续 3 次失败：站点返回 502；距上次自动重启不足 10 分钟，先不重启" }];
+  { id: 1, slug: "dsh-probe", owner_label: null, host_id: 2, state: "released", dsh_version: "1.14.2", config_version: "v2", dns_name: "dsh-probe.example.com", released_at: iso(-86400 * 6), updated_at: iso(-86400 * 6), err: null },{ id: 2, slug: "dsh-01", owner_label: "家人", host_id: 1, state: "running", dsh_version: "1.14.2", config_version: "v2", dns_name: "dsh-01.example.com", released_at: null, updated_at: iso(-3600), err: null },{ id: 3, slug: "dsh-02", owner_label: null, host_id: 1, state: "unhealthy", dsh_version: "1.13.8", config_version: "v2", dns_name: "dsh-02.example.com", released_at: null, updated_at: iso(-900), err: "健康检查连续 3 次失败：站点返回 502；距上次自动重启不足 10 分钟，先不重启" }];
 const CFG = [{ key: "image", value: "dsh-family:local", label: "镜像", help: "镜像是事先构建好传到那台机器上的，控制台不构建；换版本是以后的能力，现在固定用站点配置的默认版本" }, { key: "documentsDirectory", value: "/data", label: "工作区根目录", help: "DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配" }, { key: "trustedHosts", value: "", label: "准入域名", help: "Origin 和 Host 不完全相等就拒绝——「能打开但一直重连」都是它的锅" },
 { key: "TZ", value: "Asia/Shanghai", label: "时区", help: "定时任务和备份都按北京时间走" }, { key: "backupWindow", value: "03:20-04:00", label: "备份窗口", help: "窗口内不自动重启，免得把正在跑的备份腰斩" }];
-const STEPS = { deploy: [[10, "域名规划"], [20, "主机预检"], [30, "添加解析"], [40, "开隧道"], [50, "建反代站点"], [60, "部署容器"], [70, "抓登录密钥"], [80, "公网探活"], [90, "验收复核"]],
-restart: [[10, "重启容器"], [20, "等待健康"], [30, "抓登录密钥"], [40, "公网探活"]], release: [[10, "核对确认词"], [20, "注销 nginx 站点"], [30, "注销 frp 隧道"], [40, "注销解析记录"], [50, "停止容器（只停不删）"], [60, "标记已释放"]] };
+// DSH 容器内**实际生效**的配置（详情页「DSH 配置」卡）；值全是文档占位
+const grp = (t, ...i) => ({ title: t, items: i.map(([key, value, note]) => ({ key, value, note: note || "" })) });
+const DSHC = (I) => ({
+  captured_at: iso(-3600), dsh_version: I.dsh_version || "1.14.2",
+  model: "qwen-example-27b", base_url: "http://192.0.2.20:8000/v1",
+  agent_team: true, office_skills: true, skills: ["comfy-image"],
+  bundles: ["dsh-base", "dsh-web-app"],
+  groups: [
+    grp("模型", ["默认模型", "qwen-example-27b", "会话默认用的那一个；下拉里可换"],
+        ["提供方", "local", "地址 http://192.0.2.20:8000/v1"],
+        ["上下文窗口", "262144", "超过就触发压缩"], ["单次回复上限", "32768"]),
+    grp("上下文压缩", ["压缩触发比例", "0.8", "用到窗口的这个比例就自动压缩"],
+        ["压缩预算", "8192", "每次压缩产出多少 token 的摘要"]),
+    grp("生图", ["DSH 原生入口", "没有", "DSH 没有原生生图入口，生图由技能调 ComfyUI 接口完成"],
+        ["技能是否就位", "已就位", "技能放在实例数据卷的 skills/ 下，DSH 会自动发现"]),
+    grp("插件与智能体团队", ["智能体团队", "已开启", "团队成员、共享任务板、团队工具都在"],
+        ["团队成员上限", "4", "开启后由它管并发，不再受子代理上限约束"],
+        ["插件安装入口", "已关闭", "防止误装带云端调用的第三方插件"]),
+    grp("技能（Skills）", ["办公技能（Word/PPT/Excel）", "已开启", "官方 office 技能 + LibreOffice Kit"],
+        ["已发现技能", "comfy-image", "来自实例数据卷 skills/ 目录，改完不用重启"]),
+    grp("预设与并发", ["会话预设", "standard", "standard / ptc / minimal / cordis 四选一"],
+        ["工作流并发", "2", ""]),
+    grp("准入与权限", ["公网地址", "https://" + I.dns_name, "一键登录地址就是拼在它后面"],
+        ["文件权限档", "danger-full-access", "她让改文件时不再逐次弹窗"],
+        ["读取时间", iso(-3600).slice(0, 19).replace("T", " ") + " UTC", "点「重新读取」按最新值刷新"]),
+  ],
+});
+const STEPS = { deploy: [[10, "域名规划"], [20, "主机预检"], [30, "添加解析"], [40, "开隧道"], [50, "建反代站点"], [60, "部署容器"], [66, "铺生图技能与智能体团队"], [70, "抓登录密钥"], [80, "公网探活"], [90, "验收复核"]],
+restart: [[5, "铺生图技能与智能体团队"], [10, "重启容器"], [20, "等待健康"], [30, "抓登录密钥"], [40, "公网探活"]], release: [[10, "核对确认词"], [20, "注销 nginx 站点"], [30, "注销 frp 隧道"], [40, "注销解析记录"], [50, "停止容器（只停不删）"], [60, "标记已释放"]] };
 const mkJob = (k, i, ms) => (jobs[++SEQ] = { id: SEQ, kind: k, inst: i, t0: Date.now(), stepMs: ms, steps: STEPS[k], done: false }, SEQ);
 function jobView(id) { const j = jobs[id]; if (!j) return null; const st = j.steps.map((_, i) => { const e = Date.now() - j.t0; return e >= (i + 1) * j.stepMs ? "succeeded" : e >= i * j.stepMs ? "running" : "pending"; });
   if (!j.done && st.every((s) => s === "succeeded")) { j.done = true; const I = insts.find((x) => x.id === j.inst); if (I) { I.updated_at = iso(); if (j.kind === "deploy") I.state = "running"; if (j.kind === "restart") tok[I.id] = Math.floor(Math.random() * 1e6); if (j.kind === "release") { I.state = "released"; I.released_at = iso(); } } }
@@ -19,7 +46,7 @@ function logsFor(id, after) { const j = jobs[id]; if (!j) return { items: [], ne
     out.push({ id: lid, seq: s[0], level: "info", line: k === 0 ? `$ ssh ${hosts[si % 2].name} … # ${s[1]}` : k === 1 ? `← ${s[1]}：done (exit 0)` : "校验回读通过", ts: new Date(at).toISOString() }); } });
   return { items: out, next: Math.max(after, out.length ? out[out.length - 1].id : after) }; }
 const tokOf = (i) => (tok[i] ??= 100000 + i * 777), detail = (I) => ({ id: I.id, slug: I.slug, owner_label: I.owner_label, host: { id: I.host_id, name: hosts.find((h) => h.id === I.host_id).name },
-state: I.state, desired_state: I.state === "released" ? "released" : "running", dsh_version: I.dsh_version, image_tag: "dsh-family:local", image_id: "a1b2c3d4", config_version: I.config_version, config: { items: CFG.map((c) => ({ ...c, value: c.key === "trustedHosts" ? I.dns_name : c.value })) }, network: { dns_name: I.dns_name, public_url: "https://" + I.dns_name, frp_remote_port: 4892 + I.id, frp_proxy_id: 700 + I.id, dns_record_id: "9000000" + I.id, container_ip: I.state === "released" ? null : "172.30.0." + I.id }, runtime: I.state === "released" ? null : { docker_state: "running", health: I.state === "unhealthy" ? "unhealthy" : "healthy", restart_count: I.state === "unhealthy" ? 2 : 0, cpu_pct: 0.4, mem_usage_bytes: 2.8e8, mem_limit_bytes: 4.29e9, captured_at: iso(-60) }, access: { has_token: I.state !== "released", token_masked: "to" + tokOf(I.id) + "··9" + I.id, url: I.state === "released" ? null : `https://${I.dns_name}/?token=········`, captured_at: iso(-7200) }, last_error: I.err, released_at: I.released_at, actions: { restart: I.state !== "released", release: I.state !== "released" } });
+state: I.state, desired_state: I.state === "released" ? "released" : "running", dsh_version: I.dsh_version, image_tag: "dsh-family:local", image_id: "a1b2c3d4", config_version: I.config_version, dsh_config: DSHC(I), config: { items: CFG.map((c) => ({ ...c, value: c.key === "trustedHosts" ? I.dns_name : c.value })) }, network: { dns_name: I.dns_name, public_url: "https://" + I.dns_name, frp_remote_port: 4892 + I.id, frp_proxy_id: 700 + I.id, dns_record_id: "9000000" + I.id, container_ip: I.state === "released" ? null : "172.30.0." + I.id }, runtime: I.state === "released" ? null : { docker_state: "running", health: I.state === "unhealthy" ? "unhealthy" : "healthy", restart_count: I.state === "unhealthy" ? 2 : 0, cpu_pct: 0.4, mem_usage_bytes: 2.8e8, mem_limit_bytes: 4.29e9, captured_at: iso(-60) }, access: { has_token: I.state !== "released", token_masked: "to" + tokOf(I.id) + "··9" + I.id, url: I.state === "released" ? null : `https://${I.dns_name}/?token=········`, captured_at: iso(-7200) }, last_error: I.err, released_at: I.released_at, actions: { restart: I.state !== "released", release: I.state !== "released" } });
 const evts = (I) => [{ id: 3, kind: "token_captured", message: "抓到最新登录密钥并入库", created_at: I.updated_at }, { id: 2, kind: "auto_restart", message: I.state === "unhealthy" ? "健康检查失败，等待自动重启冷却窗口" : "自动重启一次，恢复健康", created_at: iso(-86400) },
 { id: 1, kind: I.state === "released" ? "released" : "deployed", message: I.state === "released" ? "已释放：解析/隧道/站点注销，容器停止（数据保留）" : "开通完成，验收通过", created_at: iso(-86400 * 8) }];
 http.createServer(async (req, res) => {
@@ -36,7 +63,7 @@ http.createServer(async (req, res) => {
   if (p === "/api/overview") return send(200, { dns_zone: "example.com", running: insts.filter((i) => i.state === "running").length, unhealthy: insts.filter((i) => ["unhealthy", "restarting", "error"].includes(i.state)).length, released: insts.filter((i) => i.state === "released").length, hosts: hosts.length, by_host: hosts.map((h) => ({ host: h.name, note: h.note, total: insts.filter((i) => i.host_id === h.id).length, free_gb: h.id === 1 ? 1740 : 42 })) });
 if (p === "/api/instances" && req.method === "GET") { const q = (u.searchParams.get("q") ?? "").toLowerCase(); return send(200, insts.filter((i) => !q || [i.slug, i.owner_label, i.dns_name].some((v) => v?.toLowerCase().includes(q))).map((i) => ({ ...i, host: hosts.find((h) => h.id === i.host_id), err: undefined }))); }
 if (p === "/api/instances" && req.method === "POST") { const nid = Math.max(0, ...insts.map((i) => i.id)) + 1, slug = "dsh-" + String(Math.max(...insts.map((i) => Number(/^dsh-(\d+)$/.exec(i.slug)?.[1] ?? 0)), 0) + 1).padStart(2, "0");
-insts.push({ id: nid, slug, owner_label: null, host_id: b.host_id ?? 2, state: "deploying", dsh_version: null, config_version: "v1", dns_name: slug + ".example.com", released_at: null, updated_at: iso(), err: null });
+insts.push({ id: nid, slug, owner_label: null, host_id: b.host_id ?? 2, state: "deploying", dsh_version: null, config_version: "v2", dns_name: slug + ".example.com", released_at: null, updated_at: iso(), err: null });
 return send(200, { instance_id: nid, dns_name: slug + ".example.com", job_id: mkJob("deploy", nid, 2600) }); }
   const I = m(/^\/api\/instances\/(\d+)/) ? insts.find((i) => i.id === iid()) : null;
   if (m(/^\/api\/instances\/\d+$/) && req.method === "PATCH") { if (!I) return send(404, { detail: "实例不存在" }); I.owner_label = b.owner_label ?? ""; return send(200, detail(I)); }
@@ -44,7 +71,8 @@ return send(200, { instance_id: nid, dns_name: slug + ".example.com", job_id: mk
   if (m(/^\/api\/instances\/\d+\/events$/)) return I ? send(200, evts(I)) : send(404, { detail: "实例不存在" });
   if (m(/^\/api\/instances\/\d+\/restart$/)) { if (!I || I.state === "released") return send(409, { detail: "当前状态不可重启" }); I.state = "restarting"; return send(200, { job_id: mkJob("restart", I.id, 1600) }); }
   if (m(/^\/api\/instances\/\d+\/release$/)) { if (!I) return send(404, { detail: "实例不存在" }); if (b.confirm !== I.slug) return send(422, { detail: "确认词与实例名不一致，拒绝释放" }); return send(200, { job_id: mkJob("release", I.id, 1300) }); }
-  if (m(/^\/api\/instances\/\d+$/)) return I ? send(200, detail(I)) : send(404, { detail: "实例不存在" });
+  if (m(/^\/api\/instances\/\d+\/dsh-config$/)) return I ? send(200, DSHC(I)) : send(404, { detail: "实例不存在" });
+if (m(/^\/api\/instances\/\d+$/)) return I ? send(200, detail(I)) : send(404, { detail: "实例不存在" });
   const jid = Number(m(/^\/api\/jobs\/(\d+)/)?.[1]);
   if (m(/^\/api\/jobs\/\d+\/logs$/)) return send(200, logsFor(jid, Number(u.searchParams.get("after") ?? 0)));
   if (m(/^\/api\/jobs\/\d+\/stream$/)) { if (process.env.MOCK_NO_SSE) return send(404, { detail: "SSE 已按请求关闭（演练轮询回落）" });

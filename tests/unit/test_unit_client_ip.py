@@ -41,7 +41,7 @@ def test_forged_xff_from_outside_cannot_choose_bucket():
 
 
 def test_x_real_ip_wins_behind_trusted_proxy():
-    r = req("192.168.3.109", {"x-real-ip": "203.0.113.5",
+    r = req("10.0.0.10", {"x-real-ip": "203.0.113.5",
                               "x-forwarded-for": "192.0.2.9, 203.0.113.5"})
     assert client_ip(r) == "203.0.113.5"
 
@@ -56,8 +56,8 @@ def test_no_peer_is_unknown():
 
 
 def test_https_only_from_trusted_proxy_report():
-    assert is_https(req("192.168.3.109", {"x-forwarded-proto": "https"})) is True
-    assert is_https(req("192.168.3.109", {"x-forwarded-proto": "http"})) is False
+    assert is_https(req("10.0.0.10", {"x-forwarded-proto": "https"})) is True
+    assert is_https(req("10.0.0.10", {"x-forwarded-proto": "http"})) is False
     # 外部来源自称 https 不算数
     assert is_https(req("198.51.100.7", {"x-forwarded-proto": "https"})) is False
     assert is_https(req("198.51.100.7", {}, scheme="https")) is True

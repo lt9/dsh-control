@@ -2,9 +2,8 @@
 
 <!-- impeccable:product-schema 1 -->
 
-> 本文件在无人类应答机制下由显式简报推断写成（ask_user_question 探测对子代理报错：
-> human interaction is unavailable）。推断条目逐条标注「推断」；其余为简报与
-> docs/ARCHITECTURE.md、README.md 的直接事实。
+> 产品简报：给谁用、解决什么、什么算做好。标「推断」的条目来自早期简报推断，
+> 其余来自契约与实现。
 
 ## Platform
 

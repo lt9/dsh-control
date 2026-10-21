@@ -4,7 +4,7 @@ public_base = "https://console.example.com"
 ingress_ip = "203.0.113.10"          # A 记录指向的入口（frps 所在机器的公网 IP）
 dns_zone = "example.com"
 domain_prefix = "dsh-"               # 一级子域，受证书通配层级约束
-frp_port_start = 4893
+frp_port_start = 20000
 dsh_image = "dsh-family:local"
 
 [providers]                           # 换厂商只改这里，见下

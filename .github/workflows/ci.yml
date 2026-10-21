@@ -1,0 +1,83 @@
+name: check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: ruff
+        run: ruff check src tests migrations
+      # 测试用的是假面板与假主机（内存 SQLite），不需要 PostgreSQL，
+      # 也不会碰到任何真实系统——这就是它能在 CI 里跑的原因。
+      - name: pytest
+        run: pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: 类型检查
+        run: npx tsc -b
+      - name: 构建
+        run: npm run build
+
+  # 文档与测试里不许出现真实站点信息（内网地址、真实域名、真密钥形状）。
+  # 这一关独立成 job，是因为它挂了最容易被忽略——它不报错不代表没漏。
+  docs-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 扫现网值
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = {
+              "真实域名": r"pipboy\.cn",
+              "内网地址": r"192\.168\.\d+\.\d+",
+              "运维密钥形状": r"dshc-[A-Za-z0-9_-]{12,}",
+              "32位十六进制密钥": r"\b[0-9a-f]{32}\b",
+              "GitHub token": r"gh[pousr]_[A-Za-z0-9]{20,}",
+              "云 AK": r"LTAI[A-Za-z0-9]{12,}",
+              "私钥": r"BEGIN [A-Z ]*PRIVATE KEY",
+          }
+          skip = re.compile(r"example\.(test|com)|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.")
+          hits = []
+          for p in list(pathlib.Path("docs").rglob("*.md")) + [
+                  pathlib.Path("README.md"), pathlib.Path("SECURITY.md"),
+                  pathlib.Path("CONTRIBUTING.md"), pathlib.Path("CHANGELOG.md")]:
+              if not p.is_file():
+                  continue
+              for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                  if skip.search(line):
+                      continue
+                  for name, pat in bad.items():
+                      if re.search(pat, line):
+                          hits.append(f"{p}:{n} 【{name}】")
+          if hits:
+              print("发现现网值：")
+              print("\n".join(hits[:20]))
+              sys.exit(1)
+          print("文档干净")
+          PY

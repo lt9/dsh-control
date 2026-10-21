@@ -57,8 +57,9 @@ ADR 一条决策一个文件：`docs/adr/NNN-标题.md`。
 
 ## 2. 数据模型（PostgreSQL）
 
-库：与 ai-seo-platform 同一个 PG 实例（`tierai-prod-postgres-1`，Docker 网络
-`tierai-prod_default`），独立数据库 `dsh_control`。
+库：独立的 PostgreSQL 数据库 `dsh_control`。可以和别的项目共用一个 PG 实例
+（容器加入该实例所在的 Docker 网络即可），但不要共用库——本控制台的库属于
+最高敏感级，里面集中存着各实例的登录密钥。
 
 ### 2.0 数据库三条规矩（不可违反，评审会逐条查）
 
@@ -171,14 +172,14 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 
 ```json
 {
-  "id": 1, "slug": "dsh-02", "owner_label": "家人", "host": {"id":1,"name":"nas-8"},
+  "id": 1, "slug": "dsh-02", "owner_label": "家人", "host": {"id":1,"name":"nas-1"},
   "state": "running", "desired_state": "running",
   "dsh_version": "1.x.y", "image_tag": "dsh-family:local", "image_id": "5023c780",
   "config_version": "v1",
   "config": {"items": [{"key":"documentsDirectory","value":"/data","label":"工作区根目录",
                        "help":"DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配"}]},
   "network": {"dns_name":"dsh-02.example.com","public_url":"https://dsh-02.example.com",
-              "frp_remote_port":4893,"frp_proxy_id":575,"dns_record_id":"2112...","container_ip":"192.0.2.5"},
+              "frp_remote_port":20001,"frp_proxy_id":575,"dns_record_id":"2112...","container_ip":"192.0.2.5"},
   "runtime": {"docker_state":"running","health":"healthy","restart_count":0,
               "cpu_pct":0.4,"mem_usage_bytes":280000000,"mem_limit_bytes":4294967296,
               "captured_at":"2026-10-20T21:40:00+08:00"},
@@ -366,7 +367,7 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 | 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
 | 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就失败并提示用 `cli images ship` 传过来。本步骤**永不构建镜像** | 无副作用 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
-| 40 | `frp_create` | 建隧道（remotePort 从 4893 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
+| 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
 | 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket） | 删刚建的站点/upstream |
 | 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS` | 保留现场，标 error |
 | 70 | `token_capture` | 从容器日志抓一键地址 | 标 error，可重试 |
@@ -426,9 +427,9 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 单容器 `dsh-control`：FastAPI 直接 serve 前端构建产物（`frontend/dist` 打进镜像），
 一个进程同时给 API 和静态页，避免跨域与第二个服务。监听 `DSHC_LISTEN_PORT=13300`。
 
-- 连 PG：加入 `tierai-prod_default` 网络，`DSHC_DATABASE_URL=postgresql+asyncpg://tierai:…@198.51.100.6:5432/dsh_control`
-- 出公网：`dshctl.example.com` → NG → frps → `192.0.2.10:13300`
-- 迁到 .8：换一份 `.env`（PG 地址、监听端口、frpc 客户端、数据根目录）重起即可，
+- 连 PG：加入 PostgreSQL 所在的 Docker 网络，`DSHC_DATABASE_URL=postgresql+asyncpg://USER:…@DB_HOST:5432/dsh_control`
+- 出公网：`console.example.com` → NG → frps → `192.0.2.10:13300`
+- 换宿主机：换一份 `.env`（PG 地址、监听端口、frpc 客户端、数据根目录）重起即可，
   代码里不允许出现任何写死的机器地址，全部走环境变量或 `hosts` 表。
 
 ## 8. 环境变量

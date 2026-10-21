@@ -31,8 +31,8 @@ _ITEMS: list[dict[str, Any]] = [
         "key": "CONTAINER_PORT",
         "label": "容器内监听端口",
         "help": "DSH 进程在容器里监听的端口，取自 docker 的端口映射（8080/tcp -> "
-                "0.0.0.0:4895 里的 8080）。现网曾把宿主机端口当这个值显示，"
-                "于是 4895 被标在了容器上。",
+                "0.0.0.0:20002 里的 8080）。现网曾把宿主机端口当这个值显示，"
+                "于是 20002 被标在了容器上。",
     },
     {
         "key": "HOST_PORT",
@@ -43,7 +43,7 @@ _ITEMS: list[dict[str, Any]] = [
     {
         "key": "FRP_REMOTE_PORT",
         "label": "frp 公网端口",
-        "help": "frps 侧声明的 remotePort，从 4893 起递增分配，建之前会先在 VPS "
+        "help": "frps 侧声明的 remotePort，从 frp_port_start 起递增分配，建之前会先在 VPS "
                 "探测占用。释放实例时这条隧道最先被删掉。",
     },
     {

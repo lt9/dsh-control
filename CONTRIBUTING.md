@@ -5,9 +5,20 @@
 ```bash
 uv venv .venv && uv pip install -e ".[dev]"
 cp .env.example .env          # 填数据库地址
-cd web && npm ci              # 前端
-make check                    # ruff + pytest + 前端构建
+make check                    # ruff + pytest
+cd frontend && npm ci && npx tsc -b && npm run build
 ```
+
+改界面不必先搭后端。仓库自带契约一致的假接口：
+
+```bash
+cd frontend
+node mock/server.mjs &                                 # 127.0.0.1:13300，密钥 dshc-demo
+VITE_API_TARGET=http://127.0.0.1:13300 npx vite        # 打开 http://127.0.0.1:13301
+```
+
+假数据全是文档占位值（`*.example.com`、RFC5737 地址），所以截图与录屏可以直接放进
+文档；`MOCK=empty` 看空台账，`MOCK_NO_SSE=1` 演练 SSE 断开后的轮询回退。
 
 ## 必须遵守的约定
 

@@ -168,8 +168,8 @@ async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, 
 
     端口探测器只知道"4894 被占了"，不知道占着它的就是我们自己上次建的那条隧道，
     于是每次续建都往上加一个端口，接着被 ensure 的「隧道已存在但端口不一致，拒绝
-    改动既有隧道」挡死（2026-10-21 现网：4893 别人在用、4894 是我们自己的 dsh_01、
-    4895 是新挑的）。指向别的机器的隧道一律拒绝复用，那种才是真冲突。
+    改动既有隧道」挡死（2026-10-21 现网：起点端口别人在用、下一个是我们自己的另一条隧道、
+    再下一个是新挑的）。指向别的机器的隧道一律拒绝复用，那种才是真冲突。
     """
     if _manual(ctx, "frp"):
         return await _pick_frp_port(ctx), None
@@ -230,9 +230,9 @@ async def _port_map(ctx: JobCtx, container: str) -> tuple[int, int]:
     """返回 (容器内监听端口, 宿主机发布端口)，读的是 docker 自己的端口映射。
 
     现网第 27 个缺陷：第 65 步把 .env 里的 HOST_PORT 当成"容器内监听端口"写进
-    快照，详情页因此把 4895 标在容器上。真值是 docker inspect 里的
-    `8080/tcp -> 0.0.0.0:4895`——容器监听什么端口只有 docker 知道，
-    kit 的 .env 里那个键名连它自己都不守（dsh-01 写 8080，dsh-02 写 4895）。
+    快照，详情页因此把宿主机端口标在容器上。真值是 docker inspect 里的
+    `8080/tcp -> 0.0.0.0:20002`——容器监听什么端口只有 docker 知道，
+    kit 的 .env 里那个键名连它自己都不守（有的实例写 8080，有的写宿主机发布端口）。
     """
     cmd = PORT_MAP_SNIPPET.replace("__NAME__", shlex.quote(container))
     r = await ctx.ssh(cmd, timeout=60, quiet=True)
