@@ -352,7 +352,7 @@ async def test_retry_after_reload_failure_does_not_duplicate_config_snapshot(env
 
 async def test_host_prepare_creates_missing_data_root(env):
     """数据根目录不存在时由控制台 mkdir -p：不该让人先手动建目录才能开通。
-    现网 host-109 的 /home/twan/dsh-data 就是这么把第一次开通卡住的。"""
+    现网有一台主机的数据根目录被人放在了家目录下，第一次开通就是这么卡住的。"""
     body = await create(env)
     await wait_job(env.app, body["job_id"])
     cmds = env.providers.executor.commands
