@@ -26,6 +26,7 @@ from .db import repo
 from .db.models import Credential, DeployJob, utcnow
 from .db.session import Db, make_db
 from .jobs.deploy import run_deploy
+from .jobs.purge import run_purge
 from .jobs.release import run_release
 from .jobs.restart import run_restart
 from .jobs.runner import JobRunner
@@ -103,7 +104,7 @@ def create_app(db: Db | None = None, providers: Any | None = None,
                  for c in creds])
             st.runner = JobRunner(st.db, st.providers, st.settings)
             st.runner.register_flows({"deploy": run_deploy, "restart": run_restart,
-                                      "release": run_release})
+                                      "release": run_release, "purge": run_purge})
         interrupted = await fail_interrupted_jobs(st.db)
         if interrupted:
             log.warning("中断了 %s 个遗留任务", interrupted)
@@ -133,7 +134,7 @@ def create_app(db: Db | None = None, providers: Any | None = None,
     app.state.watcher_enabled = start_watcher
     runner = JobRunner(app.state.db, providers or _LazyProviders(app), settings)
     runner.register_flows({"deploy": run_deploy, "restart": run_restart,
-                           "release": run_release})
+                           "release": run_release, "purge": run_purge})
     app.state.runner = runner
 
     app.include_router(public_router, prefix="/api")

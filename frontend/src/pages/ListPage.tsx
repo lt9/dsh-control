@@ -2,12 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, type InstanceRow, type InstanceState } from "../api/client";
 import { useAsync } from "../lib/hooks";
-import { fmtRel, fmtFull } from "../lib/format";
+import { fmtRel, fmtFull, fmtDate, fmtDaysLeft } from "../lib/format";
 import { Icon, StateChip } from "../components/ui";
 
 type Filter = "all" | "alive" | "trouble" | "released";
 
 const TROUBLE: InstanceState[] = ["unhealthy", "restarting", "error"];
+/** 次要分组：released 还在保留期（可恢复），purged 是终态（只剩档案）。
+ *  两个都不占主表——§9 把它们默认折叠在同一格里。 */
+const ARCHIVED: InstanceState[] = ["released", "purged"];
 
 export default function ListPage() {
   const nav = useNavigate();
@@ -41,22 +44,26 @@ export default function ListPage() {
   const rows = useAsync(() => api.instances(q || undefined), [q]);
   const ov = useAsync(() => api.overview(), []);
   const [filter, setFilter] = useState<Filter>("all");
-  const [showReleased, setShowReleased] = useState(false);
+  const [showArchive, setShowArchive] = useState(false);
 
-  const [main, released] = useMemo(() => {
+  const [main, archived] = useMemo(() => {
     const all = rows.data ?? [];
-    return [all.filter((r) => r.state !== "released"), all.filter((r) => r.state === "released")];
+    return [all.filter((r) => !ARCHIVED.includes(r.state)), all.filter((r) => ARCHIVED.includes(r.state))];
   }, [rows.data]);
+  const nReleased = useMemo(() => archived.filter((r) => r.state === "released").length, [archived]);
+  const nPurged = archived.length - nReleased;
+  // 搜索时把次要分组自己摊开：用户搜的是「那台已经没了的」，还藏着就等于没搜到。
+  const archiveOpen = showArchive || Boolean(q);
 
   const counts = useMemo(() => {
     const all = rows.data ?? [];
     return {
       alive: all.filter((r) => r.state === "running" || r.state === "deploying" || r.state === "pending").length,
       trouble: all.filter((r) => TROUBLE.includes(r.state)).length,
-      released: released.length,
+      released: archived.length,
       total: all.length,
     };
-  }, [rows.data, released]);
+  }, [rows.data, archived]);
 
   const shown = useMemo(() => {
     if (filter === "alive") return main.filter((r) => r.state === "running" || r.state === "deploying" || r.state === "pending");
@@ -173,16 +180,20 @@ export default function ListPage() {
             </div>
           )}
 
-          {released.length > 0 && (
+          {archived.length > 0 && (
             <div className="released-zone">
-              <button type="button" className="zone-toggle" aria-expanded={showReleased}
-                onClick={() => setShowReleased((v) => !v)}>
+              <button type="button" className="zone-toggle" aria-expanded={archiveOpen}
+                aria-controls="archive-table"
+                onClick={() => setShowArchive((v) => !v)}>
                 <Icon name="chevron" />
-                已释放 · {released.length}
-                <span className="zone-note">档案保留，不可恢复</span>
+                <span>已释放 · {nReleased}</span>
+                {nPurged > 0 && <span className="zone-purged">已彻底释放 · {nPurged}</span>}
+                <span className="zone-note">
+                  {nPurged > 0 ? "保留期内可恢复；已彻底释放的只剩档案" : "档案保留，保留期内可一键恢复"}
+                </span>
               </button>
-              {showReleased && (
-                <div className="card" style={{ marginTop: 8 }}>
+              {archiveOpen && (
+                <div className="card" style={{ marginTop: 8 }} id="archive-table">
                   <div className="tbl-wrap scroll-light">
                     <table className="tbl">
                       <thead>
@@ -192,7 +203,7 @@ export default function ListPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {released.map((r) => <Row key={r.id} r={r} released onOpen={() => nav(`/instances/${r.id}`)} />)}
+                        {archived.map((r) => <Row key={r.id} r={r} archived onOpen={() => nav(`/instances/${r.id}`)} />)}
                       </tbody>
                     </table>
                   </div>
@@ -222,9 +233,16 @@ function FilterStat({ on, label, n, tone, onClick }: {
   );
 }
 
-function Row({ r, released = false, onOpen }: { r: InstanceRow; released?: boolean; onOpen: () => void }) {
+function Row({ r, archived = false, onOpen }: { r: InstanceRow; archived?: boolean; onOpen: () => void }) {
   const title = r.owner_label || r.slug;
   const sub = r.owner_label ? r.slug : null;
+  const purged = r.state === "purged";
+  // 次要分组里那一列讲「什么时候没的」：purged 讲彻底释放那天，released 讲释放那天。
+  const at = purged ? (r.purged_at ?? r.released_at) : archived ? r.released_at : r.updated_at;
+  const atTitle = purged ? `彻底释放于 ${fmtFull(r.purged_at)}`
+    : archived ? `释放于 ${fmtFull(r.released_at)}` : fmtFull(r.updated_at);
+  // 保留期倒计时只给一行小字，完整日期在悬停里——主表扫读不该被它挤到。
+  const dueLeft = !purged && archived ? fmtDaysLeft(r.purge_after) : null;
   return (
     <tr className="clickable" tabIndex={0} role="link" aria-label={`打开 ${title} 详情`}
       onClick={onOpen}
@@ -238,8 +256,13 @@ function Row({ r, released = false, onOpen }: { r: InstanceRow; released?: boole
       <td className="mono">{r.config_version ?? "—"}</td>
       <td>{r.host_name ?? "—"}</td>
       <td className="mono">{r.dns_name ?? "—"}</td>
-      <td className="num" title={fmtFull(released ? r.released_at : r.updated_at)}>
-        {released ? (r.released_at ? fmtRel(r.released_at) : "—") : fmtRel(r.updated_at)}
+      <td className="num" title={atTitle}>
+        {at ? fmtRel(at) : "—"}
+        {dueLeft && (
+          <span className="row-due" title={`保留期至 ${fmtDate(r.purge_after)}，到期后系统自动彻底释放`}>
+            保留期{dueLeft}
+          </span>
+        )}
       </td>
     </tr>
   );

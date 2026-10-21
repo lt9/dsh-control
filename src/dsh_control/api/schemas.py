@@ -28,3 +28,15 @@ class UpdateInstanceRequest(BaseModel):
 
 class ReleaseRequest(BaseModel):
     confirm: str = ""
+
+
+class PurgeRequest(BaseModel):
+    """§4 POST /instances/{id}/purge：confirm 由前端填（长按确认），逐字等于 slug。"""
+
+    confirm: str = ""
+
+
+class DeployRequest(BaseModel):
+    """§4 POST /instances/{id}/deploy 的可选 body：留空 = 站点当前目标 tag。"""
+
+    image: str | None = Field(default=None, max_length=255)

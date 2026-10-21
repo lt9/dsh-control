@@ -33,9 +33,9 @@ JsonType = JSON().with_variant(JSONB, "postgresql")
 BigIntPk = BigInteger().with_variant(Integer, "sqlite")
 
 INSTANCE_STATES = ("pending", "deploying", "running", "unhealthy", "restarting",
-                   "released", "error")
+                   "released", "purged", "error")
 DESIRED_STATES = ("running", "released")
-JOB_KINDS = ("deploy", "restart", "release")
+JOB_KINDS = ("deploy", "restart", "release", "purge")
 JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
@@ -150,12 +150,15 @@ class Instance(Base):
     container_port: Mapped[int | None] = mapped_column(Integer, comment="容器发布端口")
     state: Mapped[str] = mapped_column(
         String(32), default="pending", index=True,
-        comment="运行状态：pending/deploying/running/unhealthy/restarting/released/error")
+        comment="运行状态：pending/deploying/running/unhealthy/restarting/released/purged/error")
     desired_state: Mapped[str] = mapped_column(String(32), default="running",
                                                comment="期望状态：running/released（终态）")
     last_error: Mapped[str | None] = mapped_column(Text, comment="最近一次错误（已脱敏）")
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
                                                          comment="释放时间（UTC）")
+    purged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        comment="彻底释放时间（UTC）；purged 终态落这一刻，保留审计记录的日期口径")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
                                                  comment="创建时间（UTC）")
     updated_at: Mapped[datetime] = mapped_column(
@@ -230,15 +233,20 @@ class DeployJob(Base):
     __table_args__ = (
         _in("kind", JOB_KINDS),
         _in("state", JOB_STATES),
-        {"comment": "一次性任务：deploy/restart/release 状态机"},
+        {"comment": "一次性任务：deploy/restart/release/purge 状态机"},
     )
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     instance_id: Mapped[int] = mapped_column(BigInteger, index=True,
                                              comment="逻辑指向 instances.id，无外键")
-    kind: Mapped[str] = mapped_column(String(16), comment="任务类型：deploy/restart/release")
+    kind: Mapped[str] = mapped_column(String(16),
+                                      comment="任务类型：deploy/restart/release/purge")
     state: Mapped[str] = mapped_column(String(16), default="pending", index=True,
                                        comment="任务状态：pending/running/succeeded/failed")
+    params: Mapped[dict[str, Any] | None] = mapped_column(
+        JsonType, default=dict,
+        comment="工单附加参数（如切镜像升级的 {\"image\": \"目标tag\"}、"
+                "purge 的 {\"source\": \"auto|manual\"}），可为空")
     error: Mapped[str | None] = mapped_column(Text, comment="失败原因（已脱敏）")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
                                                         comment="开始时间（UTC）")

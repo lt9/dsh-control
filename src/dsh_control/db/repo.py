@@ -35,6 +35,26 @@ async def get_credential_by_kind(s: AsyncSession, kind: str) -> Credential | Non
     )
 
 
+async def get_site_value(s: AsyncSession, key: str) -> Any:
+    """现读 credentials(kind=site) 里的单个键（seed --site 灌的 [site] 段镜像）。
+
+    只给 watcher / 序列化这类「每轮/每次现读最新库值」的口径用（§3：改了 DB 的
+    purge_after_days 不需重启就生效）；整表覆盖仍走 main.load_site_into_settings，
+    不在循环里重建 settings。"""
+    cred = await get_credential_by_kind(s, "site")
+    return (cred.secret or {}).get(key) if cred else None
+
+
+async def current_purge_after_days(s: AsyncSession, fallback: int) -> int:
+    """released 保留期的当前值：库里的 site 行优先，读不到或读坏回落 env 口径。"""
+    raw = await get_site_value(s, "purge_after_days")
+    try:
+        value = int(raw)   # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return value if value >= 0 else fallback
+
+
 async def upsert_credential(
     s: AsyncSession, *, kind: str, name: str, secret: dict[str, Any], note: str = ""
 ) -> Credential:
@@ -215,8 +235,10 @@ async def latest_snapshot(s: AsyncSession, instance_id: int) -> InstanceSnapshot
 
 # ---------------------------------------------------------------- jobs / steps / logs
 
-async def create_job(s: AsyncSession, instance_id: int, kind: str) -> DeployJob:
-    job = DeployJob(instance_id=instance_id, kind=kind, state="pending")
+async def create_job(s: AsyncSession, instance_id: int, kind: str,
+                     params: dict[str, Any] | None = None) -> DeployJob:
+    job = DeployJob(instance_id=instance_id, kind=kind, state="pending",
+                    params=params or {})
     s.add(job)
     await s.commit()
     return job

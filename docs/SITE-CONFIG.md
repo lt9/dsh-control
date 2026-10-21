@@ -30,6 +30,7 @@ dns_zone = "example.com"
 domain_prefix = "dsh-"               # 一级子域，受证书通配层级约束
 frp_port_start = 20000
 dsh_image = "dsh-family:local"      # 开通时用的镜像标签；本机必须已有，控制台不构建
+purge_after_days = 15                # 释放后数据保留天数，到期自动彻底释放（purge）
 
 [providers]                           # 换厂商只改这里，见下
 dns = "aliyun"                        # aliyun | noop
@@ -94,6 +95,22 @@ credential_name = "console-ed25519"
 
 `noop` provider 是通用性的另一半：没有阿里云也能用（DNS 自己指），没有 nginxWebUI 也能用
 （反代自己配），只有被管主机与 SSH 是必需的。
+
+## 释放保留期与彻底释放
+
+```toml
+[site]
+purge_after_days = 15     # 释放后数据保留天数；到期自动彻底释放
+```
+
+`released` 的实例只停容器、留数据；超过保留期且没有未完工单时，watcher 自动入队
+`purge` 工单：补删反代/隧道/解析残留、删容器、删数据目录，进入只读终态 `purged`——
+**这一步不可恢复**。保留期内随时可从详情页一键恢复（重跑开通工单，原域名原端口回来）。
+
+- `.env` 侧对应 `DSHC_PURGE_AFTER_DAYS`；站点库里的值（site 凭据行）优先。
+- watcher 与详情页都是**每轮现读**库值：改了立刻生效，不需要重启进程。
+- 删除路径只认实例 `.env` 的 `DATA_DIR` 生效值，且必须严格位于该主机 `data_root`
+  之下；过不了护栏宁可工单失败也不删。细节见 [SECURITY.md](../SECURITY.md)。
 
 ## 模型端点与密钥（开通时必须就位）
 
@@ -160,6 +177,38 @@ token 放 `credentials(kind=image_key)` 的 `secret.token`。**两项任一为�
 开启后 DSH 会显式 disable `tool-subagent*` 四条（团队协作取代了直接委派），
 所以 kit 里压的 `MAX_SUBAGENTS` 不再管她，改由 `team_max_members` 管——
 并发保护换了口径，排障时别再去翻 `MAX_SUBAGENTS`。
+
+## 字体铺放（可选，开通第 67 步）
+
+Word→PDF 在实例里有两条转换路，各自认各自的字体目录：
+
+- 右侧栏预览走 office-to-pdf 插件，读 `fontDirectories` 配置项；
+- 官方 office 技能的 LibreOffice Kit CLI 只扫 `$HOME/.fonts` 这个默认根。
+
+两条路共同认的位置是**实例 DATA_DIR 的 `home/.fonts`**（容器内 `/data/home/.fonts`），
+投递口就定在这里。面板**不配** `fontDirectories` 那个键：它是替换语义，写了会顶掉
+镜像里已有的字体目录配置，把所有文档预览炸掉。
+
+```toml
+[site]
+font_library = "/srv/dsh-fonts"   # 可选：站点字体库目录（实例宿主机上的绝对路径），留空则跳过
+```
+
+`.env` 侧是 `DSHC_FONT_LIBRARY`（形态示例；真实路径放不提交的 `deploy/site.toml`）。
+行为都在第 67 步「铺字体」里，四条规矩：
+
+- **只 cp，不挂载**：bind 挂载 `/usr/share/fonts` 要改每一台的 compose，而且字体
+  不随数据目录备份搬家；真字体不进镜像（镜像里只有同度量的开源替代），cp 是字体
+  进得去备份的唯一一条路。
+- **`cp -n` 不覆盖**：目标目录里已有的同名文件一律不动——数据卷归用户，她自己
+  放进去的字体她自管。本次新增 0 个文件也算正常完成。
+- **权限**：落地后文件 644、目录 755，保证容器内 uid 读得到。
+- **跳过条件**：`font_library` 未配置，或该目录在实例宿主机上不存在 → 步骤记一行
+  warning 并标 `skipped`，绝不失败工单（与生图技能同口径：可选能力没配，不该挡住开通）。
+
+一个坑：Office 的缺字体提示**按字体名匹配**，不按文件内容。库里放 `simfang.ttf`
+（仿宋）消不掉文档里写「仿宋_GB2312」的名字——要消掉提示，库里字体的内部名必须与
+文档引用的名字逐字一致（放真正的仿宋_GB2312，而不是名字相近的仿宋）。
 
 ## 安全门（不通过就不算开通成功）
 

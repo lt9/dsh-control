@@ -118,6 +118,9 @@ a { color: var(--accent-700); text-underline-offset: 3px; text-decoration-thickn
 .tone-wait { color: var(--wait); background: var(--wait-bg); border-color: var(--wait-line); }
 .tone-live svg { animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+/* purged：灰底上再加一道删除线。released 与 purged 只差两个字，
+   一个是停着等恢复、一个是连数据目录都没了，扫读时不能靠读字分清。 */
+.chip-struck .chip-text { text-decoration: line-through; text-decoration-thickness: 1px; }
 
 /* ————— 按钮：全站同一套形 ————— */
 .btn {
@@ -280,6 +283,12 @@ table.tbl { width: 100%; min-width: 940px; border-collapse: separate; border-spa
 .released-zone td, .released-zone .row-title { color: var(--off); }
 .released-zone .card { background: var(--panel); box-shadow: none; }
 .released-zone .tbl td { border-bottom-style: dotted; }
+/* 已彻底释放那一档：同一种灰，靠状态标签的删除线区分（见 .chip-struck） */
+.zone-toggle .zone-purged { color: var(--off); }
+.zone-toggle .zone-purged::before { content: "·"; margin-right: 8px; color: var(--ink-3); }
+/* 保留期倒计时：挂在时间那列下面，一行小字，悬停给完整日期 */
+.row-due { display: block; font: 11.5px/1.5 var(--sans); color: var(--off); letter-spacing: .02em; }
+.released-zone .row-due { color: var(--ink-2); }
 
 /* 空状态 = 首跑台 */
 .first-run { max-width: 620px; margin: 6vh auto 0; text-align: left; }
@@ -338,6 +347,12 @@ table.tbl { width: 100%; min-width: 940px; border-collapse: separate; border-spa
 .slip-due { font-size: 13px; color: var(--ink-2); margin-bottom: 14px; }
 .slip-due b { color: var(--err); font-weight: 650; }
 .slip-ops { display: flex; align-items: center; gap: 10px; }
+/* 有后果但可逆的动作（升级/重建、恢复）：同一张卡，不用红——
+   红只留给「不可恢复」，一屏里红色越多，越没人看得出哪条真不能点。 */
+.slip-safe { border-color: var(--line-2); background: var(--panel); }
+.slip-safe .slip-title h3 { color: var(--ink); letter-spacing: .12em; }
+.slip-safe .slip-due { margin-top: 12px; }
+.slip-safe .slip-rows b, .slip-rows b { font-weight: 650; color: var(--ink); }
 
 /* 配置弹窗 */
 .cfg-list { margin: 0; padding: 0; list-style: none; }

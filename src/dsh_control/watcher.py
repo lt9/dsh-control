@@ -1,4 +1,4 @@
-"""watcher：周期采状态、自动重启、抓 token（契约 §3）。
+"""watcher：周期采状态、自动重启、抓 token、到期自动终态化（契约 §3/§6.4）。
 
 自动重启的三个抑制条件（缺一不可）：
 1. 连续健康检查失败 < 3 次不重启（阈值 DSHC_UNHEALTHY_THRESHOLD，默认 3）；
@@ -9,7 +9,11 @@
 恢复 healthy 立即清零计数，再叠加窗口与冷却，绝不会因此进重启循环。
 
 宿主机 docker 策略自动拉起容器（restart_count 增长）后，这里负责重新抓
-最新 token 落库，保证详情页 access 永远是当前最新密钥。
+最新 token，保证详情页 access 永远是当前最新密钥；抓到的值与库里最新一条
+相同则什么都不写、不记事件（§3 去重——「事件流被获取密码刷满」就是这么修的）。
+
+released 实例不采集、不重启；保留期满（purge_after_days，每轮现读库值，
+site.toml 改了立即生效）自动入队 purge 工单做终态化（§6.4）。
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ from .settings import Settings, get_settings
 log = logging.getLogger("dsh_control.watcher")
 
 # 这些状态下 watcher 不采集、不判定：pending/deploying 还没容器，
-# restarting 归 restart job 管，released 是终态（契约 §3）。
+# restarting 归 restart job 管，released 是已停放的停放态（契约 §3：不采集不
+# 重启；保留期到期由 _queue_due_purges 入队 purge，purged 没有容器可采）。
 SKIP_STATES = {"pending", "deploying", "restarting", "released"}
 
 
@@ -110,6 +115,41 @@ async def maybe_auto_restart(
     return True
 
 
+async def _queue_due_purges(s: AsyncSession, released_rows: list[Instance],
+                            settings: Settings, runner: Any, now: datetime) -> None:
+    """保留期已过的 released 实例入队 purge 工单（契约 §3/§6.4 自动触发）。
+
+    每轮现读库里的保留天数（site 行改了立即生效，不吃启动缓存——只读这一个键，
+    不在循环里重建 settings）；`released_at + 天数 < now` 且该实例没有未完工单
+    才入队；runner.spawn 与自动重启同款。released 实例照常不采集、不重启
+    （SKIP_STATES 不变，§3）。"""
+    if not released_rows:
+        return
+    days = await repo.current_purge_after_days(s, settings.purge_after_days)
+    busy = {j.instance_id for j in await repo.unfinished_jobs(s)}
+    for inst in released_rows:
+        if inst.id in busy:
+            continue
+        released_at = inst.released_at
+        if released_at is None:
+            continue    # 没有释放时间的历史行：无法判断期满，宁可不删
+        if released_at.tzinfo is None:
+            released_at = released_at.replace(tzinfo=UTC)
+        if now - released_at <= timedelta(days=days):
+            continue
+        job = await repo.create_job(s, inst.id, "purge",
+                                    {"source": "auto", "purge_after_days": days})
+        await repo.add_event(
+            s, "purge_queued", instance_id=inst.id, job_id=job.id,
+            message=f"released 保留期已过（现读 {days} 天），自动入队彻底释放",
+            data=redact({"source": "auto", "purge_after_days": days,
+                         "released_at": released_at.isoformat()}),
+        )
+        log.info("实例 %s 保留期已过，入队 purge（job %s）", inst.slug, job.id)
+        if runner is not None:
+            runner.spawn(job.id)
+
+
 async def scan_once(
     db: Any, providers: Any, settings: Settings | None, runner: Any,
     wstate: WatcherState, now: datetime | None = None,
@@ -118,8 +158,11 @@ async def scan_once(
     now = now or datetime.now(UTC)
     async with db.session() as s:
         instances = await repo.list_instances(s)
+        due_released: list[Instance] = []
         for inst in instances:
             if inst.state in SKIP_STATES or inst.desired_state == "released":
+                if inst.state == "released":
+                    due_released.append(inst)   # 保留期判定在循环后统一做
                 continue
             host = await repo.get_host(s, inst.host_id)
             if host is None or not host.enabled:
@@ -219,16 +262,23 @@ async def scan_once(
                 await repo.set_instance_state(s, inst, "unhealthy")
             await maybe_auto_restart(s, inst, wstate, settings, runner, now)
 
+        # released 不在采集循环里，但保留期到了要自动终态化（§3/§6.4）
+        await _queue_due_purges(s, due_released, settings, runner, now)
+
 
 async def _recapture_after_auto_restart(
     s: AsyncSession, runtime: Any, inst: Instance,
     kind: str = "docker_auto_restarted", message: str = "检测到容器被自动重启，重抓登录密钥",
 ) -> None:
     try:
-        tok = await capture_token(s, runtime, inst, "logs")
+        res = await capture_token(s, runtime, inst, "logs")
     except TokenNotFound as exc:
         await repo.add_event(s, "token_recapture_failed", instance_id=inst.id,
                              message=redact_text(str(exc)), data={})
+        return
+    if not res.changed:
+        # §3 去重：值与库里最新一条相同 → 什么都不写、不记事件（自动路径静默，
+        # 这修掉了「事件流被获取密码刷满」）。
         return
     try:
         inst.dsh_version = await runtime.version(inst.container_name or inst.slug)
@@ -237,7 +287,7 @@ async def _recapture_after_auto_restart(
         pass
     await repo.add_event(
         s, kind, instance_id=inst.id, message=redact_text(message),
-        data=redact({"source": "logs", "url": tok.url, "token": tok.token}),
+        data=redact({"source": "logs", "url": res.url, "token": res.token}),
     )
 
 

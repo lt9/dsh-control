@@ -419,7 +419,10 @@ class JobRunner:
             else:
                 j.state = "failed"
                 j.error = error[:4000]
-                if inst and j.kind != "release":
+                # release/purge 失败不许把实例改判 error：它们的前态（released）
+                # 本身就是可停留状态，purge 还要能重跑或改走恢复（契约 §6.4
+                # 「记 error，可重跑」说的是工单）。deploy/restart 才落 error。
+                if inst and j.kind not in ("release", "purge"):
                     await repo.set_instance_state(s, inst, "error", last_error=error[:2000])
                 elif inst:
                     inst.last_error = error[:2000]

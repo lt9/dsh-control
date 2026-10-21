@@ -52,7 +52,7 @@ _ITEMS: list[dict[str, Any]] = [
         "help": "DSH 用它拼默认工作区，容器里没有 xdg-user-dir，必须显式配。"
                 "真实路径由 kit 的 new-instance.sh 决定："
                 "<DATA_ROOT>/dsh-family/<实例名>/data，所以 data_root 该给一个挂载点"
-                "（例如 /mnt/hdd2），别给已经带项目名的目录，否则会多出一层。",
+                "（例如 /srv/dsh），别给已经带项目名的目录，否则会多出一层。",
     },
     {
         "key": "DATA_DIR",

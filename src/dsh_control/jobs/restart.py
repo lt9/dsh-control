@@ -85,12 +85,15 @@ async def run_restart(ctx: JobCtx) -> None:
         )
         await ctx.s.commit()
 
-    # ---- 30 token_capture：重启后必须重新抓最新 token 落库
+    # ---- 30 token_capture：重启后必须重新抓最新 token（§3 去重：值没变不写不记）
     async with ctx.step(30, "token_capture", "重抓登录密钥"):
         tok = await capture_token(ctx.s, rt, inst, "restart")
-        await ctx.log("info", "已抓到重启后的最新一键地址")
-        await ctx.event("token_captured", "重启后重新抓到登录密钥",
-                        {"source": "restart", "url": tok.url, "token": tok.token})
+        if tok.changed:
+            await ctx.log("info", "已抓到重启后的最新一键地址")
+            await ctx.event("token_captured", "重启后重新抓到登录密钥",
+                            {"source": "restart", "url": tok.url, "token": tok.token})
+        else:
+            await ctx.log("info", "重启后密钥与库里最新值一致（未轮换）：不落新行、不记事件")
 
     # ---- 35 dsh_config：重启后把 DSH 生效配置刷新进快照（详情页那格的最新值）
     try:

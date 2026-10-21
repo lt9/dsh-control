@@ -27,6 +27,14 @@ export function Icon({ name, size = 14 }: { name: string; size?: number }) {
     case "power":    return <svg {...p}><path d="M8 2.6v5" /><path d="M4.4 4.6a4.8 4.8 0 1 0 7.2 0" /></svg>;
     case "search":   return <svg {...p}><circle cx="7" cy="7" r="4.4" /><path d="M10.4 10.4 14 14" /></svg>;
     case "release":  return <svg {...p}><path d="M8 2.8v6.6" /><path d="M5.4 6.8 8 9.4l2.6-2.6" /><path d="M3 12.6h10" /></svg>;
+    // 升级/重建：与 release 同一套笔画，箭头朝上（把这台原地抬起来），共用一条底线。
+    case "upgrade":  return <svg {...p}><path d="M8 12.4V4.2" /><path d="M5.4 6.8 8 4.2l2.6 2.6" /><path d="M3 2.8h10" /></svg>;
+    // 恢复：刷新那个圈反过来转——回到原来那台，不是重来一遍。
+    case "restore":  return <svg {...p}><path d="M3.4 8a4.6 4.6 0 1 0 1.6-3.5" /><path d="M3 2.6v2.6h2.6" /></svg>;
+    // 彻底释放：垃圾桶，比 release 那个「放下」更硬，因为它删的是数据目录。
+    case "purge":    return <svg {...p}><path d="M3.2 4.4h9.6" /><path d="M6.2 4.4V3.1h3.6v1.3" /><path d="M4.4 4.4l.7 8.5h5.8l.7-8.5" /><path d="M6.7 6.6v4M9.3 6.6v4" /></svg>;
+    // purged 的印记：圈上划一道——记录还在，东西没了。
+    case "void":     return <svg {...p}><circle cx="8" cy="8" r="5.2" /><path d="M4.6 11.4 11.4 4.6" /></svg>;
     default:         return null;
   }
 }
@@ -35,13 +43,15 @@ export function StateGlyph({ state }: { state: InstanceState }) {
   return <Icon name={STATE_META[state]?.glyph ?? "hollow"} size={12} />;
 }
 
-/** 印章式状态标签：直角细框 + 宽字距 + 几何点（色 + 形 + 文案三重冗余）。 */
+/** 印章式状态标签：直角细框 + 宽字距 + 几何点（色 + 形 + 文案三重冗余）。
+ *  purged 再加一道删除线——灰底上「已释放」和「已彻底释放」只差两个字，
+ *  扫读时得能一眼看出这条已经没有数据了（§9）。 */
 export function StateChip({ state, size = "md" }: { state: InstanceState; size?: "sm" | "md" }) {
   const m = STATE_META[state] ?? { zh: state, tone: "wait" as Tone, glyph: "hollow" };
   return (
-    <span className={`chip tone-${m.tone}${size === "sm" ? " chip-sm" : ""}`}>
+    <span className={`chip tone-${m.tone}${size === "sm" ? " chip-sm" : ""}${state === "purged" ? " chip-struck" : ""}`}>
       <StateGlyph state={state} />
-      {m.zh}
+      <span className="chip-text">{m.zh}</span>
     </span>
   );
 }
@@ -97,9 +107,12 @@ export function CopyButton({ text, label = "复制", big = false, title, provide
   );
 }
 
-/** 按住确认：1.5s 长按触发，松手即取消；按钮上是按压进度。 */
-export function HoldButton({ ms = 1500, disabled, onHold, children, holdLabel = "继续按住…" }: {
+/** 按住确认：1.5s 长按触发，松手即取消；按钮上是按压进度。
+ *  释放与彻底释放共用它（§9：危险动作用长按，不用打字）。 */
+export function HoldButton({ ms = 1500, disabled, onHold, children, holdLabel = "继续按住…",
+  ariaLabel = "按住 1.5 秒确认" }: {
   ms?: number; disabled?: boolean; onHold: () => void; children: ReactNode; holdLabel?: string;
+  ariaLabel?: string;
 }) {
   const [holding, setHolding] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -150,10 +163,47 @@ export function HoldButton({ ms = 1500, disabled, onHold, children, holdLabel = 
       onPointerUp={stop} onPointerLeave={stop} onPointerCancel={stop}
       onKeyDown={(e) => { if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); start(); } }}
       onKeyUp={(e) => { if (e.key === " " || e.key === "Enter") stop(); }}
-      aria-label="按住 1.5 秒确认释放">
+      aria-label={ariaLabel}>
       <span className="hold-bar" ref={barRef} aria-hidden />
       <span className="hold-label">{holding ? holdLabel : busy ? "已签字，正在执行…" : children}</span>
     </button>
+  );
+}
+
+/** 一屏后果卡（§9：危险与不可逆动作不弹窗套弹窗，一屏内把后果说完，零打字）。
+ *  释放/彻底释放用它（danger + 长按确认），升级/重建与恢复也用它（danger=false + 一次点击），
+ *  同一张卡、同一套排版——四种动作在详情页长得像一家人，用户不用重新学。 */
+export function ConsequenceCard({ title, no, head, rows, due, danger = true, hold = false,
+  confirmLabel, onConfirm, onCancel, busy = false, holdAriaLabel, footnote }: {
+  title: string; no?: string; head?: ReactNode;
+  rows: { cap: string; val: ReactNode }[];
+  due?: ReactNode; danger?: boolean; hold?: boolean;
+  confirmLabel: string; onConfirm: () => void; onCancel: () => void; busy?: boolean;
+  holdAriaLabel?: string; footnote?: ReactNode;
+}) {
+  return (
+    <div className={`slip${danger ? "" : " slip-safe"}`} role="group" aria-label={title}>
+      <div className="slip-title">
+        <h3>{title}</h3>
+        {no && <span className="no mono">{no}</span>}
+      </div>
+      {head && <p className="slip-due">{head}</p>}
+      <ul className="slip-rows">
+        {rows.map((r) => <li key={r.cap}><i>{r.cap}</i><span>{r.val}</span></li>)}
+      </ul>
+      {due && <p className="slip-due">{due}</p>}
+      <div className="slip-ops">
+        {hold ? (
+          <HoldButton onHold={onConfirm} disabled={busy} ariaLabel={holdAriaLabel}>{confirmLabel}</HoldButton>
+        ) : (
+          <button type="button" className="btn btn-primary btn-lg" disabled={busy} onClick={onConfirm}>
+            {busy ? "已提交，正在执行…" : confirmLabel}
+          </button>
+        )}
+        <button type="button" className="btn" disabled={busy} onClick={onCancel}>再想想</button>
+      </div>
+      {footnote && <p className="mut small" style={{ marginTop: 10 }}>{footnote}</p>}
+    </div>
   );
 }
 

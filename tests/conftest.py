@@ -257,9 +257,9 @@ class FakeExecutor:
             if pattern in command:
                 return result
         if "HostConfig.PortBindings" in command:
-            # 假主机上的容器一律监听 8080，发布到 4895。容器内监听端口只能问
+            # 假主机上的容器一律监听 8080，发布到 20003。容器内监听端口只能问
             # docker，别拿 .env 的 HOST_PORT 顶替（现网第 27 个缺陷）。
-            return ExecResult(0, "8080/tcp=4895 ", "")
+            return ExecResult(0, "8080/tcp=20003 ", "")
         if "dump-config" in command:
             # 安全门（domain/safety.py）读的是这份；测试要改就直接塞 handlers
             return ExecResult(0, SAFE_DUMP, "")
@@ -441,12 +441,15 @@ def make_settings(**over) -> Settings:
         "frps_upstream_host": "198.51.100.9",
         "public_base": "https://console.example.test",
         "provider_dns": "aliyun", "provider_frp": "frp_panel", "provider_ng": "nginxwebui",
-        "frp_port_start": 4893,
+        "frp_port_start": 20001,
         "dsh_image": "dsh-test:v9",
         # 443 站点必须带现成通配证书名（现网实测：ssl=0 的 443 面板配置过不了 nginx -t）
         "wildcard_cert_name": "*.example.test",
         # kit 的 compose 里 LLM_BASE_URL / LLM_API_KEY 必填，缺一个容器就拒启
         "llm_base_url": "https://llm.example.test:8000/v1",
+        # 假主机上默认存在一个假字体库目录（第 67 步铺字体的源；假执行器一律回 ok，
+        # 专门测「没配库/目录不存在」的用例自己改成空串或塞 LIB_MISSING 回执）
+        "font_library": "/srv/dsh-fonts",
         "wait_healthy_seconds": 1,
         "poll_interval": 1,
     }

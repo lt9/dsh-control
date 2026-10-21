@@ -53,7 +53,7 @@ UPSTREAM_FIXTURE = {"id": "1310000000000000000", "name": UP_NAME, "tactics": "",
                     "proxyType": 0, "monitor": 0, "descr": "dsh-control",
                     "seq": "1310000000000000000"}
 BACKEND_FIXTURE = {"id": "1310000000000000002", "upstreamId": "1310000000000000000",
-                   "server": "198.51.100.10", "port": 4894, "status": "none",
+                   "server": "198.51.100.10", "port": 20002, "status": "none",
                    "param": "", "monitorStatus": -1,
                    "createTime": 1792512721419, "updateTime": 1792512721419}
 LOCATION_FIXTURE = {
@@ -219,7 +219,7 @@ def test_header_host_with_port_is_refused_before_any_request(bad_host):
     api = FakeNg()
     with pytest.raises(IntegrationError) as ei:
         run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                    upstream_server="198.51.100.10:4894",
+                                    upstream_server="198.51.100.10:20002",
                                     cert_name=CERT, header_host=bad_host))
     assert ei.value.code == "header_host_port"
     assert api.requests == []   # 连 token 都不取，杜绝半写状态
@@ -228,7 +228,7 @@ def test_header_host_with_port_is_refused_before_any_request(bad_host):
 def test_location_payload_field_set_is_whitelist_subset():
     api = FakeNg(growth=True)
     run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                upstream_server="198.51.100.10:4894",
+                                upstream_server="198.51.100.10:20002",
                                 cert_name=CERT))
     loc = write_for(api, "/server/insertOrUpdateLocation")
     assert set(loc) <= LOCATION_PARAM_FIELDS          # 白名单外零字段
@@ -243,11 +243,11 @@ def test_foreign_site_names_never_touched():
     api = FakeNg()
     with pytest.raises(NotManaged):
         run(api.panel().ensure_site(server_name="chat.example.com", upstream_name=UP_NAME,
-                                    upstream_server="198.51.100.10:4894"))
+                                    upstream_server="198.51.100.10:20002"))
     with pytest.raises(NotManaged):
         run(api.panel().ensure_site(server_name="dsh.legacy-names.example.com",
                                     upstream_name=UP_NAME,
-                                    upstream_server="198.51.100.10:4894"))
+                                    upstream_server="198.51.100.10:20002"))
     with pytest.raises(NotManaged):
         run(api.panel().delete_site(9, expect_name="chat.example.com"))
     assert api.writes == []
@@ -265,7 +265,7 @@ def test_foreign_upstream_name_blocked():
 def test_ensure_site_fresh_creates_upstream_site_and_location():
     api = FakeNg(growth=True)   # 全空白，写完才长出
     site = run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                       upstream_server="198.51.100.10:4894",
+                                       upstream_server="198.51.100.10:20002",
                                        listen_port=443, cert_name=CERT))
     assert (site.server_id, site.upstream_id) == (1310000000000000001,
                                                   1310000000000000000)
@@ -275,7 +275,7 @@ def test_ensure_site_fresh_creates_upstream_site_and_location():
     assert "fullchain.cer" in srv["pem"] and srv["key"].endswith(".key")
     assert write_for(api, "/api/upstream/insertOrUpdate")["name"] == UP_NAME
     back = write_for(api, "/upstream/insertOrUpdateServer")
-    assert back["server"] == "198.51.100.10" and back["port"] == "4894"
+    assert back["server"] == "198.51.100.10" and back["port"] == "20002"
 
 
 def test_continuation_half_baked_writes_only_location():
@@ -283,7 +283,7 @@ def test_continuation_half_baked_writes_only_location():
     api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
                  backends=[dict(BACKEND_FIXTURE)], locations=[], growth=True)
     site = run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                       upstream_server="198.51.100.10:4894",
+                                       upstream_server="198.51.100.10:20002",
                                        cert_name=CERT))
     assert [p for p, _ in api.writes] == ["/api/server/insertOrUpdateLocation"]
     assert site.location_id == 1310000000000000003
@@ -293,7 +293,7 @@ def test_all_matching_writes_nothing():
     api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
                  backends=[dict(BACKEND_FIXTURE)], locations=[dict(LOCATION_FIXTURE)])
     site = run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                       upstream_server="198.51.100.10:4894",
+                                       upstream_server="198.51.100.10:20002",
                                        cert_name=CERT))
     assert api.writes == []                             # 全一致：一个字都不写
     assert (site.server_id, site.location_id) == (1310000000000000001,
@@ -310,7 +310,7 @@ def test_backend_address_change_updates_in_place_and_never_appends():
     api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
                  backends=[stale], locations=[dict(LOCATION_FIXTURE)], growth=True)
     site = run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                       upstream_server="198.51.100.10:4894",
+                                       upstream_server="198.51.100.10:20002",
                                        cert_name=CERT))
     back = write_for(api, "/upstream/insertOrUpdateServer")
     assert back is not None and str(back["id"]) == BACKEND_FIXTURE["id"]  # 带 id 改
@@ -328,7 +328,7 @@ def test_two_stale_backends_refuse_without_any_write():
                  backends=two, locations=[dict(LOCATION_FIXTURE)])
     with pytest.raises(IntegrationError) as got:
         run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                    upstream_server="198.51.100.10:4894",
+                                    upstream_server="198.51.100.10:20002",
                                     cert_name=CERT))
     assert got.value.code == "ng_backend_drift"
     assert api.writes == []
@@ -339,7 +339,7 @@ def test_location_pointing_elsewhere_is_updated_with_its_id():
     api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
                  backends=[dict(BACKEND_FIXTURE)], locations=[wrong], growth=True)
     run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                upstream_server="198.51.100.10:4894",
+                                upstream_server="198.51.100.10:20002",
                                 cert_name=CERT))
     loc = write_for(api, "/server/insertOrUpdateLocation")
     assert loc["id"] == LOCATION_FIXTURE["id"]          # 带原 id 更新，不新建
@@ -353,7 +353,7 @@ def test_write_then_reread_missing_location_raises_never_lies():
 
     async def go():
         await api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                      upstream_server="198.51.100.10:4894",
+                                      upstream_server="198.51.100.10:20002",
                                       cert_name=CERT)
 
     with pytest.raises(IntegrationError) as ei:
@@ -501,7 +501,7 @@ def test_dry_run_records_all_writes_and_sends_none():
                  backends=[dict(BACKEND_FIXTURE)], locations=[])
     panel = api.panel(dry_run=True, recorder=rec)
     site = run(panel.ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                 upstream_server="198.51.100.10:4894",
+                                 upstream_server="198.51.100.10:20002",
                                  cert_name=CERT))
     run(panel.reload())
     assert site.server_id == 0                       # 合成对象
@@ -518,7 +518,7 @@ def test_ensure_site_passes_token_header_on_writes():
     api = FakeNg(server=dict(SITE_FIXTURE), upstream=dict(UPSTREAM_FIXTURE),
                  backends=[dict(BACKEND_FIXTURE)], locations=[], growth=True)
     run(api.panel().ensure_site(server_name=SITE, upstream_name=UP_NAME,
-                                upstream_server="198.51.100.10:4894",
+                                upstream_server="198.51.100.10:20002",
                                 cert_name=CERT))
     for r in api.requests:
         if r.url.path.startswith("/api/"):

@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, type DshConfig, type TokenResp } from "../api/client";
-import { fmtBytes, fmtFull, fmtRel, maskMiddle, maskUrlToken } from "../lib/format";
+import { fmtBytes, fmtDate, fmtFull, fmtDaysLeft, fmtRel, maskMiddle, maskUrlToken } from "../lib/format";
 import { useAsync } from "../lib/hooks";
-import { CopyButton, HoldButton, Icon, Modal, StateChip } from "../components/ui";
+import { ConsequenceCard, CopyButton, Icon, Modal, StateChip } from "../components/ui";
+
+/** 详情页四种「有后果的动作」，同一时刻只摊开一张后果卡。 */
+type Op = "release" | "purge" | "upgrade" | "restore";
 
 export default function DetailPage() {
   const { id } = useParams();
   const nav = useNavigate();
   const [cfgOpen, setCfgOpen] = useState(false);
-  const [slipOpen, setSlipOpen] = useState(false);
+  const [op, setOp] = useState<Op | null>(null);
   const [showToken, setShowToken] = useState(false);
   const [renameFor, setRenameFor] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -25,7 +28,7 @@ export default function DetailPage() {
   const [dshErr, setDshErr] = useState<string | null>(null);
   const [dshBusy, setDshBusy] = useState(false);
 
-  // §9：每次进入 / 手动刷新都走 /token 强制现取——重启后密钥会变，这里是当前最新的。
+  // §9：进页面那一次走 /token 现取——重启后密钥会变，这里是当前最新的一份。
   const fetchToken = useCallback(async (): Promise<Partial<TokenResp> | null> => {
     if (!id) return null;
     setTokBusy(true); setTokErr(null);
@@ -38,7 +41,21 @@ export default function DetailPage() {
       return null;
     } finally { setTokBusy(false); }
   }, [id]);
-  useEffect(() => { void fetchToken(); }, [fetchToken]);
+  // §9：完整密钥只在「进页面那一次」和「用户自己点刷新 / 再取一次 / 点复制」时现取。
+  // 这一页没有定时器、没有 SSE，任何自动路径都不会去敲 /token（§3：watcher 也不抓）。
+  // 进页面那一次要等详情先回来——知道容器已经不在（released 停着 / purged 已删）
+  // 就不去敲这一枪：本来取不到，白挨一次 409，还会在页面上留一条没意义的「现取失败」。
+  const state = det.data?.state ?? null;
+  /** 容器不在的状态：released 停着（数据留着）、purged 已删（连数据目录都没了）。
+   *  这两态没有可抓的登录密钥，也不该再采运行态。 */
+  const containerGone = state === "released" || state === "purged";
+  const revealedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!state || revealedFor.current === state) return;
+    revealedFor.current = state;
+    if (containerGone) return;
+    void fetchToken();
+  }, [state, containerGone, fetchToken]);
 
   const refreshDsh = useCallback(async () => {
     if (!id) return;
@@ -51,10 +68,16 @@ export default function DetailPage() {
     } finally { setDshBusy(false); }
   }, [id, det.reload]);
 
-  const refreshAll = () => { void det.reload(); void events.reload(); void fetchToken(); };
+  // 手动「刷新」= 用户主动要一份最新的，这一次才再 reveal 一次（§9：不自动轮询）。
+  // 容器已经不在了的状态没什么可现取的，别去敲那一下。
+  const refreshAll = () => {
+    void det.reload(); void events.reload();
+    if (!containerGone) void fetchToken();
+  };
   const d = det.data;
   useEffect(() => { setDsh(d?.dsh_config ?? null); setDshErr(null); }, [d?.dsh_config]);
   const released = d?.state === "released";
+  const purged = d?.state === "purged";
 
   const doRestart = async () => {
     if (!d) return;
@@ -62,17 +85,30 @@ export default function DetailPage() {
     try { const r = await api.restart(d.id); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=restart`); }
     catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); }
   };
-  // 开通失败不是死路：重跑是续建，从失败那一步接着做，已建好的域名/隧道/站点会被跳过
-  const doDeploy = async () => {
+  /** deploy 是续建统一入口（§4）：开通失败续建 / 升级重建 / released 恢复，三种来路
+   *  都往这里走，差别只在文案与工单页标题。都不传 image——目标镜像就是站点当前 tag，
+   *  本期界面不做版本选择（§6.1）。 */
+  const doDeploy = async (opKind?: "upgrade" | "restore") => {
     if (!d) return;
     setBusy(true); setOpError(null);
-    try { const r = await api.deploy(d.id); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=deploy`); }
-    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); }
+    try {
+      const r = await api.deploy(d.id);
+      nav(`/jobs/${r.job_id}?instance=${d.id}&kind=deploy${opKind ? `&op=${opKind}` : ""}`);
+    }
+    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); setOp(null); }
   };
   const doRelease = async () => {
     if (!d) return;
+    setBusy(true); setOpError(null);
     try { const r = await api.release(d.id, d.slug); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=release`); }
-    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setSlipOpen(false); }
+    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); setOp(null); }
+  };
+  /** 彻底释放：confirm=slug 由前端填（§4），用户不打字，防误靠按住 1.5 秒。 */
+  const doPurge = async () => {
+    if (!d) return;
+    setBusy(true); setOpError(null);
+    try { const r = await api.purge(d.id, d.slug); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=purge`); }
+    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); setOp(null); }
   };
 
   if (det.loading && !d) {
@@ -100,6 +136,19 @@ export default function DetailPage() {
   const shownToken = fullToken ? (showToken ? fullToken : maskMiddle(fullToken)) : (d.access?.token_masked ?? null);
   const label = d.owner_label;
   const cfgItems = d.config?.items ?? [];
+  // actions 由服务端算（§4）；万一后端还没给这一组，退化成「什么都不给点」，
+  // 而不是让详情页整页白掉——台账页看不到这台，比页面崩了有用。
+  const acts = d.actions ?? { restart: false, release: false };
+  const canUpgrade = acts.upgrade === true && (d.state === "running" || d.state === "unhealthy");
+  const canRestore = acts.restore === true && released;
+  const canPurge = acts.purge === true && released;
+  // 开通失败续建：契约 §4 的示例 actions 里没有 deploy 这一键，老前端一直靠它。
+  // 后端没给就按状态自己判——error/pending 且没有别的可用动作时，这就是那台「重新开通」。
+  const canRetry = acts.deploy === true
+    || (acts.deploy === undefined && (d.state === "error" || d.state === "pending"));
+  const port = d.network?.frp_remote_port ?? null;
+  const dueDate = fmtDate(d.purge_after);
+  const dueLeft = fmtDaysLeft(d.purge_after);
 
   return (
     <main className="shell">
@@ -110,8 +159,8 @@ export default function DetailPage() {
         <span className="id">{d.slug}</span>
         {renameFor === null
           ? <span className="label">
-              {label ?? <span className="mut small">未备注 · 点铅笔给他起个名</span>}
-              {!released && (
+              {label ?? <span className="mut small">{purged ? "未备注" : "未备注 · 点铅笔给他起个名"}</span>}
+              {!purged && (
                 <button type="button" className="btn btn-ghost btn-icon" aria-label="改备注名"
                   onClick={() => setRenameFor(label ?? "")}><Icon name="pencil" size={13} /></button>
               )}
@@ -140,8 +189,10 @@ export default function DetailPage() {
               {d.access?.captured_at && <span className="mut small mono" title={fmtFull(d.access.captured_at)}>上次取到 {fmtRel(d.access.captured_at)}</span>}
             </div>
             <div className="card-body">
-              {released ? (
-                <p className="mut small">实例已释放，公网入口已注销，没有可用的登录地址。</p>
+              {purged ? (
+                <p className="mut small">这台已彻底释放：容器和数据目录都删了，没有可登录的地址，密钥也随数据一起没了。</p>
+              ) : released ? (
+                <p className="mut small">实例已释放，公网入口已注销，现在没有可用的登录地址。恢复回来还是这个域名。</p>
               ) : (<>
                 {tokErr && !fullUrl && <div className="alert alert-warn"><Icon name="triangle" /><span>现取失败：{tokErr}。下面是库里最后一次取到的（打码）。</span></div>}
                 <div className="secret-row">
@@ -188,8 +239,12 @@ export default function DetailPage() {
               {d.runtime?.captured_at && <span className="mut small" title={fmtFull(d.runtime.captured_at)}>采集于 {fmtRel(d.runtime.captured_at)}</span>}
             </div>
             <div className="card-body">
-              {released || !d.runtime ? (
-                <p className="mut small">{released ? "已释放：容器只停不删，不再采集。" : "还没采到运行态。"}</p>
+              {containerGone || !d.runtime ? (
+                <p className="mut small">
+                  {purged ? "已彻底释放：容器已删除，不再采集。"
+                    : released ? "已释放：容器只停不删，不再采集。"
+                    : "还没采到运行态。"}
+                </p>
               ) : (
                 <dl className="kv">
                   <dt>容器</dt><dd>{d.runtime.docker_state === "running" ? "在跑" : d.runtime.docker_state === "exited" ? "已停止" : d.runtime.docker_state}</dd>
@@ -213,17 +268,21 @@ export default function DetailPage() {
               <h2>DSH 配置</h2>
               <span className="mut small">{dsh ? `读取于 ${dsh.captured_at}` : "未读取"}</span>
               <span className="spacer" />
-              <button type="button" className="btn btn-sm" onClick={() => void refreshDsh()}
-                disabled={dshBusy} aria-busy={dshBusy}
-                title="进容器读一次实际生效的配置（约 1 秒）">
-                <Icon name="refresh" size={14} />{dshBusy ? "读取中…" : "重新读取"}
-              </button>
+              {!containerGone && (
+                <button type="button" className="btn btn-sm" onClick={() => void refreshDsh()}
+                  disabled={dshBusy} aria-busy={dshBusy}
+                  title="进容器读一次实际生效的配置（约 1 秒）">
+                  <Icon name="refresh" size={14} />{dshBusy ? "读取中…" : "重新读取"}
+                </button>
+              )}
             </div>
             <div className="card-body">
-              {dshErr && <p className="mut small" role="alert" style={{ color: "var(--bad)" }}>{dshErr}</p>}
+              {dshErr && <p className="mut small" role="alert" style={{ color: "var(--err)" }}>{dshErr}</p>}
               {!dsh && !dshErr && (
                 <p className="mut small">
-                  这台实例还没读过 DSH 内部的配置（旧快照）。点「重新读取」进容器读一次实际生效的值。
+                  {containerGone
+                    ? "这台没有配置快照可读：容器已经不在了。"
+                    : "这台实例还没读过 DSH 内部的配置（旧快照）。点「重新读取」进容器读一次实际生效的值。"}
                 </p>
               )}
               {dsh && dsh.groups.map((g) => (
@@ -278,6 +337,11 @@ export default function DetailPage() {
               <dt>DNS 记录</dt><dd className="mono">{d.network?.dns_record_id ?? "—"}</dd>
               <dt>状态机</dt><dd className="mono">{d.state} → {d.desired_state}</dd>
               {d.released_at && <><dt>释放于</dt><dd className="num">{fmtFull(d.released_at)}</dd></>}
+              {d.purge_after && <>
+                <dt>保留期至</dt>
+                <dd className="num">{dueDate}{dueLeft ? <span className="mut small">（{dueLeft}）</span> : null}</dd>
+              </>}
+              {d.purged_at && <><dt>彻底释放于</dt><dd className="num">{fmtFull(d.purged_at)}</dd></>}
             </dl>
           </details>
         </div>
@@ -287,49 +351,133 @@ export default function DetailPage() {
           <section className="card" aria-label="操作">
             <div className="card-head"><h2>操作</h2></div>
             <div className="card-body">
-              {released ? (
-                <p className="mut small">已释放的实例只留档案：公网入口已注销、容器已停止（数据还在），没有恢复入口。</p>
-              ) : (
+              {purged ? (
+                /* purged = 只读档案：一个动作按钮都不给（§9）。历史照常看，就在下面这张卡。 */
+                <p className="mut small">
+                  {"已彻底释放：容器、数据目录和外部对象都删干净了，"}<b>不可恢复</b>{"。这一条只当档案留着——它做过什么，看下面的事件与台账明细。"}
+                </p>
+              ) : (<>
                 <div className="actions">
-                  {d.actions.deploy && (
-                    <button type="button" className="btn btn-primary btn-lg" disabled={busy} onClick={doDeploy}
+                  {canRetry && (
+                    <button type="button" className="btn btn-primary btn-lg" disabled={busy || op !== null}
+                      onClick={() => void doDeploy()}
                       title="从失败的那一步接着建：已建好的域名、隧道、反代会跳过，不会重复创建">
                       <Icon name="plus" />重新开通
                     </button>
                   )}
-                  <button type="button" className="btn btn-lg" disabled={!d.actions.restart || busy} onClick={doRestart}
-                    title="重启会轮换登录密钥，新密钥自动抓回">
-                    <Icon name="power" />重启
-                  </button>
-                  <button type="button" className="btn btn-danger btn-lg" disabled={!d.actions.release || slipOpen}
-                    onClick={() => setSlipOpen(true)}>
-                    <Icon name="release" />释放…
-                  </button>
-                  {!d.actions.restart && !released && <span className="mut small" style={{ alignSelf: "center" }}>当前状态不可重启</span>}
+                  {canUpgrade && (
+                    <button type="button" className="btn btn-lg" disabled={busy || op !== null}
+                      onClick={() => setOp("upgrade")}
+                      title="用站点当前的镜像标签原地重建这台容器：数据不动，登录链接不变，会话会断一下">
+                      <Icon name="upgrade" />升级 / 重建
+                    </button>
+                  )}
+                  {!containerGone && (
+                    <button type="button" className="btn btn-lg" disabled={!acts.restart || busy || op !== null}
+                      onClick={doRestart}
+                      title="重启会轮换登录密钥，新密钥自动抓回">
+                      <Icon name="power" />重启
+                    </button>
+                  )}
+                  {canRestore && (
+                    <button type="button" className="btn btn-primary btn-lg" disabled={busy || op !== null}
+                      onClick={() => setOp("restore")}
+                      title="重建解析、隧道与反代，把停着的容器起回来：还是这个域名，数据原样">
+                      <Icon name="restore" />恢复实例
+                    </button>
+                  )}
+                  {acts.release && !released && (
+                    <button type="button" className="btn btn-danger btn-lg" disabled={busy || op !== null}
+                      onClick={() => setOp("release")}>
+                      <Icon name="release" />释放…
+                    </button>
+                  )}
+                  {canPurge && (
+                    <button type="button" className="btn btn-danger btn-lg" disabled={busy || op !== null}
+                      onClick={() => setOp("purge")}
+                      title="删容器、删数据目录，不可恢复">
+                      <Icon name="purge" />彻底释放…
+                    </button>
+                  )}
+                  {!acts.restart && !acts.release && !canUpgrade && !canRetry && !released && !purged && (
+                    <span className="mut small" style={{ alignSelf: "center" }}>当前状态没有可执行的操作</span>
+                  )}
+                  {released && !canRestore && !canPurge && (
+                    <p className="mut small">已释放：容器停着、数据留着，但接口说这台既不能恢复也不能彻底释放。</p>
+                  )}
                 </div>
-              )}
 
-              {slipOpen && !released && (
-                <div className="slip" role="group" aria-label="释放放行条">
-                  <div className="slip-title">
-                    <h3>释 放 放 行 条</h3>
-                    <span className="no mono">NO.{String(d.id).padStart(4, "0")} · {d.slug}</span>
-                  </div>
-                  <ul className="slip-rows">
-                    <li><i>注销解析</i><span className="mono">A {d.network?.dns_name ?? d.slug} → RecordId {d.network?.dns_record_id ?? "—"}</span></li>
-                    <li><i>注销隧道</i><span className="mono">frp 公网 {d.network?.frp_remote_port ?? "—"} · 隧道 id {d.network?.frp_proxy_id ?? "—"}</span></li>
-                    <li><i>注销站点</i><span className="mono">nginx {d.network?.public_url ?? d.network?.dns_name ?? "—"}</span></li>
-                    <li><i>停止容器</i><span>只 <span className="mono">stop</span>，不删容器、不碰数据目录和镜像</span></li>
-                  </ul>
-                  <p className="slip-due">
-                    签字之后<b>不可恢复</b>：他从今往后打不开这个地址；台账里这条永远灰着，只当档案。
-                  </p>
-                  <div className="slip-ops">
-                    <HoldButton onHold={doRelease}>按住签字释放</HoldButton>
-                    <button type="button" className="btn" onClick={() => setSlipOpen(false)}>再想想</button>
-                  </div>
-                </div>
-              )}
+                {/* 一屏后果卡：点开哪个动作就摊开哪张，零打字（§9）。
+                    释放与彻底释放要长按 1.5 秒，升级/重建与恢复一次点击。 */}
+                {op === "release" && (
+                  <ConsequenceCard
+                    title="释放放行条" no={`NO.${String(d.id).padStart(4, "0")} · ${d.slug}`}
+                    rows={[
+                      { cap: "注销解析", val: <span className="mono">A {d.network?.dns_name ?? d.slug} → RecordId {d.network?.dns_record_id ?? "—"}</span> },
+                      { cap: "注销隧道", val: <span className="mono">frp 公网 {d.network?.frp_remote_port ?? "—"} · 隧道 id {d.network?.frp_proxy_id ?? "—"}</span> },
+                      { cap: "注销站点", val: <span className="mono">nginx {d.network?.public_url ?? d.network?.dns_name ?? "—"}</span> },
+                      { cap: "停止容器", val: <span>只 <span className="mono">stop</span>，不删容器、不碰数据目录和镜像</span> },
+                    ]}
+                    due={<>签字之后他立刻打不开这个地址。容器只停不删、数据原样留着，保留期内在这一页可以一键恢复；<b>到期还没恢复的，系统会自动彻底释放</b>。</>}
+                    hold confirmLabel="按住签字释放" holdAriaLabel="按住 1.5 秒确认释放"
+                    onConfirm={doRelease} onCancel={() => setOp(null)} busy={busy}
+                  />
+                )}
+
+                {op === "purge" && (
+                  <ConsequenceCard
+                    title="彻底释放" no={`NO.${String(d.id).padStart(4, "0")} · ${d.slug}`}
+                    head={d.purge_after
+                      ? (dueLeft === "已到期"
+                        ? <>保留期已于 <b className="num">{dueDate}</b> 期满，系统随时可能自动执行同样的操作。</>
+                        : <>保留期至 <b className="num">{dueDate}</b>（{dueLeft}），到期后系统会自动执行同样的操作。</>)
+                      : <>保留期满之后，系统会自动执行同样的操作。</>}
+                    rows={[
+                      { cap: "删除容器", val: <span>连正在跑的一起 <span className="mono">docker rm</span>；镜像不动</span> },
+                      { cap: "删除数据目录", val: <span>这台的全部用户数据，<b>含备份归档与全部历史</b>，一起删掉</span> },
+                      { cap: "补删外部对象", val: <span>解析 / 隧道 / 反代站点，凡是还挂着记录的逐个补删干净</span> },
+                      { cap: "保留的东西", val: <span>只有台账这一条：它的工单与事件照常可看</span> },
+                    ]}
+                    due={<><b>不可恢复。</b>要再用只能新建一台，数据不会回来。</>}
+                    hold confirmLabel="按住签字彻底释放" holdAriaLabel="按住 1.5 秒确认彻底释放"
+                    onConfirm={doPurge} onCancel={() => setOp(null)} busy={busy}
+                  />
+                )}
+
+                {op === "upgrade" && (
+                  <ConsequenceCard
+                    danger={false}
+                    title="升级 / 重建" no={`NO.${String(d.id).padStart(4, "0")} · ${d.slug}`}
+                    rows={[
+                      { cap: "做什么", val: <span>用站点当前的镜像标签把这台容器<b>原地重建</b>一次（不是 <span className="mono">restart</span>，换镜像必须重建才生效）</span> },
+                      { cap: "目标镜像", val: <span className="mono" title="镜像是事先构建好传到那台机器上的，控制台不构建；这一期不做版本选择，目标就是站点配置的那个标签">
+                        {d.image_tag ?? "站点当前标签"}<span className="mut small"> · 站点当前版本，不用选</span></span> },
+                      { cap: "会断什么", val: <span>正在跑的会话断一下，重开就好</span> },
+                      { cap: "不动什么", val: <span>数据目录一个字不动；域名、公网端口、反代都不重建</span> },
+                      { cap: "登录链接", val: <span>不变，密钥也不轮换——现在这串地址重建完照样能用</span> },
+                    ]}
+                    due={<>同实例原地重建，不会新建第二台，也不迁数据。</>}
+                    confirmLabel={busy ? "已提交，正在执行…" : "确认重建"}
+                    onConfirm={() => void doDeploy("upgrade")} onCancel={() => setOp(null)} busy={busy}
+                  />
+                )}
+
+                {op === "restore" && (
+                  <ConsequenceCard
+                    danger={false}
+                    title="恢复实例" no={`NO.${String(d.id).padStart(4, "0")} · ${d.slug}`}
+                    rows={[
+                      { cap: "重新解析", val: <span className="mono">A {d.network?.dns_name ?? d.slug}（还是这个域名）</span> },
+                      { cap: "重开隧道", val: <span>frp 公网端口尽量找回原来那个{port != null ? <span className="mono"> {port}</span> : null}；被占了就换一个，域名不受影响</span> },
+                      { cap: "重建站点", val: <span className="mono">nginx {d.network?.public_url ?? d.network?.dns_name ?? "—"}（upstream 名照旧）</span> },
+                      { cap: "起回容器", val: <span>同一个数据目录、同一个容器名，<b>数据原样</b></span> },
+                    ]}
+                    due={<>还是这一台、还是这个域名，不新建第二台。恢复之后保留期不再倒计时，到期自动彻底释放那条也不再触发。</>}
+                    confirmLabel={busy ? "已提交，正在执行…" : "开始恢复"}
+                    onConfirm={() => void doDeploy("restore")} onCancel={() => setOp(null)} busy={busy}
+                  />
+                )}
+              </>)}
             </div>
           </section>
 

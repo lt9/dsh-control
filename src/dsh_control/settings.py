@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     image_backup_url: str = ""        # DSHC_IMAGE_BACKUP_URL：备用入口，主入口不通时自动换
     team_max_members: int = 4         # DSHC_TEAM_MAX_MEMBERS：智能体团队人数上限
 
+    # ---- 字体（开通第 67 步「铺字体」的源；站点配置，不是凭据，不进 credentials）
+    # 站点字体库目录：实例宿主机上的绝对路径，开通时 cp -n 进实例 DATA_DIR 的
+    # home/.fonts（Word→PDF 两条转换路共同认的投递口）。留空 = 不铺，步骤标 skipped。
+    font_library: str = ""            # DSHC_FONT_LIBRARY：站点字体库目录（绝对路径）
+
     # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
     # 默认部署镜像标签（准备好的版本，如 registry.local/dsh:stable）
     dsh_image: str = Field(default="",
@@ -90,6 +95,10 @@ class Settings(BaseSettings):
     poll_interval: int = 30              # 秒
     unhealthy_threshold: int = 3         # 连续失败次数（契约 §3 固定 3）
     wait_healthy_seconds: int = 120      # 重启后等待健康上限
+    # released 保留天数（契约 §3/§6.4）：到期 watcher 自动入队 purge。
+    # 库里的 site 行优先（site.toml [site].purge_after_days 落库，watcher 每轮现读），
+    # 这里只是 env 兜底默认值。
+    purge_after_days: int = 15           # DSHC_PURGE_AFTER_DAYS
 
     dry_run: bool = False
 
@@ -122,8 +131,9 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
         "wildcard_cert_name": "wildcard_cert_name",
         "llm_base_url": "llm_base_url", "llm_model_id": "llm_model_id",
         "image_api_url": "image_api_url", "image_backup_url": "image_backup_url",
-        "team_max_members": "team_max_members",
+        "team_max_members": "team_max_members", "font_library": "font_library",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
+        "purge_after_days": "purge_after_days",
     }
     for src, dst in mapping.items():
         if site.get(src) not in (None, ""):
