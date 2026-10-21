@@ -92,6 +92,34 @@ async def test_events_never_contain_plaintext_token(env):
     assert "token_captured" in kinds
 
 
+async def test_reveal_dedupes_rows_and_events(env):
+    """§3 去重：reveal 抓到与库里最新一条相同的值 → 不落库、不记事件，
+    但照常 200 返回现取值。连续 reveal 两次未变：库里仍一条、事件仍一条。"""
+    from sqlalchemy import select
+
+    from dsh_control.db.models import Event, InstanceToken
+
+    body = await deploy(env)
+    iid = body["instance_id"]
+    tok = env.runtime.token
+
+    r1 = await env.client.get(f"/api/instances/{iid}/token", headers=XRW)
+    assert r1.status_code == 200
+    assert r1.json()["token"] == tok, "未变化也要照常 200 给现取值"
+    r2 = await env.client.get(f"/api/instances/{iid}/token", headers=XRW)
+    assert r2.status_code == 200 and r2.json()["token"] == tok
+
+    async with env.db.session() as s:
+        rows = list((await s.scalars(select(InstanceToken))).all())
+        caps = [e for e in (await s.scalars(select(Event))).all()
+                if e.kind == "token_captured"]
+    assert len(rows) == 1, "值没变不许堆重复行"
+    assert rows[0].token == tok
+    assert len(caps) == 1, "事件仍一条（deploy 第 70 步那条），reveal 未变不记"
+    # 响应里的 url 与 token 一致可用
+    assert tok in r2.json()["url"]
+
+
 async def test_token_not_found_returns_502(env):
     body = await deploy(env)
     iid = body["instance_id"]

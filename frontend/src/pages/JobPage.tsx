@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, type InstanceDetail, type Step } from "../api/client";
-import { JOB_META, JOB_STATE_META, STEP_STATE_META, fmtClock } from "../lib/format";
+import { api, type InstanceDetail, type JobPurpose, type Step } from "../api/client";
+import { JOB_META, JOB_STATE_META, PURPOSE_META, STEP_STATE_META, fmtClock } from "../lib/format";
 import { useJobFeed } from "../lib/hooks";
 import { CopyButton, Icon, ToneChip } from "../components/ui";
 
@@ -15,6 +15,11 @@ export default function JobPage() {
   // 否则 DonePanel 不渲染，已回收的实例也就无从显示"地址已失效"的提示。
   const instanceId = q.get("instance") ? Number(q.get("instance")) : (job?.instance_id ?? null);
   const kind = ((q.get("kind") ?? job?.kind) as keyof typeof JOB_META) || "deploy";
+  // 同一个 deploy 工单有三种来路（新建 / 升级重建 / 恢复）。来路**先看工单响应里的
+  // purpose**（§4：服务端入队时按当时状态定死）；URL 上的 ?op= 只给 purpose 落地之前的
+  // 旧链接兜底——手敲或分享的链接没有它，也照样能靠工单自己说对话。
+  const purpose: JobPurpose | null = job?.purpose ?? (q.get("op") as JobPurpose | null) ?? null;
+  const title = (kind === "deploy" && purpose ? PURPOSE_META[purpose]?.zh : null) ?? JOB_META[kind]?.zh ?? "任务";
   const done = job?.state === "succeeded" || job?.state === "failed";
   const meta = JOB_STATE_META[job?.state ?? "pending"];
 
@@ -24,7 +29,7 @@ export default function JobPage() {
         <Icon name="back" size={13} />回台账
       </button>
       <div className="job-head">
-        <h1>{JOB_META[kind]?.zh ?? "任务"} · 工单 #{id}</h1>
+        <h1>{title} · 工单 #{id}</h1>
         <ToneChip tone={meta.tone}>{meta.zh}</ToneChip>
         {instanceId && (
           <button type="button" className="btn btn-ghost" onClick={() => nav(`/instances/${instanceId}`)}>
@@ -38,7 +43,7 @@ export default function JobPage() {
       )}
 
       {job?.state === "succeeded" && kind === "deploy" && instanceId && (
-        <DonePanel instanceId={instanceId} />
+        <DonePanel instanceId={instanceId} purpose={purpose} />
       )}
       {job?.state === "succeeded" && kind === "restart" && instanceId && (
         <DonePanel instanceId={instanceId} restart />
@@ -46,7 +51,15 @@ export default function JobPage() {
       {job?.state === "succeeded" && kind === "release" && (
         <div className="card done-panel">
           <h2>已释放</h2>
-          <p className="mut">解析、隧道、站点已注销；容器已停止，数据原样保留。台账里这条档案永远可见，但不可恢复。</p>
+          <p className="mut">解析、隧道、站点已注销；容器已停止，数据原样保留。<br />
+            保留期内在这一台的详情页可以一键恢复；到期还没恢复，系统会自动彻底释放，那时才不可恢复。</p>
+        </div>
+      )}
+      {job?.state === "succeeded" && kind === "purge" && (
+        <div className="card done-panel">
+          <h2>已彻底释放</h2>
+          <p className="mut">容器与数据目录（含备份归档）都已删除，外部对象补删干净，不可恢复。<br />
+            台账这一条与它的工单、事件都留着，只读——要再用只能新建一台。</p>
         </div>
       )}
       {job?.state === "failed" && (
@@ -160,8 +173,10 @@ function LogPanel({ logs, transport, running }: {
   );
 }
 
-/** 部署完成：大字给可复制的一键登录地址。 */
-function DonePanel({ instanceId, restart = false }: { instanceId: number; restart?: boolean }) {
+/** 干完一件事之后的大字面板：新建给一键地址，升级/恢复给"还是那串"，重启给新密钥。 */
+function DonePanel({ instanceId, restart = false, purpose = null }: {
+  instanceId: number; restart?: boolean; purpose?: JobPurpose | null;
+}) {
   const [det, setDet] = useState<InstanceDetail | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -176,7 +191,7 @@ function DonePanel({ instanceId, restart = false }: { instanceId: number; restar
         setDet(d);
         // 已回收的实例没有可用的公网入口，别再"现取一键地址"（容器已停，取到也是死链，
         // 还会让外行以为这串地址照样能用）。
-        if (d.state === "released") return;
+        if (d.state === "released" || d.state === "purged") return;
         const t = await api.token(instanceId);
         setUrl(t.url ?? null);
       } catch (e) {
@@ -185,17 +200,27 @@ function DonePanel({ instanceId, restart = false }: { instanceId: number; restar
     })();
   }, [instanceId]);
 
-  const gone = det?.state === "released";
+  const gone = det?.state === "released" || det?.state === "purged";
+  const heading = restart ? "已重启，密钥已换新"
+    : purpose === "upgrade" ? "已重建完成"
+    : purpose === "restore" ? "已恢复"
+    : "开通完成";
+  const lead = restart ? "旧密钥已失效，下面这串是新的。"
+    : purpose === "upgrade" ? "数据没动、地址没变、密钥也没轮换——原来那串继续用。"
+    : purpose === "restore" ? "还是原来那个域名。下面这串是刚现取的，直接发给他。"
+    : "把这串地址发给他：手机打开就能用，不用再登录。";
 
   return (
     <div className="card done-panel" style={{ marginBottom: 16 }}>
-      <h2>{restart ? "已重启，密钥已换新" : "开通完成"}</h2>
-      {!gone && <p className="mut small">{restart ? "旧密钥已失效，下面这串是新的。"
-        : "把这串地址发给他：手机打开就能用，不用再登录。"}</p>}
+      <h2>{heading}</h2>
+      {!gone && <p className="mut small">{lead}</p>}
       {det && <p className="small">{det.owner_label || det.slug} · <span className="mono">{det.network?.dns_name}</span></p>}
       {gone
-        ? <p className="mut small" style={{ marginTop: 12 }}>这台已回收：公网入口注销、容器已停，
-            地址不再有效（数据还在，档案留着）。</p>
+        ? <p className="mut small" style={{ marginTop: 12 }}>
+            {det?.state === "purged"
+              ? "这台已彻底释放：容器与数据目录都删了，地址不再有效，台账里只留档案。"
+              : "这台已回收：公网入口注销、容器已停，地址不再有效（数据还在，保留期内可恢复）。"}
+          </p>
         : url
         ? <>
             <code className="big-url">{url}</code>

@@ -1,6 +1,6 @@
 // 时间与状态语义。所有时间一律按 Asia/Shanghai 显示（§9）。
 
-import type { InstanceState, JobKind, JobState, StepState } from "../api/client";
+import type { InstanceState, JobKind, JobPurpose, JobState, StepState } from "../api/client";
 
 const TZ = "Asia/Shanghai";
 
@@ -51,8 +51,32 @@ export function fmtBytes(n: number | null | undefined): string {
   return `${Math.round(n / 1e3)} KB`;
 }
 
+const dateFmt = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+/** 只到日的日期，形状就是契约里写的 YYYY-MM-DD（§4 的 purge_after 文案要用它）。 */
+export function fmtDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : dateFmt.format(d);
+}
+
+/** 保留期还剩几天（向上取整：还剩 3 小时也说「还剩 1 天」，不写成 0 天吓人）。
+ *  到期之后系统自己会动手，所以这里说「已到期」而不是「剩 0 天」。 */
+export function fmtDaysLeft(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return null;
+  const diff = t - Date.now();
+  if (diff <= 0) return "已到期";
+  return `还剩 ${Math.ceil(diff / 86_400_000)} 天`;
+}
+
 /** 状态语义全站唯一：running 绿 / unhealthy·restarting 琥珀 / error 红 / released 灰（§9）。
- *  tone 决定颜色，glyph 决定形状——颜色之外再叠一层形状冗余，不单靠色。 */
+ *  tone 决定颜色，glyph 决定形状——颜色之外再叠一层形状冗余，不单靠色。
+ *  purged 与 released 同为灰，靠 glyph（空圈加斜杠）+「删除态」文案分开：
+ *  一个是停着等恢复，一个是连数据目录都没了，扫读时不能混。 */
 export type Tone = "ok" | "warn" | "err" | "off" | "live" | "wait";
 export const STATE_META: Record<InstanceState, { zh: string; tone: Tone; glyph: string }> = {
   running:    { zh: "运行中", tone: "ok",   glyph: "round" },
@@ -60,6 +84,7 @@ export const STATE_META: Record<InstanceState, { zh: string; tone: Tone; glyph: 
   restarting: { zh: "重启中", tone: "warn", glyph: "triangle" },
   error:      { zh: "故障",   tone: "err",  glyph: "cross" },
   released:   { zh: "已释放", tone: "off",  glyph: "hollow" },
+  purged:     { zh: "已彻底释放", tone: "off", glyph: "void" },
   deploying:  { zh: "部署中", tone: "live", glyph: "half" },
   pending:    { zh: "待部署", tone: "wait", glyph: "hollow" },
 };
@@ -68,6 +93,16 @@ export const JOB_META: Record<JobKind, { zh: string }> = {
   deploy: { zh: "开通部署" },
   restart: { zh: "重启" },
   release: { zh: "释放" },
+  purge: { zh: "彻底释放" },
+};
+
+/** deploy 工单的来路（§4：服务端入队时按当时状态定死，工单页据此出标题与完成文案，
+ *  不靠 URL 猜）。同一个 deploy 工单三种来路，标题要是都写「开通部署」，点「升级 / 重建」
+ *  跳过去看着像又开了一台新的。 */
+export const PURPOSE_META: Record<JobPurpose, { zh: string }> = {
+  create: { zh: "开通部署" },
+  upgrade: { zh: "升级 / 重建" },
+  restore: { zh: "恢复实例" },
 };
 
 export const JOB_STATE_META: Record<JobState, { zh: string; tone: Tone }> = {

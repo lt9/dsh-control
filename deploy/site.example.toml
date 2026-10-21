@@ -6,6 +6,13 @@ dns_zone = "example.com"
 domain_prefix = "dsh-"               # 一级子域，受证书通配层级约束
 frp_port_start = 20000
 dsh_image = "dsh-family:local"
+# 可选：站点字体库目录（**实例宿主机上**的绝对路径，此处仅为形态示例）。
+# 开通第 67 步把里面的文件 cp -n 进实例 DATA_DIR 的 home/.fonts（同名不覆盖）；
+# 留空或目录不存在 = 跳过铺字体，不影响开通。
+font_library = "/srv/dsh-fonts"
+# 可选：释放后数据保留天数（默认 15）。到期 watcher 自动入队彻底释放（purge）：
+# 删容器、删数据目录，不可恢复。对应 DSHC_PURGE_AFTER_DAYS，库里的站点值优先。
+purge_after_days = 15
 
 [providers]                           # 换厂商只改这里，见下
 dns = "aliyun"                        # aliyun | noop

@@ -9,6 +9,7 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -163,28 +164,46 @@ async def _llm_material(ctx: JobCtx) -> dict[str, str]:
             "search_key": str(secret.get("search_api_key") or "").strip()}
 
 
-async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any) -> tuple[int, Any | None]:
+async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any,
+                              inst: Any) -> tuple[int, Any | None]:
     """续建先认出自己的隧道，再考虑挑新端口；返回 (端口, 复用到的隧道)。
 
-    端口探测器只知道"4894 被占了"，不知道占着它的就是我们自己上次建的那条隧道，
+    端口探测器只知道"20002 被占了"，不知道占着它的就是我们自己上次建的那条隧道，
     于是每次续建都往上加一个端口，接着被 ensure 的「隧道已存在但端口不一致，拒绝
     改动既有隧道」挡死（2026-10-21 现网：起点端口别人在用、下一个是我们自己的另一条隧道、
     再下一个是新挑的）。指向别的机器的隧道一律拒绝复用，那种才是真冲突。
+
+    恢复场景（§6.3.1）：隧道已随释放删掉，但库里 `frp_remote_port` 是特意保留不
+    复用的——别的实例挑端口时永远避开它，正主回来先探一次占用再赎回，原公网端口
+    与原域名一起回来（§9「原域名原端口回来」）。被占才回落原分配逻辑，并 event
+    说破换了端口。
     """
-    if _manual(ctx, "frp"):
-        return await _pick_frp_port(ctx), None
-    prior = await ctx.frp().find_by_name(names.tunnel, host.frpc_client_id)
-    if prior is None:
-        return await _pick_frp_port(ctx), None
-    lip = str(prior.local_ip or "")
-    if lip and lip != host.ssh_host:
-        raise StepFailed(
-            f"隧道 {names.tunnel} 已存在且指向 {lip}:{prior.local_port}，与本机 "
-            f"{host.ssh_host} 不符——那是别的服务，不复用也不改")
-    await ctx.log("info", f"隧道 {names.tunnel} 是先前给这台实例建的"
-                          f"（proxy_id={prior.proxy_id}，remotePort={prior.remote_port}），"
-                          "沿用它的端口，不再新挑")
-    return int(prior.remote_port or 0), prior
+    if not _manual(ctx, "frp"):
+        prior = await ctx.frp().find_by_name(names.tunnel, host.frpc_client_id)
+        if prior is not None:
+            lip = str(prior.local_ip or "")
+            if lip and lip != host.ssh_host:
+                raise StepFailed(
+                    f"隧道 {names.tunnel} 已存在且指向 {lip}:{prior.local_port}，与本机 "
+                    f"{host.ssh_host} 不符——那是别的服务，不复用也不改")
+            await ctx.log("info", f"隧道 {names.tunnel} 是先前给这台实例建的"
+                                  f"（proxy_id={prior.proxy_id}，"
+                                  f"remotePort={prior.remote_port}），"
+                                  "沿用它的端口，不再新挑")
+            return int(prior.remote_port or 0), prior
+    saved = int(inst.frp_remote_port or 0)
+    if saved:
+        if not await ctx.frp().remote_port_taken(saved):
+            await ctx.log("info", f"恢复：赎回原公网端口 :{saved}"
+                                  "（释放时特意保留、其它实例永不复用）")
+            return saved, None
+        new_port = await _pick_frp_port(ctx)
+        await ctx.log("warn", f"原公网端口 :{saved} 已被占用，改用 :{new_port}")
+        await ctx.event("frp_port_fallback",
+                        f"原公网端口 :{saved} 被占，改用 :{new_port}",
+                        {"saved_port": saved, "new_port": new_port})
+        return new_port, None
+    return await _pick_frp_port(ctx), None
 
 
 # 公网探活的重试口径：容器刚起来的几秒里首页可能还回 401（静态壳未就绪），
@@ -198,8 +217,8 @@ async def env_facts(ctx: JobCtx, slug: str) -> dict[str, str]:
     """把实例目录里 .env 的**生效值**读回来（只取白名单键）。
 
     配置快照原本在第 10 步按猜测写：端口只能填 0，数据目录按 data_root 拼。
-    现网详情页因此写着 CONTAINER_PORT=0、DOCUMENTS_DIRECTORY=/mnt/hdd2/dsh-family/
-    dsh-02，而她真正的数据在 /mnt/hdd2/dsh-family/dsh-family/dsh-02/data——
+    现网详情页因此写着 CONTAINER_PORT=0、DOCUMENTS_DIRECTORY=/srv/dsh/dsh-family/
+    dsh-02，而她真正的数据在 /srv/dsh/dsh-family/dsh-02/data——
     kit 的公式是 DATA_ROOT/dsh-family/<名>/data，拼出来的和落盘的不是一回事。
     密钥类键名一律不取：这行命令的 stdout 会回到本进程，快照要写进库。
     """
@@ -256,6 +275,44 @@ _PROBE_MEANING = {
     "unexpected": "回包不像 DSH（确认门后面是谁）",
 }
 
+# ---- 铺字体（第 67 步）：投递口 = 实例 DATA_DIR 的 home/.fonts（容器内 /data/home/.fonts）。
+# Word→PDF 有两条转换路，各自认各自的目录：右侧栏预览的 office-to-pdf 插件读
+# fontDirectories，官方 office 技能的 LibreOffice Kit CLI 只扫 $HOME/.fonts 默认根；
+# home/.fonts 是两条路共同认的位置，面板根本不配 fontDirectories（替换语义，写了
+# 会顶掉镜像里已配的目录，炸掉所有预览）。
+_FONT_DST_REL = "home/.fonts"
+
+_FONT_SKIP_NO_LIB = ("站点没配字体库（font_library 为空）：本次跳过铺字体，"
+                     "实例其他功能不受影响")
+
+_FONT_NEW_RE = re.compile(r"new=(\d+)")
+
+
+def _font_cp_script(lib: str, dst: str) -> str:
+    """宿主上铺字体的脚本：把库里内容 cp 进 dst，落地后文件 644、目录 755。
+
+    - **`cp -n` 是防覆盖红线**：目标里已有的同名文件一律不动（她的字体她自管），
+      所以重复部署（redeploy 切镜像续建）随便跑，新增 0 个也算正常完成；
+    - **只 cp**：不 bind 挂载 /usr/share/fonts（挂载要改每台 compose，字体也不随
+      数据备份搬家）、不跑 fc-cache（容器里 fontconfig 自己会扫）、不碰 compose；
+    - 权限整目录刷 644/755：字体本就该全局可读，保证容器内 uid 读得到；
+    - 库目录不存在只打标记退 0——「跳过还是失败」是编排层的判定，不发生在宿主上。
+    """
+    return "\n".join([
+        "set -e",
+        f"lib={shlex.quote(lib)}",
+        f"dst={shlex.quote(dst)}",
+        'if [ ! -d "$lib" ]; then echo "[fonts] LIB_MISSING"; exit 0; fi',
+        'mkdir -p "$dst"',
+        'before=$(find "$dst" -type f 2>/dev/null | wc -l)',
+        'cp -rn "$lib"/. "$dst"/',
+        'find "$dst" -type d -exec chmod 755 {} +',
+        'find "$dst" -type f -exec chmod 644 {} +',
+        'after=$(find "$dst" -type f | wc -l)',
+        'echo "[fonts] DONE src=$lib dst=$dst new=$((after-before))"',
+    ])
+
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -265,6 +322,9 @@ async def run_deploy(ctx: JobCtx) -> None:
     dns_name = inst.dns_name or names.server_name
     public_url = inst.public_url or f"https://{dns_name}"
     data_dir = f"{host.data_root.rstrip('/')}/{slug}"
+    # 工单附加参数（§4 deploy body {"image": "目标tag"}）：容器步与第 20 步的镜像
+    # 在位检查优先用它，留空 = 站点当前目标 tag（settings.dsh_image）。
+    image_param = str((ctx.job.params or {}).get("image") or "").strip()
 
     # 回滚兜底。runner 按 reversed() 倒序执行，这里最先 append 就最后执行：
     # 外部对象都删完之后，把库里指向它们的登记 id 抹掉——死 id 留着就是假凭据
@@ -288,14 +348,15 @@ async def run_deploy(ctx: JobCtx) -> None:
         # NG 回源地址必须站点显式声明（DSHC_FRPS_UPSTREAM_HOST / site.toml）：
         # 代码里不许猜、不许回落 ingress_ip——云上无 NAT 回环，公网 IP 在入口机上不通。
         frps_host = ctx.settings.require("frps_upstream_host")
-        image = ctx.settings.require("dsh_image")
+        image = image_param or ctx.settings.require("dsh_image")
         # 443 必须挂证书：面板里 ssl=0 的 443 站点拼出来的配置 nginx 校验不过，
         # 而且公网地址是 https，不挂证书等于建成就用不了。用现成通配证书，不签新的。
         ctx.settings.require("wildcard_cert_name")
         await ctx.log("info", f"slug={slug} 域名={dns_name} 容器={names.container}")
         await ctx.log("info", f"NG 挂现成通配证书 {ctx.settings.wildcard_cert_name}"
                               "（443 不挂证书的面板配置过不了 nginx -t；本站不签新证书）")
-        await ctx.log("info", f"镜像（准备好的版本，开通阶段永不构建）：{image}"
+        await ctx.log("info", f"镜像（准备好的版本，开通阶段永不构建"
+                              f"{'；本工单指定 tag' if image_param else ''}）：{image}"
                               "——20 步会在目标主机上核验它在位")
         await ctx.log("info", f"NG 将以 {frps_host} 回源（frps 监听地址，"
                               "需 NG 容器视角可达；本站若 NG 为 host 网络通常填 127.0.0.1）")
@@ -337,6 +398,11 @@ async def run_deploy(ctx: JobCtx) -> None:
         inst.public_url = public_url
         inst.container_name = names.container
         inst.config_version = CONFIG_VERSION
+        # 恢复即「我要它再跑起来」：released 实例的 desired_state 翻回 running，
+        # 否则工单成功后 watcher 仍按期望 released 跳过采集，等于恢复了没人守护。
+        if inst.desired_state != "running":
+            inst.desired_state = "running"
+            await ctx.log("info", "期望状态改回 running（续建/恢复都是要它跑）")
         await ctx.s.commit()
 
     # ---- 20 host_prepare：主机可达 / 数据盘剩余空间 / kit 在位
@@ -446,7 +512,7 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 40 frp_create：先探测端口再建隧道；失败删刚建的
     async with ctx.step(40, "frp_create", "创建 frp 隧道") as st:
-        port, prior = await _reuse_or_pick_port(ctx, names, host)
+        port, prior = await _reuse_or_pick_port(ctx, names, host, inst)
         if _manual(ctx, "frp"):
             st.state = "skipped"
             await ctx.frp().ensure(
@@ -739,11 +805,48 @@ async def run_deploy(ctx: JobCtx) -> None:
                                   "详情页的 DSH 配置卡会是空的，可以事后点「重新读取」")
         await ctx.s.commit()
 
+    # ---- 67 fonts：铺字体——把站点字体库 cp 进实例 DATA_DIR 的 home/.fonts。
+    # 放在容器部署之后：DATA_DIR 此刻已由 kit 脚本按生效值建好（口径同 65 步，
+    # 优先读实例 .env 的 DATA_DIR，读不到才按 data_root 拼）。对已 running 的
+    # 实例重复部署（redeploy 切镜像）同样跑：cp -n 幂等，只可能新增、绝不覆盖。
+    # 库没配 / 宿主上没这个目录 → 记 warning 跳过，不失败工单（先例：生图技能）。
+    async with ctx.step(67, "fonts", "铺字体") as st:
+        lib = (ctx.settings.font_library or "").strip().rstrip("/")
+        if not lib:
+            st.state = "skipped"
+            st.detail = _FONT_SKIP_NO_LIB
+            await ctx.log("warn", _FONT_SKIP_NO_LIB)
+            await ctx.s.commit()
+        else:
+            facts = await env_facts(ctx, slug)   # 同 65 步口径：DATA_DIR 认机器上的事实
+            dst = f"{(facts.get('DATA_DIR') or data_dir).rstrip('/')}/{_FONT_DST_REL}"
+            r = await ctx.ssh(_font_cp_script(lib, dst), timeout=600)
+            if not r.ok:
+                raise StepFailed(f"铺字体失败: {r.tail()}")
+            out = r.stdout or ""
+            if "[fonts] LIB_MISSING" in out:
+                st.state = "skipped"
+                st.detail = (f"字体库目录 {lib} 在主机 {host.name} 上不存在："
+                             "本次跳过铺字体，实例其他功能不受影响")
+                await ctx.log("warn", st.detail)
+            else:
+                new = _FONT_NEW_RE.search(out)
+                st.detail = (f"{lib} → {dst}：本次新增 "
+                             f"{new.group(1) if new else '?'} 个文件"
+                             "（cp -n 不覆盖同名，文件 644 / 目录 755）")
+                await ctx.log("info", st.detail)
+            await ctx.s.commit()
+
     # ---- 70 token_capture：从容器日志抓一键地址（标 error，可重试）
     async with ctx.step(70, "token_capture", "从容器日志抓登录密钥"):
         tok = await capture_token(ctx.s, ctx.runtime(), inst, "bootstrap")
-        await ctx.event("token_captured", "部署后抓到一键地址",
-                        {"source": "bootstrap", "url": tok.url, "token": tok.token})
+        if tok.changed:
+            await ctx.event("token_captured", "部署后抓到一键地址",
+                            {"source": "bootstrap", "url": tok.url, "token": tok.token})
+        else:
+            # §3 去重：值与库里最新一条相同就什么都不写、不记事件
+            # （恢复/切镜像续建常走到这里——cookie secret 在 DATA_DIR，重建不轮换）。
+            await ctx.log("info", "登录密钥与库里最新值一致（未轮换）：不落新行、不记事件")
 
     # ---- 80 probe_public：首页 200 + 无 token 打 remote.mux 期望 401
     async with ctx.step(80, "probe_public", "公网探活") as st:

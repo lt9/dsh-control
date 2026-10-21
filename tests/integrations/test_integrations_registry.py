@@ -51,8 +51,8 @@ def test_noop_recorder_actions_never_read_as_already_done():
     run(dns.create("dsh-x", "203.0.113.10"))
     run(dns.delete("r1"))
     run(frp.ensure(name="dsh-a", client_id="c@1", server_id="default",
-                   local_ip="127.0.0.1", local_port=1, remote_port=4893))
-    run(frp.remote_port_taken(4893))
+                   local_ip="127.0.0.1", local_port=1, remote_port=20001))
+    run(frp.remote_port_taken(20001))
     run(frp.delete(0, expect_name="dsh-a"))
     run(ng.ensure_site(server_name="dsh-a.example.com", upstream_name="DSH_A",
                        upstream_server="127.0.0.1:1"))
@@ -74,13 +74,13 @@ def test_noop_recorder_actions_never_read_as_already_done():
 def test_noop_frp_and_ng_synthesize_clearly_fake_ids():
     frp, ng = NoopFrp(), NoopNg()
     t = run(frp.ensure(name="dsh-a", client_id="c@1", server_id="default",
-                       local_ip="127.0.0.1", local_port=1, remote_port=4893))
+                       local_ip="127.0.0.1", local_port=1, remote_port=20001))
     assert t.proxy_id == 0 and t.raw["manual"] is True
     site = run(ng.ensure_site(server_name="dsh-a.example.com", upstream_name="DSH_A",
                               upstream_server="127.0.0.1:1"))
     assert site.server_id == 0 and site.location_id is None
     assert run(frp.list()) == [] and run(ng.find_site("x")) is None
-    assert run(frp.remote_port_taken(4893)) is False  # 探测不了，宁可放行也不误报占用
+    assert run(frp.remote_port_taken(20001)) is False  # 探测不了，宁可放行也不误报占用
     assert any("websocket" in i for i in ng.manual_actions[0].instructions)
 
 

@@ -75,7 +75,8 @@ ADR 一条决策一个文件：`docs/adr/NNN-标题.md`。
 
 顺带：布尔列用 `is_`/`has_` 前缀或 `enabled` 这类形容词；时间列统一 `created_at`、
 `updated_at`、`*_at`，一律 `timestamptz` 存 UTC，显示层转 `Asia/Shanghai`；
-软删不用（本项目的"释放"是业务终态，不是软删标记）；金额/字节用 `bigint`；
+软删不用（实例的可见性只有业务状态：`released` 是可恢复的停放态，`purged` 是保留
+审计记录的终态，都不是软删标记）；金额/字节用 `bigint`；
 状态列用 `text` + CHECK 约束（不用 PG enum，加值要改类型太脆）。
 
 ```
@@ -99,9 +100,9 @@ instances          DSH 实例（一个容器 = 一个人）
   frp_proxy_id, frp_remote_port,
   ng_upstream_name, ng_server_id, ng_location_id,
   public_url, container_port,
-  state(pending|deploying|running|unhealthy|restarting|released|error),
+  state(pending|deploying|running|unhealthy|restarting|released|purged|error),
   desired_state(running|released),
-  last_error, released_at, created_at, updated_at
+  last_error, released_at, purged_at, created_at, updated_at
 
 instance_tokens    登录密钥历史，详情页永远取最新一条
   id, instance_id, token, url, source(bootstrap|logs|restart|manual), captured_at
@@ -113,8 +114,9 @@ instance_snapshots 采集到的运行态
   id, instance_id, captured_at, docker_state, health, restart_count,
   cpu_pct, mem_usage_bytes, mem_limit_bytes, raw jsonb
 
-deploy_jobs        一次性任务：deploy / release / restart
+deploy_jobs        一次性任务：deploy / restart / release / purge
   id, instance_id, kind, state(pending|running|succeeded|failed),
+  params jsonb,               # 工单附加参数：{"image": 升级目标tag} / {"purpose": create|upgrade|restore|source: auto|manual}
   error, started_at, finished_at
 
 deploy_steps       点对点进度，前端按 seq 渲染
@@ -133,13 +135,25 @@ events             审计与自动重启记录
 pending → deploying → running ⇄ unhealthy → restarting → running
                         ↓                        ↑（连续 3 次健康检查失败，自动）
                      released ← releasing
+                     ↕（续建恢复，§6.1.3）
+                     │（保留期满或手动，purge 工单，§6.4）
+                     ↓
+                   purged（终态）
 ```
 
 - `restarting` 由 watcher 自动触发或用户在详情页点重启；重启必然轮换登录 token，
   重启完成后必须重新抓 token 并写 `instance_tokens` + 记 `events`。
 - 自动重启的三个抑制条件：连续失败 < 3 次不重启；备份窗口内不重启（默认 03:20–04:00，
   可配 `DSHC_BACKUP_WINDOW`）；距上次自动重启 < 10 分钟不重启（`DSHC_RESTART_COOLDOWN`）。
-- `released` 是终态，watcher 不再采集，也不再对容器做任何写操作。
+- `released` **不再是终态**：保留期内可用 deploy 续建恢复（§6.1.3）；保留期满
+  （`DSHC_PURGE_AFTER_DAYS`，默认 15 天；site.toml `[site].purge_after_days` 落库可改，
+  watcher 每轮现读最新值）后 watcher 自动入队一个 purge 工单（§6.4），purge 成功才进入
+  真正的终态 `purged`——列表仍可见该记录，标「已彻底释放」，只读，任何写操作拒绝。
+- **token 落库与事件一律去重**：任何路径（watcher 自动重抓、restart/deploy 工单、
+  详情页 reveal）抓到一个 token 后，先与该实例库里最新一条比对：**值没变就什么都不写**
+  ——不落 `instance_tokens`、不记 `events`，reveal 响应照常返回现取值；值变了才落库并记
+  一条 `token_captured` 事件。watcher 原有的自动重抓场景保留（restart_count 增长、
+  部署后补缺），但按上面的规矩静默；这修掉了「事件流被获取密码刷满」的问题。
 
 ## 4. HTTP API
 
@@ -159,12 +173,14 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | GET | `/api/overview` | `{running, unhealthy, released, hosts, by_host[]}` |
 | GET | `/api/hosts` | 主机列表（不含密钥） |
 | GET | `/api/instances?q=&state=` | `q` 匹配 slug / owner_label / dns_name |
-| POST | `/api/instances` | 请求体可为空，或 `{host_id?}`（不传就由服务端按剩余空间选主机）→ `{instance_id, dns_name, job_id}`；slug 与端口一律服务端生成（§6.1.1），**任何情况下不接受用户传入的名字** |
+| POST | `/api/instances` | 请求体 `{confirm}`（必填）或 `{host_id?, confirm}`（不传 host_id 由服务端按剩余空间选机）→ `{instance_id, dns_name, job_id}`；slug 与端口一律服务端生成（§6.1.1）。`confirm` 必须逐字等于**服务端刚算出的 slug**——防"连点两次凭空开出公网实例"（2026-10-21 现网事故）；值由前端从确认卡回显，用户零打字（§9） |
 | GET | `/api/instances/{id}` | 详情，见下 |
-| GET | `/api/instances/{id}/token` | **现取**：SSH 抓容器日志里的最新一键地址，落库后返回 |
+| GET | `/api/instances/{id}/token` | **现取**：SSH 抓容器日志里的最新一键地址返回；与库中最新值相同则不落库不记事件（§3 去重），变了才落库 + 记事件 |
+| POST | `/api/instances/{id}/deploy` | 续建统一入口：pending/error（开通失败重试）、running（**升级/切镜像**，§6.1）、released（**恢复**，§6.1.3）都可重跑；body 可选 `{"image": "目标tag"}`（API/脚本文档用，留空=站点当前目标 tag）。purged 拒绝 |
 | POST | `/api/instances/{id}/restart` | → `{job_id}` |
 | POST | `/api/instances/{id}/release` | `{confirm}` 必须逐字等于 `slug`，否则 422 → `{job_id}`。**这个值由前端自己填**（前端知道 slug），用户不需要打字；防误操作靠 §9 的按住式确认，不靠输入 |
-| GET | `/api/jobs/{id}` | `{kind,state,steps:[{seq,key,title,state,detail}]}` |
+| POST | `/api/instances/{id}/purge` | **彻底释放**：`{confirm}` 逐字等于 `slug`（同样前端填，交互用 §9 长按确认）→ `{job_id}`。仅 released 可发起（§6.4） |
+| GET | `/api/jobs/{id}` | `{kind,purpose,state,steps:[{seq,key,title,state,detail}]}`。`purpose` 仅 deploy 有值：入队时服务端按当时状态写进 `params.purpose`——`create`（新建）/ `upgrade`（running 续建）/ `restore`（released 恢复），前端据此出标题与完成文案，不靠 URL 猜 |
 | GET | `/api/jobs/{id}/logs` | 增量日志：`?after=<id>` → `{items:[{id,seq,level,line,ts}], next}` |
 | GET | `/api/jobs/{id}/stream` | SSE，`step` / `log` / `done` 三种事件 |
 | GET | `/api/instances/{id}/events` | 事件时间线 |
@@ -186,9 +202,24 @@ pending → deploying → running ⇄ unhealthy → restarting → running
               "captured_at":"2026-10-20T21:40:00+08:00"},
   "access": {"has_token": true, "token_masked": "M1jq…IV0",
              "captured_at":"2026-10-20T21:37:36+08:00"},
-  "last_error": null, "released_at": null, "actions": {"restart": true, "release": true}
+  "last_error": null, "released_at": null, "purged_at": null,
+  "purge_after": null,
+  "actions": {"restart": true, "release": true, "upgrade": true,
+              "restore": false, "purge": false, "deploy": false}
 }
 ```
+
+`actions.deploy` 是「开通失败重试」的页面按钮口径（pending/error 才 true），与
+upgrade/restore 三个互不重叠；列表行携带与详情相同的
+`state/purged_at/purge_after/actions` 子集（列表接口连 mask 都不给，规矩不变）。
+列表次要分组里的时间列：released 行显示 `released_at`，purged 行显示 `purged_at`
+（悬停注明「彻底释放于…」）——语义都是「这台什么时候没的」。
+
+`purge_after` 仅在 `state=released` 时给出（= `released_at` + 当前保留期，渲染口径
+与全站时间字段一致：`+08:00`），前端据此显示「保留期还剩 N 天，YYYY-MM-DD 将自动彻底释放」；
+其余状态为 null。
+`actions.restore`=可恢复（released 未 purge），`actions.purge`=可彻底释放，
+`actions.upgrade`=running/unhealthy 可用「升级/重建」按钮走 deploy。
 
 `access` 只有 `has_token` / `token_masked` / `captured_at` 三个字段，**没有任何完整值**。
 完整 token 与含 token 的一键地址只在 reveal 动作 `GET /api/instances/{id}/token` 里出现，
@@ -220,8 +251,10 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | `host_not_available` | 422 | 指定 host_id 但该机禁用或数据盘不可用 | 这台机现在不能接单 |
 | `site_not_seeded` | 422 | 缺站点级配置（域名 zone/入口 IP 等）就尝试部署 | 站点还没 seed，先 `cli seed --site …` |
 | `cannot_restart_from_<state>` | 409 | 从 released 等非 running/error 状态发起重启 | 当前状态不能重启 |
-| `confirm_mismatch` | 422 | 释放确认词与 slug 不一致 | 确认词不对，输入框里输入实例名 |
+| `confirm_mismatch` | 422 | 释放/彻底释放的确认词与 slug 不一致（确认词由前端填，出现即前后端数据不同步） | 页面数据过期了，刷新后再试 |
 | `already_released` | 409 | 重复释放 | 已经释放过了 |
+| `cannot_deploy_from_<state>` | 409 | 从 purged/deploying 等不可续建状态发 deploy | 当前状态不能重新开通 |
+| `cannot_purge_from_<state>` | 409 | 从非 released 状态发起彻底释放（purged 也在其列） | 只有已释放的实例能彻底释放 |
 
 不在表里但会遇到的两种：
 
@@ -371,11 +404,26 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 | 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
 | 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket） | 删刚建的站点/upstream |
 | 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS` | 保留现场，标 error |
+| 65 | `config_backfill` | 从实例 `.env` 与 docker 端口映射读回**生效值**，覆盖第 10/20 步按猜测写的配置快照 | 读不到不失败，快照自标来源 |
+| 66 | `capabilities` | 铺生图技能与智能体团队（站点没配生图就跳过并记一行警告），并读回 DSH 生效配置 | 缺材料跳过，不挡住开通 |
+| 67 | `fonts` | **铺字体**：把站点字体库（`font_library`）里的文件 `cp -n` 进实例 DATA_DIR 的 `home/.fonts`（容器内 `/data/home/.fonts`，Word→PDF 两条转换路共同认的投递口），落地后文件 644、目录 755。只 cp 不挂载，同名不覆盖。库未配置或宿主上目录不存在 → 记 warning 并跳过，不失败工单 | 记 warning 跳过（铺字体失败才标 error） |
 | 70 | `token_capture` | 从容器日志抓一键地址 | 标 error，可重试 |
 | 80 | `probe_public` | 公网探测：首页 200 + 无 token 打 `/api/remote.mux` 期望 401（403 说明反代 Host 又错了） | 标 degraded，给出修正提示 |
 | 90 | `verify` | 跑 kit 的 `verify.sh <slug>`，收条目数 | 记录，不推翻成功 |
 
 每步把命令、耗时、stdout 摘要写进 `deploy_steps`，前端按 seq 逐条点亮。
+
+**从 running 续建（切镜像的正规路径）**：deploy 不只许 pending/error 重跑，running
+实例也允许 `POST /instances/{id}/deploy`——每一步都是「已存在且一致就跳过」的幂等
+续建，容器那步发现实例 `.env` 的 `DSH_IMAGE` 与站点当前目标 tag 不一致时由 compose
+重建容器（`docker restart` 做不到这件事：既不重读 `.env` 也不重建容器）。后果是
+会话短暂被打断；登录密钥**不轮换**——cookie secret 在实例 DATA_DIR 的
+`.credentials.yaml` 里，重建不动它，一键链接切完照用。详情页把这个入口做成
+「升级/重建」按钮（§9）。released 的恢复见 §6.1.3；purged 拒绝一切续建。
+
+**升级就是同实例原地重建**：compose 用新 tag 重建同名容器，DATA_DIR 原样挂回，
+数据天然继承，**绝不允许出现"新建一个实例再迁数据"的双份实例路径**。
+镜像来源仍守 §6.1.2——构建与搬运在镜像侧完成，工单第 20 步只验收目标 tag 在目标机存在。
 
 #### 6.1.1 域名与命名规则（全部程序生成，用户不输入）
 
@@ -410,8 +458,8 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
   架构留的就是 `instances.image_tag` 列与"标签来自配置不是代码常量"这两件事。
   需求来了再把候选做成"目标机上 `docker images` 实际有哪些标签"，在新建确认卡上做成一次点击的选项，
   仍然不输入；实例行上记 `image_tag`，
-  详情页显示"这个实例跑在哪个镜像上"。升级是"用新标签重新部署一个实例并迁移数据"，
-  不是把老容器就地换镜像——首期不做，但表结构已经留了 `image_tag` 与 `config_version`。
+  详情页显示"这个实例跑在哪个镜像上"。升级 = §6.1 的 running 续建（同实例原地重建，数据继承），
+  目标默认站点当前 tag，deploy body 可用 `{image}` 指定。
 
 ### 6.2 释放 `release`（二次确认后）
 
@@ -422,6 +470,37 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 ### 6.3 重启 `restart`
 
 `container_restart` → `wait_healthy`（最多 120 秒）→ `token_capture` → `probe_public`。
+
+### 6.3.1 恢复 `released` → 运行（走 deploy，不另立工单）
+
+released 实例在 purge 之前的恢复 = 对同一实例重跑 deploy 工单（§6.1 续建语义，
+`POST /deploy`，`actions.restore` 控制按钮出现）：DNS/frp/NG 三处都是**重建**
+（释放时删的是我们自己建的对象，名字仍从 slug 派生，天然还是原来那套域名与
+upstream 名），容器步对既有的停止容器执行 `compose up`——**同一 DATA_DIR、同一
+容器名，数据天然继承，不存在第二个实例**。恢复后按 §3 走 deploy 全流程回 running：
+plan 步把 `desired_state` 翻回 `running`——不翻的话恢复完 watcher 不守护。
+
+### 6.4 彻底释放 `purge`（released 的终态化）
+
+purge 工单**只碰本控制台创建且登记在案的对象**，顺序与 release 对称——先补删
+释放时删掉一半的外部对象（若还挂着 id），再删容器，最后删数据目录：
+
+| seq | key | 做什么 | 失败怎么办 |
+|---|---|---|---|
+| 10 | `confirm_guard` | 手动工单核对确认词等于 slug；自动工单核对 `source=auto` 且保留期确实已过（每轮现读配置） | 直接失败，无副作用 |
+| 20 | `external_cleanup` | 库里还挂着 dns/frp/ng id 就逐个补删（对象多半早在释放时删了，404 视为已删） | 记 error，可重跑 |
+| 30 | `container_remove` | `docker rm` 容器（还活着先 stop）；镜像不动 | 记 error，可重跑 |
+| 40 | `data_delete` | **删数据目录**：路径只认实例 `.env` 读回的生效 `DATA_DIR`，且必须严格位于该机 `hosts.data_root` 之下、非 data_root 本身——不满足宁可不删直接失败；满足则 `rm -rf` | 宁可不删，绝不删错 |
+| 50 | `mark_purged` | `state=purged`，`purged_at=now`，清掉外部 id 字段（released 时特意保留的 `frp_remote_port` 一并清——端口回池，终态不再赎回），记 `instance_purged` 事件 | — |
+
+- 触发两种：**自动**（watcher：`released_at + purge_after_days < now` 入队，
+  `purge_after_days` 每轮现读库里 site 行，改了 DB 不需重启）；**手动**（详情页
+  长按确认，`confirm=slug` 前端填）。
+- purge 成功后记录与历史（工单、事件、密钥历史、配置快照）**保留**——列表与详情
+  仍可看，全部只读；容器、数据目录、外部对象三样都没了。purged 不可恢复，要再用就新建。
+  `desired_state` 保持 `released` 不变——desired 只表达"要不要跑着"，没有第三种愿望。
+- 数据目录是**用户数据**，删之前不留最后快照是用户明确的选择（默认保留期 15 天就是
+  反悔窗口）；本控制台不在 purge 里夹带备份动作。
 
 ## 7. 部署形态
 
@@ -451,6 +530,8 @@ DSHC_FRP_PANEL_URL / _USER / _PASS
 DSHC_NG_URL / _USER / _PASS
 DSHC_ALIYUN_AK / _SK
 DSHC_SSH_KEY_PATH_NAS8 / _HOST109    init 时读进库，之后从库取
+DSHC_FONT_LIBRARY            站点字体库目录（实例宿主机上的绝对路径；留空 = 开通第 67 步铺字体跳过）
+DSHC_PURGE_AFTER_DAYS        released 保留天数，默认 15；到期 watcher 自动 purge（§6.4）。库里的值优先（seed 可改，watcher 每轮现读）
 DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 ```
 
@@ -465,7 +546,8 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 
 1. 登录页：一个密钥输入框 + 粘贴即可，不要求用户名。
 2. 列表页：搜索框（域名/用途都能搜）+ 新建按钮 + 表格：用途与 slug、状态、DSH 版本、
-   配置版本、所在主机、域名、更新时间。`released` 默认折叠在次要分组里。
+   配置版本、所在主机、域名、更新时间。`released` 与 `purged` 默认折叠在次要分组里
+   （purged 额外标「已彻底释放」）。
 3. 详情页：运行态与网络信息；配置卡底部一个小「？」开弹窗逐条解释每个配置项；
    一键登录 URL 与 token（一键复制，复制后给明确反馈）；操作区重启 + 释放（输入 slug
    原文才能点，二次确认）；异常时给最近事件与错误。
@@ -484,7 +566,15 @@ token 默认打码，点一下才展开。
   公网端口，全部程序生成，写清楚是自动生成）→ 点「开始部署」。要换主机是卡片上
   一次点击的事，不是表单。
 - 释放的二次确认用**按住确认**（长按 1.5 秒才触发，松手取消），配合后果清单：会删解析、
-  删隧道、删 nginx 站点，容器只停不删，数据保留，以后不能恢复。服务端仍然要求
-  `confirm == slug`，由前端填。
+  删隧道、删 nginx 站点，容器只停不删，数据保留，**保留期内可在详情页一键恢复**。
+  服务端仍然要求 `confirm == slug`，由前端填。
+- 升级/重建（running 详情页）= 一次点击 + 一张后果卡（说清：重建容器、会话短暂打断、
+  数据不动、登录链接不变、目标镜像是谁），零打字。
+- released 详情页两个动作：**恢复**（一次点击，说清重建哪三处外部对象、原域名原端口回来）；
+  **彻底释放**（长按确认 + 一屏后果清单：容器删除、数据目录删除、**不可恢复**，
+  并显示自动彻底释放的日期）。released 行/详情要显示「保留期还剩 N 天」。
+- purged：灰上加删除态标记「已彻底释放」，详情只读无按钮，历史（工单/事件）照看。
+- 密钥不进列表接口；详情页进页面时 reveal 一次拿最新，平时只显示打码与时间；
+  **界面不轮询抓密钥**；reveal 与自动重抓同守 §3 去重——没变化不产生任何事件。
 - 危险与不可逆动作不用弹窗套弹窗，一屏内把后果说完。
 - 不显示用户用不上的字段（镜像 id、内部状态机原始值这类收进次要位置或不显示）。

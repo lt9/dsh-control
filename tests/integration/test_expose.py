@@ -38,28 +38,28 @@ async def test_expose_order_and_registration(env):
     # DNS：入口主机名在 zone 下的一级 rr → ingress_ip
     assert "dns.create console 203.0.113.10" in blob
     # frp：固定隧道名、自己主机的 client、本机 ssh_host:listen_port
-    assert "frp.ensure dshctl_console remote=4893 local=192.0.2.10" in blob
+    assert "frp.ensure dshctl_console remote=20001 local=192.0.2.10" in blob
     # NG：upstream 必须用 frps_upstream_host（198.51.100.9），不是 ingress_ip；
     # headerHost=$host 由 FakeNg 的断言把守；建完必须 reload（要点 1）
-    assert "ng.ensure console.example.test DSHCTL_CONSOLE 198.51.100.9:4893" in blob
+    assert "ng.ensure console.example.test DSHCTL_CONSOLE 198.51.100.9:20001" in blob
     assert "ng.reload" in blob
-    assert "203.0.113.10:4893" not in blob
+    assert "203.0.113.10:20001" not in blob
     assert "probe https://console.example.test" in blob
     # 门后面是控制台自己，不是 DSH：探活不能拿"mux 必须 401"去要它
     assert "probe https://console.example.test ok expect=service" in blob
     assert summary == {**summary, "dns": "created", "frp": "created",
-                       "ng": "created", "probe": "ok", "frp_remote_port": 4893}
+                       "ng": "created", "probe": "ok", "frp_remote_port": 20001}
 
     # 幂等登记：id 存进 credentials(kind=site, name=console-endpoint)
     async with env.db.session() as s:
         cred = await s.scalar(select(Credential).where(
             Credential.name == ENDPOINT_CRED_NAME))
         assert cred.secret == {"dns_record_id": "rec-1", "frp_proxy_id": 1,
-                               "frp_remote_port": 4893, "ng_server_id": 1,
+                               "frp_remote_port": 20001, "ng_server_id": 1,
                                "ng_location_id": 10,
                                "ng_upstream_name": "DSHCTL_CONSOLE"}
     # 收尾必须提醒人工放行安全组（API 管不了）
-    assert any("安全组" in m and "4893" in m for _l, m in lines)
+    assert any("安全组" in m and "20001" in m for _l, m in lines)
 
 
 async def test_expose_idempotent_second_run_zero_writes(env):

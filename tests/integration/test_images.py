@@ -60,7 +60,7 @@ async def test_image_and_public_config_land_in_instance_env(env):
     await wait_job(env.app, body["job_id"])
     cmds = env.providers.executor.commands
     newc = next(c for c in cmds if "./scripts/new-instance.sh" in c)
-    assert "new-instance.sh dsh-01 4893" in newc, newc        # 端口走位置参数
+    assert "new-instance.sh dsh-01 20001" in newc, newc        # 端口走位置参数
     assert "DATA_ROOT=/hdd1/dsh-data" in newc                  # 数据根目录交给 kit
     assert "CONTAINER_PORT=" not in newc                       # 不再发明环境变量
     assert "DOCUMENTS_DIRECTORY=" not in newc

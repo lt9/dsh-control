@@ -68,10 +68,12 @@ async def test_release_order_stop_only_no_rm(env):
     d = (await env.client.get(f"/api/instances/{iid}")).json()
     assert d["state"] == "released" and d["desired_state"] == "released"
     assert d["released_at"] is not None
-    # 终态三个动作全关：deploy 必须在里面——released 是终态，绝不能给"重跑开通"入口
-    assert d["actions"] == {"restart": False, "release": False, "deploy": False}
+    # released 不是终态（§3/§6.1.3）：restart/release/deploy 关，但给恢复与
+    # 彻底释放两个动作（actions.restore / actions.purge），upgrade 关。
+    assert d["actions"] == {"restart": False, "release": False, "deploy": False,
+                            "restore": True, "purge": True, "upgrade": False}
     # 端口保留不复用
-    assert d["network"]["frp_remote_port"] == 4893
+    assert d["network"]["frp_remote_port"] == 20001
 
 
 async def test_release_materializes_conf_after_upstream_delete(env):

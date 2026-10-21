@@ -5,8 +5,8 @@ from __future__ import annotations
 from tests.conftest import XRW, create_instance, wait_job
 
 STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_create",
-                    "container_deploy", "config_backfill", "capabilities", "token_capture",
-                    "probe_public", "verify"]
+                    "container_deploy", "config_backfill", "capabilities", "fonts",
+                    "token_capture", "probe_public", "verify"]
 
 
 async def create(env, body=None):
@@ -49,10 +49,10 @@ async def test_next_slug_tracks_existing_instances(env):
 
 async def test_container_port_never_laundered_from_host_port(env):
     """docker 映射读不到时，宁可显示 0 + 标明来源，也不许把 .env 的 HOST_PORT
-    洗成"容器内监听端口"——那是第 27 个缺陷的本体：详情页曾把 4895 标在容器上。"""
+    洗成"容器内监听端口"——那是第 27 个缺陷的本体：详情页曾把 20003 标在容器上。"""
     from dsh_control.integrations.base import ExecResult
 
-    env_txt = "HOST_PORT=4895\nDATA_DIR=/mnt/hdd2/dsh-family/dsh-family/dsh-01/data\n"
+    env_txt = "HOST_PORT=20003\nDATA_DIR=/srv/dsh/dsh-family/dsh-01/data\n"
     env.providers.executor.handlers.insert(
         0, ("cat /srv/dsh-family/instances/dsh-01/.env", ExecResult(0, env_txt, "")))
     env.providers.executor.handlers.insert(
@@ -61,7 +61,7 @@ async def test_container_port_never_laundered_from_host_port(env):
     await wait_job(env.app, body["job_id"])
     d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     kv = {i["key"]: i["value"] for i in d["config"]["items"]}
-    assert str(kv["CONTAINER_PORT"]) != "4895", kv
+    assert str(kv["CONTAINER_PORT"]) != "20003", kv
     assert "没读到 docker 端口映射" in str(kv["CONFIG_SOURCE"]), kv.get("CONFIG_SOURCE")
 
 
@@ -75,7 +75,7 @@ async def test_deploy_full_flow_with_derived_names(env):
     assert detail["state"] == "running", detail["last_error"]
     # prefer_hdd：机械盘 nas-1 剩余 10G 也应赢固态 100G
     assert detail["host"]["name"] == "nas-1"
-    assert detail["network"]["frp_remote_port"] == 4893
+    assert detail["network"]["frp_remote_port"] == 20001
     # 详情只给 mask：完整 token 与含 token 的 url 都不许出现在 detail 里
     assert detail["access"]["has_token"]
     assert detail["access"]["token_masked"]
@@ -86,11 +86,11 @@ async def test_deploy_full_flow_with_derived_names(env):
     journal = "\n".join(env.journal + env.providers.executor.commands)
     assert "dns.create dsh-01 203.0.113.10" in journal
     # 派生命名（§6.1.1）：隧道 dsh_NN，upstream DSH_NN，server_name 完整域名
-    assert "frp.ensure dsh_01 remote=4893 local=192.0.2.10" in journal
+    assert "frp.ensure dsh_01 remote=20001 local=192.0.2.10" in journal
     # NG 回源必须用站点声明的 frps_upstream_host（198.51.100.9），不是 ingress_ip
-    assert "ng.ensure dsh-01.example.test DSH_01 198.51.100.9:4893" in journal
+    assert "ng.ensure dsh-01.example.test DSH_01 198.51.100.9:20001" in journal
     # kit 的接口：new-instance.sh <名字> <宿主机端口>，端口是第 2 个位置参数
-    assert "new-instance.sh dsh-01 4893" in journal
+    assert "new-instance.sh dsh-01 20001" in journal
     assert "deploy.sh dsh-01" in journal
     assert "verify.sh dsh-01" in journal
     # 安全门是控制台自己算的：读容器生效配置，不看 kit 脚本的脸色
@@ -120,7 +120,7 @@ async def test_slug_increments_and_port_never_reused(env):
     await wait_job(env.app, b2["job_id"])
     d2 = (await env.client.get(f"/api/instances/{b2['instance_id']}")).json()
     assert d2["slug"] == "dsh-02"
-    assert d2["network"]["frp_remote_port"] == 4894
+    assert d2["network"]["frp_remote_port"] == 20002
 
 
 async def test_dns_occupied_fails_job_cleanly(env):
@@ -258,7 +258,8 @@ async def test_failed_deploy_can_be_retried_and_resumes(env):
     d = (await env.client.get(f"/api/instances/{iid}")).json()
     assert d["state"] == "error"
     # 失败态必须给"重跑开通"入口，否则实例永久卡死在 error
-    assert d["actions"] == {"restart": True, "release": True, "deploy": True}
+    assert d["actions"] == {"restart": True, "release": True, "deploy": True,
+                            "restore": False, "purge": False, "upgrade": False}
 
     env.settings.frps_upstream_host = "198.51.100.9"
     r2 = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
@@ -271,14 +272,43 @@ async def test_failed_deploy_can_be_retried_and_resumes(env):
     assert sum(1 for ln in env.journal if ln.startswith("dns.create")) == 1
 
 
-async def test_deploy_retry_refused_from_running(env):
-    """running 不等于"开通失败"，重跑开通必须拒——那是 restart 的语义。"""
+async def test_deploy_retry_allowed_from_running_and_released(env):
+    """running 允许重跑 deploy——切镜像的正规路径（§6.1）：deploy 各步是「已存在且
+    一致就跳过」的幂等续建，站点 dsh_image 改了 tag 后由 compose 重建容器带上新镜像；
+    docker restart 不重读 .env、不重建容器，做不到这件事。代价是会话短暂打断。
+    **released 也允许**（§6.1.3：released 不再是终态，重跑 deploy 即恢复，细节
+    见 test_restore.py）。详情页按钮语义不变：running 仍不给"重跑开通"。"""
     r = await create_instance(env.client)
     body = r.json()
+    iid = body["instance_id"]
     await wait_job(env.app, body["job_id"])
-    r2 = await env.client.post(f"/api/instances/{body['instance_id']}/deploy", headers=XRW)
-    assert r2.status_code == 409
-    assert r2.json()["detail"]["error"] == "cannot_deploy_from_running"
+    assert (await env.client.get(f"/api/instances/{iid}")).json()["state"] == "running"
+
+    env.settings.dsh_image = "dsh-test:v10"     # 站点换好目标镜像，人来点续建
+    r2 = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r2.status_code == 200, r2.text
+    job_id = r2.json()["job_id"]
+    assert job_id
+    await wait_job(env.app, job_id)
+    d2 = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d2["state"] == "running", d2["last_error"]
+    assert d2["actions"]["deploy"] is False, "按钮口径不变：这条入口走 API/脚本"
+    # 新镜像经实例 .env 落进部署命令（compose 重建才吃得到新 tag）
+    assert any("DSH_IMAGE=dsh-test:v10" in c or "dsh-test:v10" in c
+               for c in env.providers.executor.commands)
+    evs = (await env.client.get(f"/api/instances/{iid}/events")).json()["items"]
+    assert any(e["kind"] == "deploy_requeued" and (e.get("data") or {}).get("from") == "running"
+               for e in evs), "续建事件要落库，页面上看得见从哪来的"
+
+    r3 = await env.client.post(f"/api/instances/{iid}/release",
+                               json={"confirm": "dsh-01"}, headers=XRW)
+    await wait_job(env.app, r3.json()["job_id"])
+    # released 不是终态：POST deploy = 恢复（§6.1.3），从 released 续建回 running
+    r4 = await env.client.post(f"/api/instances/{iid}/deploy", headers=XRW)
+    assert r4.status_code == 200, r4.text
+    await wait_job(env.app, r4.json()["job_id"])
+    d4 = (await env.client.get(f"/api/instances/{iid}")).json()
+    assert d4["state"] == "running", d4["last_error"]
 
 
 async def test_replace_refused_when_drift_would_wash_a_live_site(env):
@@ -419,7 +449,7 @@ async def test_failed_retry_keeps_previous_attempts_registrations(env):
     assert any("外部登记 id 保持不动" in it["line"] for it in logs), "要说明为什么没清"
 
 
-async def _leftover_tunnel(env, port: int = 4894):
+async def _leftover_tunnel(env, port: int = 20002):
     """把「上一次尝试建好的隧道」摆回面板：名字是我们的，端口被它占着。"""
     from sqlalchemy import select
 
@@ -448,7 +478,7 @@ async def test_retry_reuses_our_existing_tunnel_and_its_port(env):
     assert not [ln for ln in env.journal if ln.startswith("frp.ensure")], "复用了还新建"
     d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     net = d["network"]
-    assert net["frp_proxy_id"] == 777 and net["frp_remote_port"] == 4894
+    assert net["frp_proxy_id"] == 777 and net["frp_remote_port"] == 20002
     evs = (await env.client.get(f"/api/instances/{body['instance_id']}/events")).json()["items"]
     assert any(e["kind"] == "frp_reused" for e in evs)
     async with env.db.session() as s:
@@ -471,7 +501,7 @@ async def test_rollback_of_retry_leaves_reused_tunnel_alone(env):
     async with env.db.session() as s:
         inst = await repo.get_instance(s, iid)
         assert inst.frp_proxy_id == 777, "复用的登记被抹掉了，隧道从此没人认领"
-        assert inst.frp_remote_port == 4894
+        assert inst.frp_remote_port == 20002
         assert inst.dns_record_id == "", "这次真的建过的 DNS 才该被抹"
 
 
@@ -593,11 +623,11 @@ async def test_safety_gate_does_not_flood_job_log(env):
 async def test_config_snapshot_reports_effective_values(env):
     """详情页的端口与数据目录必须是机器上的事实。第 10 步只能猜：端口只能填 0，
     目录按 data_root 硬拼——现网因此写着 CONTAINER_PORT=0 和一个不存在的路径，
-    而她真正的数据在 /mnt/hdd2/dsh-family/dsh-family/dsh-01/data。"""
+    而她真正的数据在 /srv/dsh/dsh-family/dsh-01/data。"""
     from dsh_control.integrations.base import ExecResult
 
-    env_txt = ("HOST_PORT=4895\nPUBLIC_URL=https://dsh-01.example.test\n"
-               "DATA_DIR=/mnt/hdd2/dsh-family/dsh-family/dsh-01/data\n"
+    env_txt = ("HOST_PORT=20003\nPUBLIC_URL=https://dsh-01.example.test\n"
+               "DATA_DIR=/srv/dsh/dsh-family/dsh-01/data\n"
                "DSH_IMAGE=dsh-family:0.2.1-rc.3\n"
                "LLM_API_KEY=sk-SECRET-不许进快照\n")
     env.providers.executor.handlers.insert(
@@ -606,10 +636,10 @@ async def test_config_snapshot_reports_effective_values(env):
     await wait_job(env.app, body["job_id"])
     d = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     kv = {i["key"]: i["value"] for i in d["config"]["items"]}
-    # 容器内监听端口取自 docker 映射的左半边；4895 是宿主机发布端口
+    # 容器内监听端口取自 docker 映射的左半边；20003 是宿主机发布端口
     assert str(kv["CONTAINER_PORT"]) == "8080", kv
-    assert str(kv["HOST_PORT"]) == "4895", kv
-    assert kv["DOCUMENTS_DIRECTORY"] == "/mnt/hdd2/dsh-family/dsh-family/dsh-01/data"
+    assert str(kv["HOST_PORT"]) == "20003", kv
+    assert kv["DOCUMENTS_DIRECTORY"] == "/srv/dsh/dsh-family/dsh-01/data"
     assert str(kv["FRP_REMOTE_PORT"]) != "0"
     assert str(kv["CONFIG_SOURCE"]).startswith("生效值"), kv.get("CONFIG_SOURCE")
     blob = str(kv)

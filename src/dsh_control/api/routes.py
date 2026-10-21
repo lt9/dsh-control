@@ -38,7 +38,9 @@ from .auth import (
 )
 from .schemas import (
     CreateInstanceRequest,
+    DeployRequest,
     LoginRequest,
+    PurgeRequest,
     ReleaseRequest,
     UpdateInstanceRequest,
 )
@@ -170,13 +172,15 @@ async def list_instances(request: Request, q: str = "", state: str = "") -> dict
         rows = await repo.list_instances(s, q=q, state=state)
         # §2.0 规矩二：不联表。单表取主机后 Python 组装（主机数量级很小）。
         host_cache: dict[int, Any] = {}
+        days = await repo.current_purge_after_days(
+            s, _state(request).settings.purge_after_days)
         items = []
         for inst in rows:
             host = host_cache.get(inst.host_id)
             if host is None:
                 host = await repo.get_host(s, inst.host_id)
                 host_cache[inst.host_id] = host
-            items.append(serialize.list_item(inst, host))
+            items.append(serialize.list_item(inst, host, purge_after_days=days))
     return {"items": items}
 
 
@@ -237,8 +241,8 @@ async def create_instance(
         if (body.confirm if body else None) is None or (body.confirm or "").strip() != slug:
             raise HTTPException(status_code=422, detail={
                 "ok": False, "error": "confirm_mismatch",
-                "message": f"没有创建任何东西：要建的实例是 {slug}，"
-                           "请把这个名字原样填进确认框再提交。"})
+                "message": f"没有创建任何东西：确认的名字与服务端现算的不一致"
+                           f"（现在要建的是 {slug}）——重新取号后按确认卡回显再提交。"})
         inst = Instance(slug=slug, host_id=host.id,
                         # 容器名由 kit 决定（dsh-<slug>），创建时就按同一条规则写，
                         # 别留一个"要等第 10 步来纠正"的错值（2026-10-21 现网
@@ -249,7 +253,7 @@ async def create_instance(
         s.add(inst)
         await s.commit()
         await s.refresh(inst)
-        job = await repo.create_job(s, inst.id, "deploy")
+        job = await repo.create_job(s, inst.id, "deploy", {"purpose": "create"})
         await repo.add_event(s, "deploy_queued",
                              message=f"新建实例 {slug}（主机 {host.name}）",
                              instance_id=inst.id, job_id=job.id,
@@ -275,7 +279,9 @@ async def instance_detail(request: Request, instance_id: int) -> dict[str, Any]:
     async with _state(request).db.session() as s:
         inst = await _load_instance(s, instance_id)
         host = await repo.get_host(s, inst.host_id)
-        return await serialize.instance_detail(s, inst, host)
+        days = await repo.current_purge_after_days(
+            s, _state(request).settings.purge_after_days)
+        return await serialize.instance_detail(s, inst, host, purge_after_days=days)
 
 
 @router.patch("/instances/{instance_id}", dependencies=[Depends(require_xrw)])
@@ -287,7 +293,9 @@ async def update_instance(request: Request, instance_id: int,
         await repo.update_instance_notes(s, inst, owner_label=body.owner_label,
                                          note=body.note)
         host = await repo.get_host(s, inst.host_id)
-        return await serialize.instance_detail(s, inst, host)
+        days = await repo.current_purge_after_days(
+            s, _state(request).settings.purge_after_days)
+        return await serialize.instance_detail(s, inst, host, purge_after_days=days)
 
 
 @router.get("/instances/{instance_id}/token")
@@ -308,16 +316,20 @@ async def recapture_token(request: Request, instance_id: int) -> dict[str, Any]:
         pem = await _host_ssh_pem(s, host)
         runtime = _runtime_for_host(state.providers, host, pem)
         try:
-            tok = await capture_token(s, runtime, inst, "manual")
+            res = await capture_token(s, runtime, inst, "manual")
         except TokenNotFound as exc:
             raise HTTPException(status_code=502,
                                 detail={"ok": False, "error": "token_not_found",
                                         "message": redact_text(str(exc))}) from exc
-        await repo.add_event(s, "token_captured", message="手动重抓登录密钥",
-                             instance_id=inst.id,
-                             data={"source": "manual", "url": tok.url, "token": tok.token})
-        return {"token": tok.token, "url": tok.url, "source": tok.source,
-                "captured_at": iso(tok.captured_at)}
+        # §3 去重：与库里最新一条相同就不落库、不记事件，但照常 200 返回现取值——
+        # 「详情页永远是最新登录密钥」靠现取实现，不靠往库里堆重复行。
+        if res.changed:
+            await repo.add_event(s, "token_captured", message="手动重抓登录密钥",
+                                 instance_id=inst.id,
+                                 data={"source": "manual", "url": res.url,
+                                       "token": res.token})
+        return {"token": res.token, "url": res.url, "source": res.source,
+                "captured_at": iso(res.captured_at)}
 
 
 @router.get("/instances/{instance_id}/dsh-config")
@@ -377,31 +389,47 @@ async def instance_events(request: Request, instance_id: int,
     return {"items": [serialize.event_item(e) for e in rows]}
 
 
-# ---------------------------------------------------------------- 重启 / 释放
+# ---------------------------------------------------------------- 重启 / 释放 / 彻底释放
 
 _RESTARTABLE = {"running", "unhealthy", "restarting", "error"}
-# 开通失败后的续建入口（§6.1「重试」）：只有从未走完（pending）和已判死（error）可重跑。
-# deploying 说明有 job 在跑，running 该走 restart，released 是终态，都拒绝。
-_DEPLOYABLE = {"pending", "error"}
+# 续建入口（§4 deploy / §6.1 重试 / §6.1.3 恢复 / 切镜像）：从未走完（pending）、
+# 已判死（error）、running（切镜像的正规路径）与 **released（恢复，§6.1.3）**
+# 都可重跑。deploy 每一步都是「已存在且一致就跳过」的幂等续建；从 running 走是
+# 切镜像的正规路径（实例 .env 的 DSH_IMAGE 与站点目标 tag 不一致时 compose 重建
+# 容器——docker restart 不重读 .env、不重建容器，做不到）。代价：会话短暂打断；
+# 登录密钥不轮换（cookie secret 在 DATA_DIR/.credentials.yaml，重建不动它）。
+# deploying 有 job 在跑；purged 是终态——不在集合里，自然 409（released 的判定
+# 只看 state=="released"，purged 是另一个值，绝不与 released 混同）。
+# 注意：serialize.py 的 _DEPLOYABLE_STATES 是**页面按钮**口径（pending/error），
+# 恢复/升级走 restore/upgrade 新字段，两条独立——这里的宽开口留给 API/脚本。
+_DEPLOYABLE = {"pending", "error", "running", "released"}
 
 
 @router.post("/instances/{instance_id}/deploy", dependencies=[Depends(require_xrw)])
-async def retry_deploy(request: Request, instance_id: int) -> dict[str, Any]:
-    """开通失败后重跑（§6.1「重试」）。
+async def retry_deploy(request: Request, instance_id: int,
+                       body: DeployRequest | None = None) -> dict[str, Any]:
+    """续建统一入口（§4）：开通失败重试（pending/error）、running 升级/切镜像、
+    released **恢复**（§6.1.3）都从这里走；purged 拒绝。
 
     deploy 的每一步都是「已存在且一致就跳过」，所以重跑是**续建**：DNS/frp/NG
-    建到哪一步就接着往下走，不重建已经对的东西。只在从未走完（pending）或已判死
-    （error）时允许；deploying 有 job 在跑、released 是终态、running 该走 restart。
+    建到哪一步就接着往下走，不重建已经对的东西。恢复即完整跑一遍 deploy：外部
+    三处按登记 id 重建/复用，容器 compose up，原 slug/容器名/公网端口回来
+    （frp 步先探占用，被占才换端口并 event 说破）。
+    body 可选 `{"image": "目标tag"}`：留空 = 站点当前目标 tag。
+    详情页的「升级/重建」（running）与「恢复实例」（released）按钮都走这个入口（§9）。
     """
     state = _state(request)
+    image_param = (body.image or "").strip() if body else ""
     async with state.db.session() as s:
         inst = await _load_instance(s, instance_id)
-        if inst.desired_state == "released" or inst.state not in _DEPLOYABLE:
+        if inst.state not in _DEPLOYABLE:
             raise HTTPException(
                 status_code=409,
                 detail={"ok": False, "error": f"cannot_deploy_from_{inst.state}",
-                        "message": "只有开通失败或尚未开通的实例可以重跑；"
-                                   "运行中的实例请走重启"})
+                        "message": "该状态不可重跑开通：有任务在跑就等它结束，"
+                                   "purged 是终态不可重开；"
+                                   "released 恢复与 running 切镜像都直接重跑 deploy"
+                                   "（幂等续建，重建容器会短暂打断会话）"})
         for j in await repo.unfinished_jobs(s):
             if j.instance_id == inst.id:
                 raise HTTPException(
@@ -410,11 +438,18 @@ async def retry_deploy(request: Request, instance_id: int) -> dict[str, Any]:
                             "message": f"该实例已有 {j.kind} 任务在跑（job {j.id}），"
                                        "等它结束再重跑"})
         prev_state = inst.state
-        job = await repo.create_job(s, inst.id, "deploy")
+        # 来路（§4）：入队时按当时状态定死，工单页据此出标题与完成文案，不靠 URL 猜。
+        purpose = ("restore" if prev_state == "released"
+                   else "upgrade" if prev_state in ("running", "unhealthy")
+                   else "create")
+        job = await repo.create_job(
+            s, inst.id, "deploy",
+            {"purpose": purpose, **({"image": image_param} if image_param else {})})
         await repo.add_event(s, "deploy_requeued",
                              message=f"重新开通 {inst.slug}（从 {prev_state} 续建）",
                              instance_id=inst.id, job_id=job.id,
-                             data={"from": prev_state})
+                             data={"from": prev_state, "purpose": purpose,
+                                   **({"image": image_param} if image_param else {})})
     state.runner.spawn(job.id)
     return {"job_id": job.id}
 
@@ -449,6 +484,42 @@ async def release_instance(request: Request, instance_id: int,
                                 detail={"ok": False, "error": "already_released"})
         job = await repo.create_job(s, inst.id, "release")
         await repo.add_event(s, "release_queued", message=f"释放 {inst.slug} 已确认",
+                             instance_id=inst.id, job_id=job.id, data={"slug": inst.slug})
+    state.runner.spawn(job.id)
+    return {"job_id": job.id}
+
+
+@router.post("/instances/{instance_id}/purge", dependencies=[Depends(require_xrw)])
+async def purge_instance(request: Request, instance_id: int,
+                         body: PurgeRequest) -> dict[str, Any]:
+    """彻底释放（§6.4）：released 的终态化——删容器、删数据目录，不可恢复。
+
+    确认词逐字等于 slug（同 release：值由前端填，长按确认，服务端不因体验放松）。
+    仅 released 可发起：running/error 等一律 409 cannot_purge_from_<state>——
+    对还在跑的实例删数据是灾难；purged 也是 409（已是终态）。
+    """
+    state = _state(request)
+    async with state.db.session() as s:
+        inst = await _load_instance(s, instance_id)
+        if body.confirm != inst.slug:
+            raise HTTPException(status_code=422,
+                                detail={"ok": False, "error": "confirm_mismatch",
+                                        "message": "确认词必须逐字等于实例 slug"})
+        if inst.state != "released":
+            raise HTTPException(
+                status_code=409,
+                detail={"ok": False, "error": f"cannot_purge_from_{inst.state}",
+                        "message": "只有已释放（released）的实例可以彻底释放"})
+        for j in await repo.unfinished_jobs(s):
+            if j.instance_id == inst.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"ok": False, "error": "job_in_progress",
+                            "message": f"该实例已有 {j.kind} 任务在跑（job {j.id}），"
+                                       "等它结束再彻底释放"})
+        job = await repo.create_job(s, inst.id, "purge",
+                                    {"source": "manual", "confirm": inst.slug})
+        await repo.add_event(s, "purge_queued", message=f"彻底释放 {inst.slug} 已确认",
                              instance_id=inst.id, job_id=job.id, data={"slug": inst.slug})
     state.runner.spawn(job.id)
     return {"job_id": job.id}

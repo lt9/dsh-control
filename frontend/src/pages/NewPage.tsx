@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { useAsync } from "../lib/hooks";
 import { Icon } from "../components/ui";
 
@@ -15,15 +15,6 @@ export default function NewPage() {
   const ov = useAsync(() => api.overview(), []);
   const [hostId, setHostId] = useState<number | null>(null); // null = 服务端按剩余空间挑
   const [busy, setBusy] = useState(false);
-  // 输入框收 slug（dsh-04）也收卡片上显示的那个完整域名（dsh-04.example.test）：
-  // 上一版只认 slug，页面却写着"把域名打进输入框"，不懂技术的人打到第一步就卡住。
-  const matchesTarget = (v: string) => {
-    const s = v.trim().toLowerCase();
-    if (!s || !nextSlug) return false;
-    return s === nextSlug.toLowerCase() || s === (dnsName ?? "").toLowerCase();
-  };
-  const [armed, setArmed] = useState(false);
-  const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   // 域名后缀首选站点配置（overview.dns_zone 等字段，防御式读），退而求其次从既有实例反推。
@@ -43,15 +34,29 @@ export default function NewPage() {
   const hostList = (hosts.data ?? []).filter((h) => h.enabled !== false);
   const picked = hostList.find((h) => h.id === hostId) ?? null;
 
+  // 防"连点两次凭空开出一台公网实例"（2026-10-21 现网事故）不靠让人打字（§9 新建零打字）：
+  // confirm 由这张卡回显（就是上面显示的那个名字），服务端逐字比对它刚算出的 slug——
+  // 真双击的第二下带的是已经过期的名字，服务端直接 422，什么都不会建。
+  // 前端这里再把提交那一下锁死：ref 同步置位，同一次点击事件循环里发不出第二个请求。
+  const started = useRef(false);
   const start = async () => {
+    if (started.current) return;
+    if (!nextSlug) { setError("还没拿到要创建的域名，刷新页面重试"); return; }
+    started.current = true;
     setBusy(true); setError(null);
     try {
-      if (!nextSlug) throw new Error("还没拿到要创建的域名，刷新页面重试");
       const r = await api.create({ ...(hostId == null ? {} : { host_id: hostId }), confirm: nextSlug });
       nav(`/jobs/${r.job_id}?instance=${r.instance_id}&kind=deploy`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // 没建成才解锁让人再试；名字可能是被别人抢先占了，所以重新取一次号
+      started.current = false;
       setBusy(false);
+      void plan.reload();
+      // 确认词不对 = 卡片上的名字已经不是服务端此刻给的那个了。后端那行解释是写给
+      // "把名字填进确认框"的旧交互的，这一期没有输入框，这里按码说这一页自己的话。
+      setError(e instanceof ApiError && e.code === "confirm_mismatch"
+        ? "这个名字刚被别人抢先占了（或者是这一页放太久了）。已经重新取好号，照着卡片上新的那个名字再点一次。"
+        : e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -110,42 +115,17 @@ export default function NewPage() {
               </div>
             )}
             <div className="confirm-foot">
-              {/* 二次确认必须是"键盘动作"，不能是"第二次点击"。
-                  上一版数点击次数，被真双击 / 自动化连发 mouseReleased+mouseClicked
-                  直接穿过去，2026-10-21 现网误建了一台 dsh-03（已走释放流程回收）。
-                  这一步会在云上建 DNS、开隧道、加反代站点并起容器，必须打到
-                  输入框里的域名与卡片上显示的一致才允许提交。 */}
-              {!armed ? (
-                <>
-                  <button type="button" className="btn btn-primary btn-lg" disabled={busy || !nextSlug}
-                    onClick={() => { setArmed(true); setTyped(""); }}>
-                    {busy ? "已提交，正在装船…" : nextSlug ? "开始部署" : "正在取号…"}
-                  </button>
-                  <span className="mut small">十步开通，随时可回台账看进度</span>
-                </>
-              ) : (
-                <>
-                  <input className="input" type="text" value={typed} autoFocus
-                    aria-label={`输入 ${nextSlug ?? "域名"} 以确认新建`}
-                    placeholder={`输入 ${nextSlug ?? "域名"}（或完整域名）确认`}
-                    onChange={(e) => setTyped(e.target.value)} />
-                  <button type="button" className="btn btn-primary btn-lg"
-                    disabled={busy || !matchesTarget(typed)} onClick={() => void start()}>
-                    {busy ? "已提交，正在装船…" : "确认新建"}
-                  </button>
-                  <button type="button" className="btn btn-ghost"
-                    onClick={() => { setArmed(false); setTyped(""); }}>
-                    返回改主意
-                  </button>
-                </>
-              )}
+              <button type="button" className="btn btn-primary btn-lg" disabled={busy || !nextSlug}
+                onClick={() => void start()}>
+                {busy ? "已提交，正在装船…" : nextSlug ? "开始部署" : "正在取号…"}
+              </button>
+              <span className="mut small">十步开通，随时可回台账看进度</span>
             </div>
-            {armed && (
-              <p className="mut small" role="note">
-                确认：会在云上新建 DNS、隧道、反代站点并在机器上起容器。请把上面卡片里的域名
-                或完整域名原样打进输入框才允许提交——点两下不算确认。
-              </p>
-            )}
+            <p className="mut small" role="note">
+              确认：会在云上新建 DNS、隧道、反代站点并在机器上起容器。这一页不用打任何字：
+              卡片上的 <span className="mono">{nextSlug ?? "正在取号…"}</span> 提交时原样回传给服务端核对，
+              名字要是刚被别人抢先占了就直接拒绝，绝不会建成别的。
+            </p>
           </div>
         </div>
       </div>

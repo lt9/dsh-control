@@ -32,7 +32,7 @@ def envelope(body):
 
 
 def make_record(rid, name, client="c1.example@1", lip="192.0.2.10", lport=13000,
-                rport=4894, config_b64=False):
+                rport=20002, config_b64=False):
     inner = tunnel_config_payload(name=name, local_ip=lip, local_port=lport,
                                   remote_port=rport)
     cfg = encode_config(inner) if config_b64 else json.dumps(inner)
@@ -119,7 +119,7 @@ class FakePanel:
 
 def test_config_encode_is_base64_of_json_string():
     inner = tunnel_config_payload(name="dsh_a", local_ip="192.0.2.10",
-                                  local_port=13000, remote_port=4894)
+                                  local_port=13000, remote_port=20002)
     enc = encode_config(inner)
     assert json.loads(base64.b64decode(enc).decode()) == inner
     # 键序与内部形状照契约
@@ -210,14 +210,14 @@ def test_envelope_rejects_unknown_proxy_field_before_any_request():
 
 def test_list_maps_tunnel_fields_and_filters_client():
     api = FakePanel([
-        make_record(9001, "dsh_a", rport=4894),
-        make_record(9002, "someone_b", client="other.example@1", rport=4899),
+        make_record(9001, "dsh_a", rport=20002),
+        make_record(9002, "someone_b", client="other.example@1", rport=20009),
     ])
     panel = api.panel()
     all_t = run(panel.list())
     assert len(all_t) == 2
     a = next(t for t in all_t if t.name == "dsh_a")
-    assert (a.proxy_id, a.remote_port, a.local_ip, a.local_port) == (9001, 4894, "192.0.2.10", 13000)
+    assert (a.proxy_id, a.remote_port, a.local_ip, a.local_port) == (9001, 20002, "192.0.2.10", 13000)
     only = run(panel.list("other.example@1"))
     assert [t.name for t in only] == ["someone_b"]
 
@@ -230,23 +230,23 @@ def test_list_error_envelope_raises():
 
 
 def test_remote_port_taken():
-    api = FakePanel([make_record(9001, "dsh_a", rport=4894)])
-    assert run(api.panel().remote_port_taken(4894)) is True
-    assert run(api.panel().remote_port_taken(4895)) is False
+    api = FakePanel([make_record(9001, "dsh_a", rport=20002)])
+    assert run(api.panel().remote_port_taken(20002)) is True
+    assert run(api.panel().remote_port_taken(20003)) is False
 
 
 # ------------------------------------------------------------------ ensure
 
 def test_ensure_idempotent_when_identical_exists():
-    api = FakePanel([make_record(9001, "dsh_a", rport=4894)])
+    api = FakePanel([make_record(9001, "dsh_a", rport=20002)])
     t = run(api.panel().ensure(name="dsh_a", client_id="c1.example@1", server_id="default",
-                               local_ip="192.0.2.10", local_port=13000, remote_port=4894))
+                               local_ip="192.0.2.10", local_port=13000, remote_port=20002))
     assert t.proxy_id == 9001
     assert "/api/v1/proxy/create_config" not in api.paths  # 一个字都不写
 
 
 def test_ensure_port_mismatch_refuses_to_touch_existing():
-    api = FakePanel([make_record(9001, "dsh_a", rport=4894)])
+    api = FakePanel([make_record(9001, "dsh_a", rport=20002)])
     with pytest.raises(IntegrationError) as ei:
         run(api.panel().ensure(name="dsh_a", client_id="c1.example@1", server_id="default",
                                local_ip="192.0.2.10", local_port=13000, remote_port=4900))
@@ -259,15 +259,15 @@ def test_ensure_rejects_foreign_names_without_any_request(bad_name):
     api = FakePanel([make_record(9001, "dsh_a")])
     with pytest.raises(NotManaged):
         run(api.panel().ensure(name=bad_name, client_id="c1.example@1", server_id="default",
-                               local_ip="192.0.2.10", local_port=1, remote_port=4893))
+                               local_ip="192.0.2.10", local_port=1, remote_port=20001))
     assert api.requests == []  # 连 login 都不该发
 
 
 def test_ensure_creates_with_base64_config_and_reads_back():
     api = FakePanel([make_record(9001, "someone_existing", client="other.example@1")])
     t = run(api.panel().ensure(name="dsh_new", client_id="c1.example@1", server_id="default",
-                               local_ip="127.0.0.1", local_port=13300, remote_port=4893))
-    assert t.name == "dsh_new" and t.proxy_id > 9001 and t.remote_port == 4893
+                               local_ip="127.0.0.1", local_port=13300, remote_port=20001))
+    assert t.name == "dsh_new" and t.proxy_id > 9001 and t.remote_port == 20001
     sent = api.body_of("/create_config")
     # CreateProxyConfigRequest 只有这四个字段（proto 核定）：没有 name/type
     assert set(sent) == {"clientId", "serverId", "config", "overwrite"}
@@ -276,7 +276,7 @@ def test_ensure_creates_with_base64_config_and_reads_back():
     assert list(envelope_obj) == ["proxies"]  # 控制台同款 {"proxies": [...]} 包装
     inner, = envelope_obj["proxies"]
     assert inner["name"] == "dsh_new"
-    assert inner["remotePort"] == 4893 and inner["localIP"] == "127.0.0.1"
+    assert inner["remotePort"] == 20001 and inner["localIP"] == "127.0.0.1"
     assert inner["plugin"] is None
 
 
@@ -354,7 +354,7 @@ def test_dry_run_ensure_and_delete_record_but_send_nothing():
     api = FakePanel([make_record(9001, "dsh_alpha")])
     panel = api.panel(dry_run=True, recorder=rec)
     t = run(panel.ensure(name="dsh_new", client_id="c1.example@1", server_id="default",
-                         local_ip="127.0.0.1", local_port=1, remote_port=4893))
+                         local_ip="127.0.0.1", local_port=1, remote_port=20001))
     assert t.proxy_id == 0  # 合成对象，编排层不许当真 id 存
     run(panel.delete(9001, expect_name="dsh_alpha"))
     assert "/api/v1/proxy/create_config" not in api.paths
