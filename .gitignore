@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+node_modules/
+frontend/dist/
+.secrets/
+secrets/
+data/
+*.sqlite
+.pytest_cache/
+.ruff_cache/
+
+# 本站点专属运维资料（含内网地址、记录 id、凭据名称），不随开源仓库发布
+docs/site/
+# 站点真实配置（含内网地址与凭据变量所指文件路径），不提交
+deploy/site.toml
+deploy/site.compose.yml
+
+# 前端设计走查工具的缓存（含真机截图），不随开源仓库发布
+.impeccable/
