@@ -40,44 +40,46 @@ jobs:
       - name: 构建
         run: npm run build
 
-  # 文档与测试里不许出现真实站点信息（内网地址、真实域名、真密钥形状）。
-  # 这一关独立成 job，是因为它挂了最容易被忽略——它不报错不代表没漏。
-  docs-hygiene:
+  # 发布面里不许出现真实站点值与密钥形状。域名/IP 那两条由仓库自己的守卫测试
+  # 负责（tests/unit/test_docs_have_no_site_values.py：只允许 RFC5737 文档段与
+  # 公共基础设施域名）——那条测试跑在上面的 pytest 里，这里不重复实现，
+  # 更不能在这里写死"我自己的域名"，那等于把要保护的东西贴进公开仓库。
+  secret-shapes:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 扫现网值
+      - name: 扫密钥形状
         run: |
           python - <<'PY'
-          import pathlib, re, sys
+          import pathlib, re, subprocess, sys
           bad = {
-              "真实域名": r"pipboy\.cn",
-              "内网地址": r"192\.168\.\d+\.\d+",
-              "运维密钥形状": r"dshc-[A-Za-z0-9_-]{12,}",
-              "32位十六进制密钥": r"\b[0-9a-f]{32}\b",
               "GitHub token": r"gh[pousr]_[A-Za-z0-9]{20,}",
-              "云 AK": r"LTAI[A-Za-z0-9]{12,}",
-              "私钥": r"BEGIN [A-Z ]*PRIVATE KEY",
+              "云访问密钥": r"LTAI[A-Za-z0-9]{12,}",
+              "私钥正文": r"BEGIN [A-Z ]*PRIVATE KEY",
+              "32位十六进制密钥": r"\b[0-9a-f]{32}\b",
+              "运维密钥明文": r"dshc-[A-Za-z0-9_-]{16,}",
           }
-          skip = re.compile(r"example\.(test|com)|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.")
+          files = subprocess.run(["git", "-c", "core.quotepath=off", "ls-files"],
+                                 capture_output=True, text=True).stdout.split("\n")
           hits = []
-          for p in list(pathlib.Path("docs").rglob("*.md")) + [
-                  pathlib.Path("README.md"), pathlib.Path("SECURITY.md"),
-                  pathlib.Path("CONTRIBUTING.md"), pathlib.Path("CHANGELOG.md")]:
+          for f in filter(None, files):
+              p = pathlib.Path(f)
               if not p.is_file():
+                  continue          # 二进制与子模块同样跳过
+              try:
+                  text = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
                   continue
-              for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
-                  if skip.search(line):
-                      continue
+              for n, line in enumerate(text.splitlines(), 1):
                   for name, pat in bad.items():
                       if re.search(pat, line):
                           hits.append(f"{p}:{n} 【{name}】")
           if hits:
-              print("发现现网值：")
+              print("发现密钥形状：")
               print("\n".join(hits[:20]))
               sys.exit(1)
-          print("文档干净")
+          print("没有密钥形状泄漏")
           PY
