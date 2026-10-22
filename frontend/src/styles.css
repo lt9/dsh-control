@@ -468,6 +468,73 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
 @keyframes sk { from { background-position: -160px 0; } to { background-position: 320px 0; } }
 .sk-line { height: 12px; margin: 10px 16px; }
 
+/* ————— 设置页（§9 第 5 屏：分发方式 / 下载基址 / 制品表 / 发布）————— */
+.btn-sm { padding: 3px 10px; font-size: 12.5px; }
+
+.input {
+  padding: 7px 10px; border: 1px solid var(--line-2); border-radius: var(--r-2);
+  background: var(--card); color: var(--ink); font: 13.5px var(--sans);
+}
+.input.mono { font-family: var(--mono); font-size: 12.5px; }
+.input:focus { border-color: var(--accent); }
+.input:disabled { color: var(--ink-disabled); background: var(--panel); }
+.field-cap { font-size: 13px; color: var(--ink-2); }
+
+/* 分发方式二选一：整张卡就是按钮，说明写在卡里——选错方向只有传过一次
+   GB 级镜像的人才知道疼，所以适用场景必须出现在眼前而不是文档里。 */
+.mode-pick { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.mode-card {
+  display: block; text-align: left; padding: 11px 13px 12px; cursor: pointer;
+  background: var(--card); color: var(--ink); border: 1px solid var(--line-2);
+  border-radius: var(--r-2); box-shadow: var(--shadow-1); font: inherit;
+  transition: border-color .15s ease, background .15s ease;
+}
+.mode-card:hover:not(:disabled) { border-color: var(--ink-3); }
+.mode-card.on { border-color: var(--accent); background: var(--accent-tint); box-shadow: inset 0 0 0 1px var(--accent); }
+.mode-card:disabled { cursor: default; }
+.mc-top { display: flex; align-items: center; gap: 8px; }
+.mc-top b { font-size: 14px; }
+.mc-dot { flex: none; width: 12px; height: 12px; border: 1px solid var(--line-2);
+  border-radius: 50%; background: var(--card); }
+.mode-card.on .mc-dot { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 2px var(--accent-tint); }
+.mc-use { font-size: 12px; color: var(--ink-2); }
+.mc-on-tag { margin-left: auto; font-size: 11px; letter-spacing: .12em; color: var(--accent-700); }
+.mc-note { display: block; margin-top: 6px; font-size: 12.5px; line-height: 1.6; color: var(--ink-2); }
+
+.base-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.base-field { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: min(320px, 100%); }
+.pub-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+.pub-field { display: flex; flex-direction: column; gap: 5px; }
+.pub-field.grow { flex: 1; min-width: min(280px, 100%); }
+
+/* 制品表：校验码与链接都是长串机器标识，列内换行而不是把表撑跑 */
+.img-tbl td { vertical-align: middle; }
+/* 标签和大小是扫读的两列，不许被压成两行 */
+.img-tbl .col-tag .row-title, .img-tbl .col-size, .img-tbl .col-when { white-space: nowrap; }
+.img-tbl .col-ops { width: 1%; }
+.sha-btn { background: none; border: 0; border-bottom: 1px dashed var(--line-2); padding: 0 0 1px;
+  cursor: pointer; color: var(--ink-2); font: 12.5px var(--mono); }
+.sha-btn:hover { color: var(--accent-700); border-bottom-color: var(--accent); }
+.sha-full { display: block; margin-bottom: 3px; width: 100%; text-align: left; background: none; border: 0;
+  padding: 0; cursor: pointer; color: var(--ink); font: 11.5px/1.5 var(--mono); word-break: break-all; }
+.cell-url { min-width: 230px; }
+.cell-url > * { margin-right: 8px; }
+.url-mask { color: var(--ink-2); word-break: break-all; }
+.cell-ops { text-align: right; white-space: nowrap; }
+
+/* 一次性回执（改完给一句「好了」，不要弹窗要人点） */
+.toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 40;
+  display: inline-flex; align-items: center; gap: 8px; max-width: min(560px, calc(100vw - 32px));
+  padding: 9px 14px; font-size: 13px;
+  background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok-line);
+  border-radius: var(--r-2); box-shadow: var(--shadow-2);
+  animation: toast-in .18s ease-out;
+}
+.toast svg { flex: none; }
+@keyframes toast-in { from { transform: translate(-50%, 6px); opacity: 0; } }
+
 /* ————— 响应式：只做结构收纳，不花屏 ————— */
 @media (max-width: 1020px) {
   .grid2, .job-cols { grid-template-columns: 1fr; }
@@ -480,6 +547,8 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
   .kv dt { margin-top: 8px; }
   .topbar-right { gap: 8px; }
   .topbar-right > span { display: none; }
+  .mode-pick { grid-template-columns: 1fr; }
+  .base-row .btn, .pub-form .btn-lg { flex: 1; justify-content: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {

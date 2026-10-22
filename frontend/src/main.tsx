@@ -6,6 +6,7 @@ import App from "./App";
 import ListPage from "./pages/ListPage";
 import DetailPage from "./pages/DetailPage";
 import NewPage from "./pages/NewPage";
+import SettingsPage from "./pages/SettingsPage";
 import JobPage from "./pages/JobPage";
 
 const router = createBrowserRouter([
@@ -16,6 +17,7 @@ const router = createBrowserRouter([
       { path: "/instances/new", element: <NewPage /> },
       { path: "/instances/:id", element: <DetailPage /> },
       { path: "/jobs/:id", element: <JobPage /> },
+      { path: "/settings", element: <SettingsPage /> },
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },

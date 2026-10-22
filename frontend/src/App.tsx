@@ -3,6 +3,7 @@ import { Navigate, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "./api/client";
 import { fmtFull } from "./lib/format";
 import LoginPage from "./pages/LoginPage";
+import { Icon } from "./components/ui";
 
 export default function App() {
   const [auth, setAuth] = useState<"unknown" | "in" | "out">("unknown");
@@ -48,6 +49,8 @@ export default function App() {
         <nav className="topnav" aria-label="主导航">
           <a href="/" className={loc.pathname === "/" ? "on" : ""}>台账</a>
           <a href="/instances/new" className={loc.pathname === "/instances/new" ? "on" : ""}>新建</a>
+          <a href="/settings" className={loc.pathname === "/settings" ? "on" : ""}
+            title="镜像分发方式与制品库"><Icon name="gear" size={13} />设置</a>
         </nav>
         <div className="topbar-right">
           {expires && <span>登录态到 {fmtFull(expires).slice(0, 16)}</span>}

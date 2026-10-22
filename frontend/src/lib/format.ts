@@ -1,6 +1,6 @@
 // 时间与状态语义。所有时间一律按 Asia/Shanghai 显示（§9）。
 
-import type { InstanceState, JobKind, JobPurpose, JobState, StepState } from "../api/client";
+import type { InstanceState, JobKind, JobPurpose, JobState, ShipMode, StepState } from "../api/client";
 
 const TZ = "Asia/Shanghai";
 
@@ -94,6 +94,22 @@ export const JOB_META: Record<JobKind, { zh: string }> = {
   restart: { zh: "重启" },
   release: { zh: "释放" },
   purge: { zh: "彻底释放" },
+  publish: { zh: "发布制品" },
+};
+
+/** §6.1.5 两种分发方式。名字照契约，说明写清各自吃谁的带宽——选错方向的代价
+ *  只有传过一次 GB 级镜像的人才知道，所以这一句必须写在按钮上而不是文档里。 */
+export const SHIP_MODE_META: Record<ShipMode, { zh: string; use: string; note: string }> = {
+  ssh: {
+    zh: "SSH 直传",
+    use: "局域网首选",
+    note: "源机 docker save 的流经面板内存直接灌进目标机 docker load，两边都不落盘、两台之间也不用互信。慢的地方是它两头都吃控制台带宽——公网机之间走这条会很难看。",
+  },
+  download: {
+    zh: "控制台下载",
+    use: "公网机首选",
+    note: "先把镜像发布成制品，目标机自己 curl 控制台公网域名去拉，拉完强制校验 sha256 再 load。控制台只被每台目标机拉一次，不再当转发的管道。",
+  },
 };
 
 /** deploy 工单的来路（§4：服务端入队时按当时状态定死，工单页据此出标题与完成文案，
