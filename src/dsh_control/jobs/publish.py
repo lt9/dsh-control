@@ -153,7 +153,7 @@ async def run_publish(ctx) -> None:
                                     sha256=sha, token=token, origin_host=host.name)
         else:
             # 同 tag 重发：行就地换（一次 UPDATE 提交 = 原子换行）。token 同步
-            # 换新——旧链接的 token 再也查不到，"旧链接立死"由这一提交生效。
+            # 换新——旧链接的门票到此为止，"旧链接立死"由这一提交生效。
             prev.filename = filename
             prev.size_bytes = size
             prev.sha256 = sha
@@ -161,6 +161,12 @@ async def run_publish(ctx) -> None:
             prev.origin_host = host.name
             prev.created_at = utcnow()
             await ctx.s.commit()
+        # ---- 提交点：从这一行起「表里的行永远指向完整文件」是既成事实。
+        # 作废 10/20 登记的全部回滚动作——之后任何一步（含 20 自己剩下的
+        # demote/event、30/40 渠道推送）失败都不许回头删已落定文件。真机
+        # 43 号工单就是栽在越界回滚：行在、文件没了、console 链接变 404。
+        # 渠道层残局（临时分卷、渠道行状态）由 _mirror_step 自己收尾。
+        ctx.rollback_actions.clear()
         if prev_filename and prev_filename != filename:
             # 老登记的指向别的文件（例如旧的命名口径）：换行成功后才清旧文件
             _cleanup(store / prev_filename)
@@ -179,6 +185,7 @@ async def run_publish(ctx) -> None:
                          "sha256": sha, "origin_host": host.name})
 
     # ---- 30 / 40：推外部渠道（§6.1.6）。前置不齐 skipped，推不动才红。
+    # 提交点已过（20 record 中部），这里失败只伤渠道行，不伤制品本体。
     await _mirror_step(ctx, 30, "github", tag, filename, store)
     await _mirror_step(ctx, 40, "gitee", tag, filename, store)
 

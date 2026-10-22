@@ -34,6 +34,26 @@ class MirrorError(RuntimeError):
     """渠道推送失败：message 直接进渠道行 error 与工单，先过调用方的 redact。"""
 
 
+def _js(resp) -> dict:
+    """响应体一律过成 dict 再 .get——gitee 真机实证：查不存在的 release 回
+    **HTTP 200 + 正文 null**（不是 404），`json().get` 当场 NoneType 崩（task-7）。
+    空 body / 非 JSON 同样按「没这个键」处理，不许在解析层炸。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ja(resp) -> list:
+    """列表版：200 + null / 空 body / 非列表一律当空。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
 def _client() -> httpx.AsyncClient:
     """唯一出口：测试 monkeypatch 本函数注入 MockTransport handler。"""
     return httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0),
@@ -115,18 +135,39 @@ async def github_push(token: str, repo: str, tag: str, filename: str,
                 await c.delete(f"{GITHUB_API}/repos/{repo}/releases/assets/{old['id']}",
                                headers=headers)
 
-        async def _astream():   # 流式读文件：GB 级整包不许进内存；读盘进线程
-            with path.open("rb") as f:
-                while True:
-                    b = await asyncio.to_thread(f.read, _UPLOAD_CHUNK)
-                    if not b:
-                        break
-                    yield b
+        # uploads.github.com 不吃 chunked——E2E 真机 400 Bad Content-Length（跑了
+        # 177s 才被拒）。流式 body 也必须带精确的 Content-Length：httpx 见手设的
+        # CL 就不再自动塞 Transfer-Encoding: chunked，h11 还会校验实发字节数与头
+        # 一致（对不上是传输层翻车，下面的计数守卫先一步给人话错误）。
+        file_size = await asyncio.to_thread(lambda: path.stat().st_size)
+
+        def _guarded_stream():
+            sent = 0
+
+            async def _astream():   # 流式读文件：GB 级整包不许进内存；读盘进线程
+                nonlocal sent
+                with path.open("rb") as f:
+                    while True:
+                        b = await asyncio.to_thread(f.read, _UPLOAD_CHUNK)
+                        if not b:
+                            break
+                        sent += len(b)
+                        if sent > file_size:
+                            raise MirrorError(
+                                f"实际文件比 {file_size} 字节大：制品行与盘上文件漂移，"
+                                "拒传——撒谎的 Content-Length 比 chunked 更糟")
+                        yield b
+                if sent != file_size:
+                    raise MirrorError(
+                        f"只发出 {sent}/{file_size} 字节，文件读到一半没了：拒传")
+
+            return _astream()
 
         up = await c.post(f"{upload_url}?name={quote(filename)}",
                           headers={**headers,
-                                   "Content-Type": "application/octet-stream"},
-                          content=_astream())
+                                   "Content-Type": "application/octet-stream",
+                                   "Content-Length": str(file_size)},
+                          content=_guarded_stream())
         if up.status_code in (401, 403):
             raise denied(up, "传 asset")
         if up.status_code not in (200, 201):
@@ -162,7 +203,13 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
                            "token 不能走 API？检查私人令牌有没有 projects 权限")
 
     async def attach(c, base: str, rel_id, file_path: Path) -> str:
-        """multipart 传单附件，字段名 file（官方口径），回 browser_download_url。"""
+        """multipart 传单附件，字段名 file（官方口径），回 browser_download_url。
+
+        自查结论（task-6）：httpx files= 会把整卷读进内存再发（multipart 没有
+        流式口径），所以**内存上限 = 一卷 ≈95MB**，不是制品全量——这正是分卷
+        切 95m 的另一层意义。手拼流式 multipart 要自己管 boundary 偏移和长度，
+        超出必要复杂度，不动。
+        """
         with file_path.open("rb") as fh:
             up = await c.post(f"{base}/releases/{rel_id}/attach_files", data=tok,
                               files={"file": (file_path.name, fh,
@@ -172,7 +219,7 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
         if up.status_code not in (200, 201):
             raise MirrorError(f"Gitee 传 {file_path.name} 失败 HTTP "
                               f"{up.status_code}: {up.text[:200]}")
-        url = str(up.json().get("browser_download_url") or "")
+        url = str(_js(up).get("browser_download_url") or "")
         if not url:
             raise MirrorError(f"{file_path.name} 传上去但响应里没有 "
                               "browser_download_url——直链口径变了，得核对 API")
@@ -184,25 +231,31 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
         g = await c.get(f"{base}/releases/tags/{tag_name}", params=tok)
         if g.status_code in (401, 403):
             raise denied("查 release", g.status_code)
-        if g.status_code == 200 and g.json().get("id"):
-            rel_id = g.json()["id"]
+        gj = _js(g)          # 200 + null（不存在）是 gitee 的正常回法，全线先过守卫
+        if g.status_code == 200 and gj.get("id"):
+            rel_id = gj["id"]
             # 同 tag 复用：旧附件清空重传（幂等重跑不许攒重复卷）
             assets = await c.get(f"{base}/releases/{rel_id}/assets", params=tok)
-            for old in (assets.json() if assets.status_code == 200 else []):
+            for old in (_ja(assets) if assets.status_code == 200 else []):
                 if old.get("id"):
                     await c.delete(f"{base}/releases/{rel_id}/assets/{old['id']}",
                                    params=tok)
         else:
             r = await c.post(f"{base}/releases",
                              data={**tok, "tag_name": tag_name,
-                                   "title": f"image {tag}",
+                                   # gitee 建版 name 与 target_commitish 皆必填
+                                   # （400 实测，官方文档口径一致）；快照链恒推
+                                   # main，tag 就从它起
+                                   "name": f"image {tag}",
+                                   "target_commitish": "main",
                                    "body": _release_body(tag, sha, size)})
             if r.status_code in (401, 403):
                 raise denied("建 release", r.status_code)
-            if r.status_code not in (200, 201) or not r.json().get("id"):
+            rj = _js(r)
+            if r.status_code not in (200, 201) or not rj.get("id"):
                 raise MirrorError(f"Gitee 建 release 失败 HTTP {r.status_code}: "
                                   f"{r.text[:200]}")
-            rel_id = r.json()["id"]
+            rel_id = rj["id"]
 
         tmp = Path(tempfile.mkdtemp(prefix="dshctl-mirror-"))
         try:
@@ -242,9 +295,10 @@ async def gitee_delete_release(token: str, repo: str, tag_name: str) -> None:
         if g.status_code in (401, 403):
             raise MirrorError(f"删旧 release 前查 {tag_name} 就被拒"
                               f"（HTTP {g.status_code}）")
-        if g.status_code != 200 or not g.json().get("id"):
+        gj = _js(g)          # 同样防 200 + null
+        if g.status_code != 200 or not gj.get("id"):
             return   # 查不回来：当它已经不在了，别猜
-        d = await c.delete(f"{base}/releases/{g.json()['id']}", params=tok)
+        d = await c.delete(f"{base}/releases/{gj['id']}", params=tok)
         if d.status_code not in (200, 202, 204):
             raise MirrorError(f"删 Gitee release {tag_name} 失败 HTTP "
                               f"{d.status_code}: {d.text[:200]}")

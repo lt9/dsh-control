@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import re
@@ -558,6 +559,9 @@ async def test_publish_github_asset_via_fake_api(ship_env, monkeypatch):
             return httpx.Response(204)
         if p == "/repos/someone/dsh-images/releases/9/assets" and request.method == "POST":
             assert request.headers["content-type"] == "application/octet-stream"
+            assert request.headers.get("content-length") == str(len(payload)), \
+                "uploads.github.com 不吃 chunked：必须带精确 Content-Length（E2E 400）"
+            assert "transfer-encoding" not in request.headers, "不许再走 chunked"
             assert request.content == payload, "asset 必须就是制品本体"
             return httpx.Response(201, json={"id": 10, "name": "dsh-test_v9.tar.gz"})
         raise AssertionError(f"假 API 不该收到 {request.method} {p}")
@@ -639,6 +643,9 @@ async def test_publish_gitee_splits_manifest_and_prunes_old(ship_env, monkeypatc
         if p == f"{base}/releases" and request.method == "POST":
             assert "access_token=gt_x" in str(request.url) or \
                    b"access_token" in request.content
+            # gitee 建版：name 与 target_commitish 皆必填（缺任一回 400）
+            assert b"name=" in request.content, "建版缺 name"
+            assert b"target_commitish=main" in request.content, "建版缺 target_commitish"
             return httpx.Response(201, json={"id": 5})
         if p == f"{base}/releases/5/attach_files" and request.method == "POST":
             files = _multipart_files(request.content)
@@ -770,6 +777,35 @@ async def test_step20_skips_unreachable_channel_in_order(ship_env, monkeypatch):
                for e in evs), "事件里点名选了哪条渠道"
 
 
+async def test_step20_host_base_url_forwards_console_past_channels(
+        ship_env, monkeypatch):
+    """主机显式登记 image_base_url=就近意图：console 必须排到外部渠道前面。
+    实测教训：NAS/主机上制品就在本地，按默认 gitee 优先去绕外网是南辕北辙。"""
+    await _seed_artifact(ship_env, b"tarstream", tag=IMG)
+    await _prep_download_mode(ship_env, IMG)
+    await _seed_channel(ship_env, IMG, "gitee",
+                        url="https://gitee.example/dsh-test_v9.tar.gz.manifest.json")
+    await _seed_channel(ship_env, IMG, "github",
+                        url="https://gt.example/download/image-dsh-test_v9/dsh-test_v9.tar.gz")
+    async with ship_env.db.session() as s:
+        h = await repo.get_host(s, ship_env.host_nas)
+        h.image_base_url = "http://198.51.100.77:4893"
+        await s.commit()
+
+    ex = ship_env.providers.executor
+    loaded = {"done": False}
+    monkeypatch.setattr(ex, "run", _probe_runner(ex, ex.run, loaded))
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert len(probes) == 1 and "/dl/" in probes[0], \
+        "登记了近端基址，第一条探测就该是 console，赢了不许再探外部渠道"
+    pull = next(c for c in ex.commands if "curl -fL" in c)
+    assert "198.51.100.77:4893/dl/" in pull and "sha256sum -c" in pull
+
+
 async def test_step20_gitee_reassembles_with_full_sha_check(ship_env, monkeypatch):
     await _seed_artifact(ship_env, b"tarstream", tag=IMG)
     await _prep_download_mode(ship_env, IMG)
@@ -814,3 +850,180 @@ async def test_step20_all_channels_unreachable_names_each(ship_env, monkeypatch)
     probes = [c for c in ex.commands if "--max-time 8" in c]
     assert len(probes) == 3
     assert not any("docker load" in c for c in ex.commands), "一条都没通就不许 load"
+
+
+async def test_github_upload_over_real_h11_has_exact_content_length(tmp_path, monkeypatch):
+    """MockTransport 之外的一条：真 h11 框架——裸 socket 服务器上逐字节验
+    「头里 Content-Length==size、没有 chunked、实发字节数分毫不差」。
+    uploads.github.com 就是被 chunked 打过 400 的，这条测试是它的替身。"""
+    payload = b"z" * 300_000
+    f = tmp_path / "dsh-test_v9.tar.gz"
+    f.write_bytes(payload)
+    seen: dict[str, object] = {}
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while True:                                    # 一条连接串多请求（keep-alive）
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    writer.close()
+                    return
+                head += chunk
+            head_txt, _, rest = head.partition(b"\r\n\r\n")
+            lines = head_txt.decode("latin1").split("\r\n")
+            method, target, _ = lines[0].split(" ", 2)
+            hdrs = {}
+            for ln in lines[1:]:
+                k, _, v = ln.partition(":")
+                hdrs[k.strip().lower()] = v.strip()
+            body = rest
+            need = int(hdrs.get("content-length", 0))
+            while len(body) < need:
+                body += await reader.read(min(65536, need - len(body)))
+            if target.startswith("/upload") and method == "POST":
+                seen["cl"] = hdrs.get("content-length")
+                seen["te"] = hdrs.get("transfer-encoding")
+                seen["sent"] = len(body)
+                seen["body_ok"] = body == payload
+                reply = b'{"id": 10}'
+                code = "201 Created"
+            elif target.startswith("/repos/") and method == "POST":
+                reply = b'{"message": "tag_name already exists"}'   # 走复用分支
+                code = "422 Unprocessable Entity"
+            elif "/releases/tags/" in target:
+                reply = ('{"id": 9, "upload_url": "'
+                         + base_url + '/upload{?name,label}"}').encode()
+                code = "200 OK"
+            elif method == "PATCH":
+                reply = b'{"id": 9}'
+                code = "200 OK"
+            elif "/assets" in target and method == "GET":
+                reply = b"[]"
+                code = "200 OK"
+            else:
+                reply = b'{"message": "unexpected"}'
+                code = "500 Server Error"
+            resp = (f"HTTP/1.1 {code}\r\nContent-Type: application/json"
+                    f"\r\nContent-Length: {len(reply)}\r\n\r\n").encode() + reply
+            writer.write(resp)
+            await writer.drain()
+
+    async def starter():
+        nonlocal base_url
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        base_url = f"http://127.0.0.1:{port}"
+        return server
+
+    base_url = ""
+    server = await starter()
+    monkeypatch.setattr(mirror, "GITHUB_API", base_url)
+    async with server:
+        url, rel_tag = await mirror.github_push(
+            "tok", "someone/dsh-images", "dsh-test:v9", "dsh-test_v9.tar.gz",
+            f, hashlib.sha256(payload).hexdigest(), len(payload))
+    assert rel_tag == "image-dsh-test_v9"
+    assert url == ("https://github.com/someone/dsh-images/releases/download/"
+                   "image-dsh-test_v9/dsh-test_v9.tar.gz")
+    assert seen.get("cl") == str(len(payload)), f"真线上头里必须有 CL：{seen}"
+    assert seen.get("te") is None, "真线上不许有 Transfer-Encoding: chunked"
+    assert seen.get("sent") == len(payload) and seen.get("body_ok"), "实发字节分毫不差"
+
+
+# ------------------------------------------------ 真机两轮踩的坑（task-7 钉桩）
+
+async def test_gitee_200_null_body_treated_as_missing_release(ship_env, monkeypatch):
+    """gitee 真机实证：查不存在的 release 回 **200 + 正文 null**（不是 404）。
+    曾经 40 步 0.3s 崩在 NoneType.get——这条把它钉死：null 当「不存在」走建版分支。"""
+    install_fake_save(monkeypatch, {"payload": b"g" * 512})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt_x"},
+                              headers=XRW)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        base = "/api/v5/repos/someone/dsh-images"
+        if p == f"{base}/releases/tags/image-dsh-test_v9":
+            return httpx.Response(200, json=None)        # ← 真机就长这样
+        if p == f"{base}/releases" and request.method == "POST":
+            return httpx.Response(201, json={"id": 5})
+        if p == f"{base}/releases/5/attach_files":
+            name = next(iter(_multipart_files(request.content)))
+            return httpx.Response(201, json={
+                "id": 1, "name": name,
+                "browser_download_url": f"https://gitee.example/attach/{name}"})
+        raise AssertionError(f"假 API 不该收到 {request.method} {p}")
+
+    calls: list = []
+    _fake_api(monkeypatch, handler, calls)
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    assert any(m == "POST" and u.endswith("/releases") for m, u in calls), \
+        "null 必须走「不存在→建版」分支，而不是复用一条不存在的 release"
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        row = await repo.get_channel(s, art.id, "gitee")
+        assert row.state == "ok"
+
+
+async def test_mirror_failure_does_not_rollback_committed_artifact(ship_env, monkeypatch):
+    """43 号工单教训的钉桩：20 record 提交后，40 步失败只许伤渠道行——
+    制品文件必须在、行必须有效、console 链接必须还活着、github ok 行不许动。"""
+    payload = b"g" * 4096
+    install_fake_save(monkeypatch, {"payload": payload})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/github", json={"token": "gh"},
+                              headers=XRW)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt"},
+                              headers=XRW)
+    upload_url = ("https://uploads.github.com/repos/someone/dsh-images"
+                  "/releases/9/assets{?name,label}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/repos/someone/dsh-images/releases" and request.method == "POST":
+            return httpx.Response(201, json={"id": 9, "upload_url": upload_url})
+        if p == "/repos/someone/dsh-images/releases/9/assets":
+            if request.method == "GET":
+                return httpx.Response(200, json=[])
+            return httpx.Response(201, json={"id": 10, "name": "dsh-test_v9.tar.gz"})
+        # ——以下是 gitee：建版必炸（真机第二轮的位置），且先回一个 200+null 探路
+        base = "/api/v5/repos/someone/dsh-images"
+        if p == f"{base}/releases/tags/image-dsh-test_v9":
+            return httpx.Response(200, json=None)
+        if p == f"{base}/releases" and request.method == "POST":
+            return httpx.Response(500, json={"message": "boom"})
+        raise AssertionError(f"炸点之后 gitee 不许再发 {request.method} {p}")
+
+    _fake_api(monkeypatch, handler, [])
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "failed"
+    steps = {st["key"]: st for st in job["steps"]}
+    assert steps["image_record"]["state"] == "succeeded"
+    assert steps["mirror_github"]["state"] == "succeeded"
+    assert steps["mirror_gitee"]["state"] == "failed"
+    logs = (await ship_env.client.get(f"/api/jobs/{job['id']}/logs")).json()["items"]
+    assert not any(ln["line"].startswith("回滚") for ln in logs), \
+        "提交点之后不许有任何回滚动作（越界回滚=砸穿「行存在即文件完整」）"
+    # 制品本体毫发无损：文件在、字节对、行有效
+    f = Path(ship_env.settings.image_store) / "dsh-test_v9.tar.gz"
+    assert f.exists() and f.read_bytes() == payload
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        assert art is not None and art.size_bytes == len(payload)
+        assert (await repo.get_channel(s, art.id, "github")).state == "ok"
+        g = await repo.get_channel(s, art.id, "gitee")
+        assert g.state == "failed" and "500" in g.error
+    # console 链接没变成谎言：免 cookie 下载 200
+    item = next(i for i in (await ship_env.client.get("/api/images")).json()["items"]
+                if i["tag"] == IMG)
+    ship_env.client.cookies.clear()
+    r = await ship_env.client.get(f"/dl/{item['token']}/{item['url'].rsplit('/', 1)[-1]}")
+    assert r.status_code == 200 and r.content == payload
