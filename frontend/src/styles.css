@@ -571,6 +571,60 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
 .url-mask { color: var(--ink-2); word-break: break-all; }
 .cell-ops { text-align: right; white-space: nowrap; }
 
+/* 外部渠道表（§6.1.6）：行序=探测优先序，箭头搬的就是这一行 */
+.chan-tbl td { vertical-align: middle; }
+.chan-tbl .col-ord { width: 1%; white-space: nowrap; }
+.ord { display: inline-flex; align-items: center; gap: 5px; }
+.ord .n { min-width: 1.1em; color: var(--ink-3); font-weight: 600; }
+.ord-btn { padding: 3px 5px; }
+.ord-btn svg { display: block; }
+.ord-btn.up svg { transform: rotate(-90deg); }
+.ord-btn.down svg { transform: rotate(90deg) /* 朝后挪 = 箭头朝下 */ }
+.chan-repo { max-width: 15em; padding: 4px 8px; font-size: 12.5px; }
+.chan-st { display: inline-flex; align-items: center; gap: 6px; }
+.chan-link { display: flex; align-items: center; gap: 8px; margin-top: 4px; max-width: 400px; }
+.chan-link .url-mask { flex: 1; min-width: 0; font-size: 12px; word-break: break-all; }
+/* 没配令牌的渠道：整行压灰但不藏——藏了他就不知道自己少配了一个渠道 */
+.chan-dim > td { color: var(--off); }
+.chan-dim .row-title { color: var(--off); }
+.chan-off { color: var(--off); }
+.dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-disabled); }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.err { background: var(--err); }
+.dot.off { background: var(--ink-disabled); }
+.tok { display: inline-flex; align-items: center; gap: 6px; margin-right: 10px; font-size: 12.5px; }
+.tok.ok { color: var(--ok); }
+.tok.off { color: var(--off); }
+.tok-in { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
+.tok-in .input { width: 14em; padding: 4px 8px; font-size: 12.5px; }
+/* 令牌即焚 + 顺道推送开关：开用选中色（accent），不占状态色的绿 */
+.auto-row {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--line);
+}
+.switch {
+  display: inline-flex; align-items: center; gap: 9px; margin-right: 1px;
+  padding: 0; background: none; border: 0; cursor: pointer;
+  font: 550 13px var(--sans); color: var(--ink-2);
+}
+.switch[aria-checked="true"] { color: var(--ink); }
+.switch i {
+  flex: none; position: relative; width: 32px; height: 18px; border-radius: 9px;
+  background: var(--panel); border: 1px solid var(--line-2);
+  transition: background .15s ease, border-color .15s ease;
+}
+.switch i::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--card); border: 1px solid var(--line-2);
+  transition: transform .15s ease, background .15s ease, border-color .15s ease;
+}
+.switch[aria-checked="true"] i { background: var(--accent-tint); border-color: var(--accent); }
+.switch[aria-checked="true"] i::after {
+  background: var(--accent); border-color: var(--accent); transform: translateX(14px);
+}
+.switch:disabled { cursor: default; opacity: .55; }
+
 /* 一次性回执（改完给一句「好了」，不要弹窗要人点） */
 .toast {
   position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 40;

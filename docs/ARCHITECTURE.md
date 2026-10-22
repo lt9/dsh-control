@@ -283,6 +283,10 @@ upgrade/restore 三个互不重叠；列表行携带与详情相同的
 | `cannot_deploy_from_<state>` | 409 | 从 purged/deploying 等不可续建状态发 deploy | 当前状态不能重新开通 |
 | `cannot_purge_from_<state>` | 409 | 从非 released 状态发起彻底释放（purged 也在其列） | 只有已释放的实例能彻底释放 |
 | `invalid_mode` | 422 | `PUT /api/settings` 的 `image_ship.mode` 不是 `ssh|download` | 分发方式只有两种，页面数据错了 |
+| `invalid_mirror_order` | 422 | `PUT /api/settings` 的 `mirror_order` 不是 `gitee/github/console` 的去重非空排列/子集 | 探测优先序只能是这三条渠道 |
+| `invalid_repo` | 422 | `mirrors.{ch}.repo` 不是 `owner/repo` 形（空串=清掉配置） | 仓库名写错了格式 |
+| `invalid_channel` | 422 | `PUT /api/mirror-tokens/{channel}` 渠道不是 `github|gitee` | 外部渠道只有这两个 |
+| `invalid_token` | 422 | 同上接口，token 是空白 | 令牌栏还空着 |
 
 不在表里但会遇到的两种：
 
@@ -582,6 +586,12 @@ deploy 第 20 步缺镜像分支（替代旧「报错让人跑 CLI」）：
   存 814M<1G 刚好过）再删旧 tag 的 release——仓库永远只有最新一版。gitee 渠道行
   的 `url` 指向 manifest。
 - **console**：§6.1.5 的 `/dl/{token}/`，永远兜底。
+
+**三条落地细则**（实现拍板，契约背书）：同 tag 重发先把该制品的旧渠道行打回
+`pending`——制品换货了，外部副本还是旧的，留着 `ok` 会让第 20 步拉到上一版；
+GitHub 同 tag 内同名 asset 先删旧再传新（幂等重跑不叠 asset，「历史保留」指的是
+别的 tag）；gitee 删旧版的触发口径 = 同渠道更早的 `ok` 行（覆盖同制品重发与
+新制品占位两种来路），删不动只 warn——1G 配额是软约束，不卡发布主流程。
 
 **探测选路（在目标机上做，不在面板上）**：面板装了梯子≠目标机有梯子，探测结果
 没有参考价值。download 模式缺镜像时，按 `mirror_order`（默认 gitee→github→console，

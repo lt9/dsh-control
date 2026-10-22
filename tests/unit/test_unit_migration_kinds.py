@@ -26,20 +26,24 @@ def _load(name: str):
 
 
 def test_最后一个_kind_迁移的集合等于模型集合():
-    mod = _load("image_key_kind")
+    # 0010 追加了 mirror_token（§6.1.6），它是最新一个改 credentials.kind 的迁移；
+    # 0004（image_key）作为历史钉桩继续留着不动。
+    mod = _load("image_channels")
     assert mod._KINDS_NEW == CREDENTIAL_KINDS
     assert mod._KINDS_OLD == tuple(
-        k for k in CREDENTIAL_KINDS if k != "image_key")
+        k for k in CREDENTIAL_KINDS if k != "mirror_token")
+    # 0010 的 _KINDS_OLD 必须接得上 0004 的 _KINDS_NEW——链不能断。
+    assert _load("image_key_kind")._KINDS_NEW == mod._KINDS_OLD
 
 
 def test_old_必须是_new_的子集():
     """_OLD 少写一个 kind，就等于把那条从白名单里删了——现网必炸。"""
-    mod = _load("image_key_kind")
+    mod = _load("image_channels")
     assert set(mod._KINDS_OLD) < set(mod._KINDS_NEW)
-    assert set(mod._KINDS_NEW) - set(mod._KINDS_OLD) == {"image_key"}
+    assert set(mod._KINDS_NEW) - set(mod._KINDS_OLD) == {"mirror_token"}
 
 
 def test_列注释列全了所有_kind():
-    mod = _load("image_key_kind")
+    mod = _load("image_channels")
     for kind in mod._KINDS_NEW:
-        assert kind in mod._COMMENT
+        assert kind in mod._KIND_COMMENT

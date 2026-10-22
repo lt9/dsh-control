@@ -323,40 +323,83 @@ async def _ship_missing_image(ctx: JobCtx, host: Any, image: str, have: str) -> 
 
     成功=返回（镜像已在目标机）；办不到必须 StepFailed——「没镜像照跑」不存在。
     """
-    mode, base = await repo.current_image_ship(ctx.s,
-                                               default_base=ctx.settings.public_base)
+    ship = await repo.current_image_ship(ctx.s, default_base=ctx.settings.public_base)
+    mode = ship["mode"]
+    base = ship["base_url"]
     # 按主机登记的下载基址优先：入口机拨自家公网域是 hairpin 黑洞（§6.1.5）
     host_base = (getattr(host, "image_base_url", "") or "").strip().rstrip("/")
     if host_base:
         base = host_base
     art = await repo.get_artifact_by_tag(ctx.s, image)
     if mode == "download" and art is not None:
-        if not base:
-            raise StepFailed(
-                f"分发方式=download 但下载基址没配（image_ship.base_url 与站点 "
-                f"public_base 都是空），目标机没镜像 {image} 且无处可拉")
-        url = f"{base}/dl/{art.token}/{art.filename}"
+        # ---- §6.1.6 探测选路：候选按 mirror_order 排，外部渠道只认渠道行 ok，
+        # console 恒在（现行为）。探测必须在目标机上跑——面板机装了梯子不算数。
         cache_dir = f"{host.data_root}/ship-cache"
         dest = f"{cache_dir}/{art.filename}"
-        await ctx.log("info", f"缺镜像：按设置（download）从制品库拉 {image} "
-                              f"（{art.size_bytes / (1 << 20):.1f} MB，sha 强校验）")
-        # 契约三连一字不差：curl 下载 → sha256sum -c 强制校验 → docker load → 删缓存。
-        # 缓存放 {data_root}/ship-cache：不赌 /tmp 是不是 tmpfs（GB 级塞 tmpfs
-        # 直接把机器内存打爆）。
-        r = await ctx.ssh(
-            f"mkdir -p '{cache_dir}' && "
-            f"curl -fL --retry 3 '{url}' -o '{dest}' && "
-            f"echo '{art.sha256}  {dest}' | sha256sum -c - && "
-            f"docker load -i '{dest}' && rm -f '{dest}'",
-            timeout=_SHIP_LOAD_TIMEOUT)
+        cands: list[tuple[str, str]] = []
+        for ch in ship["mirror_order"]:
+            if ch == "console":
+                if base:   # base 都没配就没有 console 入口，这一路不存在
+                    cands.append(("console", f"{base}/dl/{art.token}/{art.filename}"))
+            else:
+                row = await repo.get_channel(ctx.s, art.id, ch)
+                if row is not None and row.state == "ok" and row.url:
+                    cands.append((ch, row.url))
+        if not cands:
+            raise StepFailed(
+                f"分发方式=download，制品 {image} 存在但没有任何可用下载入口："
+                "console 基址没配（base_url/public_base 都空）、外部渠道没有 "
+                "state=ok 的行。去设置页配好基址，或发布时把渠道推成功。")
+        picked: tuple[str, str] | None = None
+        tried: dict[str, str] = {}
+        for ch, url in cands:
+            r = await ctx.ssh(f"curl -fsL --max-time 8 -r 0-0 -o /dev/null "
+                              f"'{url}' && echo OK", timeout=30)
+            if r.ok and "OK" in (r.stdout or ""):
+                picked = (ch, url)
+                break
+            tried[ch] = "不可达"
+        if picked is None:
+            detail = " / ".join(f"{ch}: {why}" for ch, why in tried.items())
+            raise StepFailed(f"{host.name} 把制品的全部渠道都探测失败"
+                             f"（{detail}）——渠道是目标机自己拨的，不是面板代拨；"
+                             "查该机出网，或换分发方式/渠道。")
+        ch, url = picked
+        skipped_probe = "、".join(tried) or "无"
+        await ctx.log("info", f"缺镜像：选路结果 = {ch}（探测顺序内第一个可达；"
+                              f"前面不通：{skipped_probe}）")
+        if ch == "gitee":
+            # gitee 三连：manifest → 按序拼卷（>>）→ **整包 sha 强校验** → load。
+            # 抽直链用 grep -o '"url":"http…"'——manifest 是我们生成的单行 JSON
+            # （separators 无空格、无嵌套转义），纯 POSIX 就够，不赌 jq/python3。
+            mani = f"{cache_dir}/manifest.json"
+            script = (
+                f"mkdir -p '{cache_dir}' && rm -f '{dest}' && "
+                f"curl -fL --retry 3 '{url}' -o '{mani}' && "
+                f"""for u in $(grep -o '"url":"http[^"]*"' '{mani}' """
+                f"""| sed 's/^"url":"//; s/"$//'); do """
+                f'curl -fL --retry 3 "$u" >> \'{dest}\' || exit 1; done && '
+                f"echo '{art.sha256}  {dest}' | sha256sum -c - && "
+                f"docker load -i '{dest}' && rm -rf '{cache_dir}'")
+            got = "gitee 分卷拼回"
+        else:
+            # 契约三连一字不差：curl 下载 → sha256sum -c → docker load → 删缓存。
+            # 缓存放 {data_root}/ship-cache：不赌 /tmp 是不是 tmpfs。
+            script = (
+                f"mkdir -p '{cache_dir}' && "
+                f"curl -fL --retry 3 '{url}' -o '{dest}' && "
+                f"echo '{art.sha256}  {dest}' | sha256sum -c - && "
+                f"docker load -i '{dest}' && rm -f '{dest}'")
+            got = f"{ch} 整包"
+        r = await ctx.ssh(script, timeout=_SHIP_LOAD_TIMEOUT)
         if not r.ok:
-            raise StepFailed("目标机拉取或加载制品失败（download 方式，"
-                             f"含 curl/sha256sum -c/docker load 三连）:\n{r.tail()}")
+            raise StepFailed(f"目标机经 {ch} 拉取或加载制品失败（{got}，"
+                             f"含 sha256sum -c/docker load）:\n{r.tail()}")
         if not await _image_present(ctx, host, image):
             raise StepFailed(f"docker load 回执正常但复查 {host.name} 上仍无 {image}"
                              "——load 进去的不是这个 tag")
-        await ctx.event("image_shipped", f"{image} 经 download 方式从制品库拉取并加载",
-                        {"image": image, "via": "download",
+        await ctx.event("image_shipped", f"{image} 经 {ch} 渠道拉取并加载",
+                        {"image": image, "via": ch, "probe": "target-host",
                          "origin_host": art.origin_host})
         return
     if mode == "ssh":

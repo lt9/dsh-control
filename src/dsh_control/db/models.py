@@ -40,8 +40,12 @@ JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
 CREDENTIAL_KINDS = ("ssh_key", "ssh_password", "aliyun_ak", "frp_panel",
-                    "ng_panel", "operator_key", "site", "llm_key", "image_key")
+                    "ng_panel", "operator_key", "site", "llm_key", "image_key",
+                    "mirror_token")
 HOST_UPSTREAM_MODES = ("frp", "direct")
+# 制品外部分发渠道（§6.1.6）：github/gitee 两路公共 Releases，console 恒兜底
+MIRROR_CHANNELS = ("github", "gitee")
+CHANNEL_STATES = ("pending", "ok", "failed")
 
 
 def _in(col: str, values: tuple[str, ...]) -> CheckConstraint:
@@ -58,19 +62,24 @@ class Base(DeclarativeBase):
 
 
 class Credential(Base):
-    """外部密钥仓库：按用户要求明文存库、可读回；只在 reveal 接口出网。"""
+    """外部密钥仓库：按用户要求明文存库、可读回；只在 reveal 接口出网。
+
+    例外：kind=mirror_token（§6.1.6 制品渠道令牌）**只写不回显**——任何 API
+    出口只给 token_set: true/false。自己的门（运维密钥）可读回，第三方的门不送。
+    """
 
     __tablename__ = "credentials"
     __table_args__ = (
         _in("kind", CREDENTIAL_KINDS),
-        {"comment": "外部密钥仓库：明文存储（用户要求可读回），只在 reveal 接口出网"},
+        {"comment": "外部密钥仓库：明文存储（用户要求可读回），只在 reveal 接口出网"
+                    "；mirror_token 例外——只写不回显（§6.1.6）"},
     )
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     kind: Mapped[str] = mapped_column(
         String(32),
         comment="类别：ssh_key/ssh_password/aliyun_ak/frp_panel/ng_panel"
-                               "/operator_key/site/llm_key/image_key")
+                               "/operator_key/site/llm_key/image_key/mirror_token")
     name: Mapped[str] = mapped_column(String(128), unique=True,
                                       comment="唯一名称，如 console-ed25519")
     secret: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict,
@@ -387,3 +396,36 @@ class ImageArtifact(Base):
                                              comment="从哪台主机 save 出来的；空串=手工投放")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
                                                  comment="发布时间（UTC）")
+
+
+class ImageChannel(Base):
+    """制品的外部分发渠道（契约 §6.1.6）：一制品一渠道一行，没有行=没推过。
+
+    url 是**目标机可直连**的入口：github=asset 直链；gitee=manifest 直链
+    （拼回剧本从它开始）。发布工单 30/40 步维护这行；第 20 步选路只认
+    state=ok 的行，且仍要在目标机上实测探测——行是登记事实，不是可达性承诺。
+    """
+
+    __tablename__ = "image_channels"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", "channel"),
+        _in("channel", MIRROR_CHANNELS),
+        _in("state", CHANNEL_STATES),
+        {"comment": "制品的外部分发渠道：一制品一渠道一行，没有行=没推过（§6.1.6）"},
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    artifact_id: Mapped[int] = mapped_column(BigInteger, index=True,
+                                             comment="逻辑指向 image_artifacts.id，无外键")
+    channel: Mapped[str] = mapped_column(String(16),
+                                         comment="渠道：github=整包 asset 直链；gitee=分卷 manifest 直链")
+    state: Mapped[str] = mapped_column(String(16), default="pending",
+                                       comment="渠道状态：pending/ok/failed——只有 ok 才进第 20 步候选")
+    url: Mapped[str] = mapped_column(String(1024), default="",
+                                     comment="目标机可直连入口：github=asset 直链；gitee=manifest 直链")
+    release_tag: Mapped[str] = mapped_column(String(255), default="",
+                                             comment="发布用的 release tag（image-<tag安全化>）；删旧版按它定位")
+    error: Mapped[str] = mapped_column(Text, default="",
+                                       comment="failed 时的原因（已脱敏）；ok 后留空或留历史说明")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 onupdate=utcnow, comment="最后推送时间（UTC）")

@@ -43,16 +43,31 @@ class DeployRequest(BaseModel):
 
 
 class ImageShipSettings(BaseModel):
-    """PUT /api/settings 的 image_ship 段（§6.1.5）：字段留 None = 不动该项。"""
+    """PUT /api/settings 的 image_ship 段（§6.1.5/§6.1.6）：字段留 None = 不动该项。"""
 
     mode: str | None = None              # ssh | download（其余 422）
     base_url: str | None = Field(default=None, max_length=512)
+    mirror_order: list[str] | None = None    # gitee/github/console 的排列/子集（§6.1.6）
+    auto_mirror: bool | None = None          # 发布是否顺道推外部渠道，默认 true
+
+
+class MirrorRepoPatch(BaseModel):
+    """PUT /api/settings 的 mirrors.{channel} 段：现在只有 repo 一个可写键。"""
+
+    repo: str | None = Field(default=None, max_length=255)   # 形如 owner/repo
 
 
 class PutSettingsRequest(BaseModel):
     """局部更新：只认已知键，别的键忽略不报错（§4 PUT /api/settings）。"""
 
     image_ship: ImageShipSettings | None = None
+    mirrors: dict[str, MirrorRepoPatch] | None = None   # 只认 github/gitee 两个键
+
+
+class MirrorTokenRequest(BaseModel):
+    """PUT /api/mirror-tokens/{channel}（§6.1.6）：只写不回显，响应永不含 token。"""
+
+    token: str = Field(min_length=1, max_length=4096)
 
 
 class PublishImageRequest(BaseModel):

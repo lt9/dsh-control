@@ -7,6 +7,13 @@
 
 ### 新增
 
+- **制品多路分发（契约 §6.1.6）**：发布制品现在顺道推 GitHub Releases（完整
+  asset）与 Gitee Releases（100M 附件红线 → 95M 分卷 + manifest，只留最新一版），
+  白嫖两家匿名 CDN；开通第 20 步在**目标机上**按优先序逐渠道探测（面板装梯子
+  不算数），第一条通的负责取货，gitee 拉齐分卷拼回后整包 sha256 强校验。
+  渠道令牌只写不回显（`kind=mirror_token`），设置页新增外部渠道卡：状态灯、
+  仓库内联改、探测优先序上下调、令牌写完即焚。开源快照同步推 gitee 仓
+  `BrilliantBoys/dsh-control`（与 GitHub 同纪律，只收干净快照链）。
 - **镜像分发可配置（契约 §6.1.5）**：新设置页选择镜像到目标机的搬运方式——
   SSH 直传（默认，局域网快路）或控制台制品下载（公网机自取）。制品=面板把
   `docker save | gzip` 落进 `DSHC_IMAGE_STORE` 的 tar.gz，每个 tag 一条免登录

@@ -1,6 +1,8 @@
 // 时间与状态语义。所有时间一律按 Asia/Shanghai 显示（§9）。
 
-import type { InstanceState, JobKind, JobPurpose, JobState, ShipMode, StepState } from "../api/client";
+import type {
+  ChannelState, InstanceState, JobKind, JobPurpose, JobState, ShipChannel, ShipMode, StepState,
+} from "../api/client";
 
 const TZ = "Asia/Shanghai";
 
@@ -110,6 +112,20 @@ export const SHIP_MODE_META: Record<ShipMode, { zh: string; use: string; note: s
     use: "公网机自取",
     note: "先把镜像发布成制品，目标机自己 curl 控制台公网域名去拉，拉完强制校验 sha256 再 load。控制台只被每台目标机拉一次，不再当转发的管道。",
   },
+};
+
+/** §6.1.6 三条渠道。名字与顺序解释见设置页那张表的 ? 气泡。 */
+export const CHANNEL_META: Record<ShipChannel, { zh: string }> = {
+  gitee: { zh: "Gitee" },
+  github: { zh: "GitHub" },
+  console: { zh: "控制台" },
+};
+
+/** 最新制品在某渠道的推送状态（image_channels）。null=那一行不存在=从没推过。 */
+export const CHANNEL_STATE_META: Record<Exclude<ChannelState, null>, { zh: string; tone: Tone }> = {
+  ok: { zh: "已推送", tone: "ok" },
+  pending: { zh: "推送中", tone: "warn" },
+  failed: { zh: "推送失败", tone: "err" },
 };
 
 /** deploy 工单的来路（§4：服务端入队时按当时状态定死，工单页据此出标题与完成文案，

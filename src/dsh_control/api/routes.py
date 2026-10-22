@@ -45,6 +45,7 @@ from .schemas import (
     CreateInstanceRequest,
     DeployRequest,
     LoginRequest,
+    MirrorTokenRequest,
     PublishImageRequest,
     PurgeRequest,
     PutSettingsRequest,
@@ -600,37 +601,92 @@ async def job_stream(request: Request, job_id: int):
     return EventSourceResponse(generator(), headers={"X-Accel-Buffering": "no"})
 
 
-# ------------------------------------------------------ 面板设置（§6.1.5 / §4）
+# ------------------------------------------------------ 面板设置（§6.1.5 / §6.1.6 / §4）
 
 _SHIP_MODES = ("ssh", "download")
+_MIRROR_ORDER_ALL = ("gitee", "github", "console")
+_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")   # owner/repo 口径（GitHub/Gitee 同形）
+
+
+async def _settings_payload(request: Request) -> dict[str, Any]:
+    """GET 的唯一装配口：全部返回**解析后的生效值**；token 永不出网（§6.1.6）。"""
+    state = _state(request)
+    async with state.db.session() as s:
+        ship = await repo.current_image_ship(s, default_base=state.settings.public_base)
+        repos = await repo.mirror_repos(s)
+        arts = await repo.list_artifacts(s)
+        latest = arts[0] if arts else None   # list_artifacts 按 created_at 倒序
+        mirrors: dict[str, Any] = {}
+        for ch in ("github", "gitee"):
+            token = await repo.mirror_token(s, ch)
+            row = await repo.get_channel(s, latest.id, ch) if latest else None
+            # 带全渠道行：前端 ok=直链复制（url）、failed=原因气泡（error），
+            # 状态键名 state（契约 §4 口径），没有行=null（§6.1.6）。
+            mirrors[ch] = {"repo": repos[ch], "token_set": bool(token),
+                           "state": row.state if row else None,
+                           "url": row.url if row else "",
+                           "error": row.error if row else "",
+                           "updated_at": iso(row.updated_at) if row else None}
+    return {"image_ship": {"mode": ship["mode"], "base_url": ship["base_url"],
+                           "mirror_order": ship["mirror_order"],
+                           "auto_mirror": ship["auto_mirror"]},
+            "mirrors": mirrors}
 
 
 @router.get("/settings")
 async def get_settings_api(request: Request) -> dict[str, Any]:
-    """面板运行设置：base_url 返回**解析后的生效值**（空串=站点 public_base 已代入）。"""
-    state = _state(request)
-    async with state.db.session() as s:
-        mode, base = await repo.current_image_ship(s, default_base=state.settings.public_base)
-    return {"image_ship": {"mode": mode, "base_url": base}}
+    """面板运行设置（§4）：base_url 给生效值；mirrors 段只给 token_set，不给 token。"""
+    return await _settings_payload(request)
 
 
 @router.put("/settings", dependencies=[Depends(require_xrw)])
 async def put_settings(request: Request, body: PutSettingsRequest) -> dict[str, Any]:
-    """局部更新面板设置：只认 image_ship，写进 site 凭据 secret，deploy 每轮现读。
+    """局部更新面板设置：只认 image_ship / mirrors 两个已知键，写进 site 凭据
+    secret（image_ship 一族），deploy/publish 每轮现读，改完不重启生效。
 
-    mode 非 ssh|download → 422（§4）；base_url 空串=回落站点 public_base。
+    校验（§6.1.6）：mode 非 ssh|download → 422；mirror_order 必须是
+    gitee/github/console 的去重非空排列/子集，否则 422 invalid_mirror_order；
+    mirrors.{ch}.repo 必须 owner/repo 形（空串=清掉配置），否则 422 invalid_repo。
     """
     state = _state(request)
-    if body.image_ship is None:
+    if body.image_ship is None and body.mirrors is None:
         # 只认已知键：整包没有可认的键就原样回当前值，不报错也不写库。
-        return await get_settings_api(request)
+        return await _settings_payload(request)
     patch = body.image_ship
-    mode = patch.mode if patch.mode is not None else None
+    mode = patch.mode if patch is not None else None
     if mode is not None and mode not in _SHIP_MODES:
         raise HTTPException(
             status_code=422,
             detail={"ok": False, "error": "invalid_mode",
                     "message": f"image_ship.mode 只认 {'|'.join(_SHIP_MODES)}，收到 {mode!r}"})
+    mirror_order = patch.mirror_order if patch is not None else None
+    if mirror_order is not None:
+        bad = (not mirror_order
+               or any(not isinstance(x, str) or x not in _MIRROR_ORDER_ALL
+                      for x in mirror_order)
+               or len(set(mirror_order)) != len(mirror_order))
+        if bad:
+            raise HTTPException(
+                status_code=422,
+                detail={"ok": False, "error": "invalid_mirror_order",
+                        "message": "mirror_order 必须是 "
+                                   f"{'/'.join(_MIRROR_ORDER_ALL)} 的去重排列或子集"
+                                   f"（非空），收到 {mirror_order!r}"})
+    repo_patches: dict[str, str] = {}
+    if body.mirrors:
+        for ch, cfg in body.mirrors.items():
+            if ch not in repo.MIRROR_CHANNELS:
+                continue   # 只认已知键：别的渠道名忽略
+            if cfg.repo is None:
+                continue
+            r = cfg.repo.strip()
+            if r and not _REPO_RE.fullmatch(r):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"ok": False, "error": "invalid_repo",
+                            "message": f"mirrors.{ch}.repo 要 owner/repo 形"
+                                       f"（如 someone/dsh-images），收到 {cfg.repo!r}"})
+            repo_patches[ch] = r
     async with state.db.session() as s:
         ship: dict[str, Any] = {}
         raw = await repo.get_site_value(s, "image_ship")
@@ -638,8 +694,19 @@ async def put_settings(request: Request, body: PutSettingsRequest) -> dict[str, 
             ship = dict(raw)
         if mode is not None:
             ship["mode"] = mode
-        if patch.base_url is not None:
+        if patch is not None and patch.base_url is not None:
             ship["base_url"] = patch.base_url.strip().rstrip("/")
+        if mirror_order is not None:
+            ship["mirror_order"] = list(mirror_order)
+        if patch is not None and patch.auto_mirror is not None:
+            ship["auto_mirror"] = patch.auto_mirror
+        if repo_patches:
+            mirrors = dict(ship.get("mirrors") or {})
+            for ch, r in repo_patches.items():
+                cfg = dict(mirrors.get(ch) or {})
+                cfg["repo"] = r
+                mirrors[ch] = cfg
+            ship["mirrors"] = mirrors
         # 读旧 secret 整包再并上 image_ship 写回——upsert 是整段覆盖，别把
         # public_base/dns_zone 这些同表兄弟键抹了（§2 seed 落的就是这一行）。
         cred = await repo.get_credential_by_kind(s, "site")
@@ -649,7 +716,35 @@ async def put_settings(request: Request, body: PutSettingsRequest) -> dict[str, 
             s, kind="site", name="site", secret=secret,
             note="站点描述文件 [site]+[providers] 段的落库镜像")
     # 回读解析后的生效值（与 GET 同口径）
-    return await get_settings_api(request)
+    return await _settings_payload(request)
+
+
+@router.put("/mirror-tokens/{channel}", dependencies=[Depends(require_xrw)])
+async def put_mirror_token(request: Request, channel: str,
+                           body: MirrorTokenRequest) -> dict[str, Any]:
+    """渠道令牌写入（§6.1.6）：upsert credentials(kind=mirror_token)。
+
+    **只写不回显**——响应只有 {ok, token_set}，任何 GET 出口也只有 token_set；
+    与运维密钥的 reveal 刻意不同：那是自己的门，这是第三方的门。
+    """
+    state = _state(request)
+    if channel not in repo.MIRROR_CHANNELS:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "invalid_channel",
+                    "message": f"渠道只认 {'|'.join(repo.MIRROR_CHANNELS)}，"
+                               f"收到 {channel!r}"})
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "invalid_token",
+                    "message": "token 不能是空白"})
+    async with state.db.session() as s:
+        await repo.upsert_credential(
+            s, kind="mirror_token", name=channel, secret={"token": token},
+            note=f"{channel} 制品渠道令牌（只写不回显，§6.1.6）")
+    return {"ok": True, "token_set": True}
 
 
 def _store_free_bytes(path: str) -> int | None:
@@ -667,9 +762,8 @@ async def list_images(request: Request) -> dict[str, Any]:
     state = _state(request)
     async with state.db.session() as s:
         arts = await repo.list_artifacts(s)
-        _mode, base = await repo.current_image_ship(s,
-                                                    default_base=state.settings.public_base)
-    items = [serialize.image_artifact_item(a, base_url=base) for a in arts]
+        ship = await repo.current_image_ship(s, default_base=state.settings.public_base)
+    items = [serialize.image_artifact_item(a, base_url=ship["base_url"]) for a in arts]
     return {"items": items, "store_free_bytes": _store_free_bytes(state.settings.image_store)}
 
 
@@ -711,6 +805,7 @@ async def delete_image(request: Request, artifact_id: int) -> dict[str, Any]:
         filename = art.filename
         tag = art.tag
         await repo.delete_artifact(s, art)   # 行先死：此后 token 查不到 → 链接立死
+        await repo.delete_channels(s, artifact_id)   # 渠道登记连坐删；外部 release 留着无妨
         await repo.add_event(s, "image_artifact_revoked",
                              message=f"制品 {tag} 已下架（删行删文件，链接失效）",
                              instance_id=None,

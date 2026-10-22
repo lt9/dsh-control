@@ -17,6 +17,7 @@ from .models import (
     Event,
     Host,
     ImageArtifact,
+    ImageChannel,
     Instance,
     InstanceConfig,
     InstanceSnapshot,
@@ -57,26 +58,122 @@ async def current_purge_after_days(s: AsyncSession, fallback: int) -> int:
 
 
 SHIP_MODES = ("ssh", "download")
+MIRROR_ORDER_DEFAULT = ["gitee", "github", "console"]   # 国内优先；探测不通自然滑向下一条（§6.1.6）
+MIRROR_CHANNELS = ("github", "gitee")                   # console 不算渠道，恒兜底
 
 
-async def current_image_ship(s: AsyncSession, *, default_base: str = "") -> tuple[str, str]:
-    """镜像分发方式的当前值（§6.1.5）：(mode, base_url)，与 purge 保留期同一个活读模式。
+def _clean_mirror_order(raw: object) -> list[str]:
+    """mirror_order 的容错读法：只认 gitee/github/console，去重保序；读坏回落默认。"""
+    if not isinstance(raw, (list, tuple)):
+        return list(MIRROR_ORDER_DEFAULT)
+    seen: list[str] = []
+    for x in raw:
+        if (isinstance(x, str) and x in ("gitee", "github", "console")
+                and x not in seen):
+            seen.append(x)
+    return seen or list(MIRROR_ORDER_DEFAULT)
 
-    site 凭据 secret 的 image_ship 优先；读不到或读坏回落 ("ssh", 站点 public_base)。
-    base_url 空串=吃 site 的 public_base——返回的永远是**解析后的生效值**（§4）。
-    default_base 是 settings.public_base 的兜底（site 行还没灌时）。
+
+async def current_image_ship(s: AsyncSession, *, default_base: str = "") -> dict[str, Any]:
+    """镜像分发设置的当前值（§6.1.5/§6.1.6），与 purge 保留期同一个活读模式。
+
+    返回生效值：{"mode", "base_url", "mirror_order", "auto_mirror"}。site 凭据
+    secret 的 image_ship 优先；读不到或读坏逐键回落默认（ssh / 站点 public_base /
+    gitee→github→console / True）。base_url 空串=吃 site 的 public_base。
     """
     raw = await get_site_value(s, "image_ship")
-    mode = raw.get("mode") if isinstance(raw, dict) else None
-    if mode not in SHIP_MODES:
-        mode = "ssh"
-    base = ""
-    if isinstance(raw, dict):
-        base = str(raw.get("base_url") or "").strip().rstrip("/")
+    d = raw if isinstance(raw, dict) else {}
+    mode = d.get("mode") if d.get("mode") in SHIP_MODES else "ssh"
+    base = str(d.get("base_url") or "").strip().rstrip("/")
     if not base:
         base = str(await get_site_value(s, "public_base") or default_base or "").strip()
         base = base.rstrip("/")
-    return mode, base
+    auto_mirror = d.get("auto_mirror")
+    auto_mirror = True if not isinstance(auto_mirror, bool) else auto_mirror
+    return {"mode": mode, "base_url": base,
+            "mirror_order": _clean_mirror_order(d.get("mirror_order")),
+            "auto_mirror": auto_mirror}
+
+
+async def mirror_repos(s: AsyncSession) -> dict[str, str]:
+    """各渠道配置的仓库名（site secret 的 image_ship.mirrors.{ch}.repo）。"""
+    raw = await get_site_value(s, "image_ship")
+    mirrors = raw.get("mirrors") if isinstance(raw, dict) else None
+    out: dict[str, str] = {}
+    for ch in MIRROR_CHANNELS:
+        cfg = mirrors.get(ch) if isinstance(mirrors, dict) else None
+        out[ch] = str(cfg.get("repo") or "") if isinstance(cfg, dict) else ""
+    return out
+
+
+async def mirror_token(s: AsyncSession, channel: str) -> str:
+    """渠道令牌明文（kind=mirror_token, name=channel）；没配返回空串。
+
+    只给服务端内部用（publish 推送）；任何 API 出口只回 token_set，明文永不出网
+    （§6.1.6）。
+    """
+    cred = await s.scalar(select(Credential).where(
+        Credential.kind == "mirror_token", Credential.name == channel))
+    return str((cred.secret or {}).get("token") or "") if cred else ""
+
+
+# ---------------------------------------------------------------- image_channels
+
+async def get_channel(s: AsyncSession, artifact_id: int,
+                      channel: str) -> ImageChannel | None:
+    return await s.scalar(select(ImageChannel).where(
+        ImageChannel.artifact_id == artifact_id, ImageChannel.channel == channel))
+
+
+async def upsert_channel(s: AsyncSession, *, artifact_id: int, channel: str,
+                         state: str, url: str = "", release_tag: str = "",
+                         error: str = "") -> ImageChannel:
+    row = await get_channel(s, artifact_id, channel)
+    if row is None:
+        row = ImageChannel(artifact_id=artifact_id, channel=channel, state=state,
+                           url=url, release_tag=release_tag, error=error)
+        s.add(row)
+    else:
+        row.state = state
+        row.url = url
+        row.release_tag = release_tag
+        row.error = error
+        row.updated_at = utcnow()
+    await s.commit()
+    return row
+
+
+async def demote_channels(s: AsyncSession, artifact_id: int, note: str) -> int:
+    """制品被同 tag 重发顶掉后，把它的渠道行全打回 pending：外部那份副本已是旧货，
+    不许再进第 20 步候选，等 30/40 重推才恢复 ok。返回打回的行数。"""
+    rows = (await s.scalars(select(ImageChannel).where(
+        ImageChannel.artifact_id == artifact_id, ImageChannel.state == "ok"))).all()
+    for row in rows:
+        row.state = "pending"
+        row.url = ""
+        row.error = note
+        row.updated_at = utcnow()
+    await s.commit()
+    return len(rows)
+
+
+async def delete_channels(s: AsyncSession, artifact_id: int) -> None:
+    """制品下架时连坐删渠道登记行（外部 release 留着无妨，公开仓库，§6.1.6）。"""
+    for row in (await s.scalars(select(ImageChannel).where(
+            ImageChannel.artifact_id == artifact_id))).all():
+        await s.delete(row)
+    await s.commit()
+
+
+async def other_ok_rows(s: AsyncSession, channel: str,
+                        exclude_row_id: int) -> Sequence[ImageChannel]:
+    """该渠道其它制品还挂着的 ok 行（gitee 仓库只留最新一版，发布成功后删旧用）。"""
+    return (await s.scalars(
+        select(ImageChannel)
+        .where(ImageChannel.channel == channel, ImageChannel.state == "ok",
+               ImageChannel.id != exclude_row_id)
+        .order_by(ImageChannel.updated_at)
+    )).all()
 
 
 # ---------------------------------------------------------------- image_artifacts
