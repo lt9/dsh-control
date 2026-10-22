@@ -8,6 +8,23 @@ const PURGE_DAYS = Number(process.env.MOCK_PURGE_DAYS ?? 15);
 const purgeAfterOf = (i) => (i.state === "released" && i.released_at
   ? new Date(new Date(i.released_at).getTime() + PURGE_DAYS * 86400 * 1000).toISOString() : null);
 let SEQ = 10, tok = {}, jobs = {};
+// 站点设置（§6.1.5）：base_url 存空串=吃站点的公网域；GET 出去的是解析后的生效值（§4）
+const SITE_BASE = "https://console.example.com";
+let settings = { image_ship: { mode: "ssh", base_url: "" } };
+const baseOf = () => settings.image_ship.base_url || SITE_BASE;
+const settingsView = () => ({ image_ship: { mode: settings.image_ship.mode, base_url: baseOf() } });
+// 制品库（§6.1.5）：一行一个 tag，行存在即文件已完整落盘。MOCK_NO_IMAGES=1 → 演练空态
+const STORE_SIZE = 480e9;
+const artTok = () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".split("").sort(() => Math.random() - .5).slice(0, 26).join("");
+const shaOf = (t) => { let h = 0x811c9dc5; for (let i = 0; i < t.length; i++) h = Math.imul(h ^ t.charCodeAt(i), 16777619) >>> 0; let out = ""; for (let i = 0; i < 16; i++) { h ^= h << 13; h >>>= 0; h ^= h >>> 17; h ^= h << 5; h >>>= 0; h = Math.imul(h, 16777619) >>> 0; out += h.toString(16).padStart(8, "0"); } return out.slice(0, 64); };
+const artFile = (tag) => tag.replace(/[^\w.-]+/g, "_") + ".tar.gz";
+let artSeq = 2;
+let arts = process.env.MOCK_NO_IMAGES ? [] : [
+  { id: 1, tag: "dsh-family:1.14.2", size_bytes: 4.32e9, sha256: shaOf("dsh-family:1.14.2"), token: "Kq7Zx2mVb4nT8sL1pR6yW3cDXQ", origin: "nas-1", created_at: iso(-86400 * 9) },
+  { id: 2, tag: "dsh-family:1.13.8", size_bytes: 4.11e9, sha256: shaOf("dsh-family:1.13.8"), token: "Zp4Qw8eRt2yu6io0pas9dfgHjK", origin: "nas-1", created_at: iso(-86400 * 38) }];
+const artView = (a) => ({ id: a.id, tag: a.tag, size_bytes: a.size_bytes, sha256: a.sha256, token: a.token,
+  url: baseOf() + "/dl/" + a.token + "/" + artFile(a.tag), origin_host: a.origin, created_at: a.created_at });
+const storeFree = () => STORE_SIZE - arts.reduce((n, a) => n + (a.size_bytes || 0), 0);
 const hosts = [{ id: 1, name: "nas-1", enabled: true, data_root: "/mnt/hdd/dsh-family", note: "机械盘，剩 1.7 T" }, { id: 2, name: "host-2", enabled: true, data_root: "/home/u/dsh-data", note: "主控台自己这台" }];
 let insts = process.env.MOCK === "empty" ? [] : [
   { id: 1, slug: "dsh-probe", owner_label: null, host_id: 2, state: "released", dsh_version: "1.14.2", config_version: "v2", dns_name: "dsh-probe.example.com", released_at: iso(-86400 * 6), updated_at: iso(-86400 * 6), err: null },{ id: 2, slug: "dsh-01", owner_label: "家人", host_id: 1, state: "running", dsh_version: "1.14.2", config_version: "v2", dns_name: "dsh-01.example.com", released_at: null, updated_at: iso(-3600), err: null },{ id: 3, slug: "dsh-02", owner_label: null, host_id: 1, state: "unhealthy", dsh_version: "1.13.8", config_version: "v2", dns_name: "dsh-02.example.com", released_at: null, updated_at: iso(-900), err: "健康检查连续 3 次失败：站点返回 502；距上次自动重启不足 10 分钟，先不重启" },
@@ -44,14 +61,27 @@ const DSHC = (I) => ({
 });
 const STEPS = { deploy: [[10, "域名规划"], [20, "主机预检"], [30, "添加解析"], [40, "开隧道"], [50, "建反代站点"], [60, "部署容器"], [66, "铺生图技能与智能体团队"], [70, "抓登录密钥"], [80, "公网探活"], [90, "验收复核"]],
 restart: [[5, "铺生图技能与智能体团队"], [10, "重启容器"], [20, "等待健康"], [30, "抓登录密钥"], [40, "公网探活"]], release: [[10, "核对确认词"], [20, "注销 nginx 站点"], [30, "注销 frp 隧道"], [40, "注销解析记录"], [50, "停止容器（只停不删）"], [60, "标记已释放"]],
-purge: [[10, "核对确认词"], [20, "补删外部对象（解析/隧道/站点）"], [30, "删除容器"], [40, "删除数据目录（含归档与历史）"], [50, "标记已彻底释放"]] };
+publish: [[10, "源机 docker save｜gzip 流进制品库"], [20, "算 sha256 并登记（同标签原子替换）"]],
+ purge: [[10, "核对确认词"], [20, "补删外部对象（解析/隧道/站点）"], [30, "删除容器"], [40, "删除数据目录（含归档与历史）"], [50, "标记已彻底释放"]] };
 // 下一台叫什么：dsh- + 现有最大序号 +1，两位零填充（口径照后端 domain/slug.py）。
 const nextSlug = () => "dsh-" + String(Math.max(0, ...insts.map((i) => Number(/^dsh-(\d+)$/.exec(i.slug)?.[1] ?? 0))) + 1).padStart(2, "0");
 const mkJob = (k, i, ms, purpose) => (jobs[++SEQ] = { id: SEQ, kind: k, inst: i, t0: Date.now(), stepMs: ms, steps: STEPS[k], done: false, purpose }, SEQ);
+// 发布工单：不带实例（制品是站点级的），进度照样走 SSE/轮询
+const mkPublish = (tag, origin) => (jobs[++SEQ] = { id: SEQ, kind: "publish", inst: null, t0: Date.now(), stepMs: 2600, steps: STEPS.publish, done: false, publish: { tag, origin, size: Math.round(3.8e9 + ((tag.length * 73) % 9) * 1e8), sha: shaOf(tag + (SEQ + 1)) } }, SEQ);
 function jobView(id) { const j = jobs[id]; if (!j) return null; const st = j.steps.map((_, i) => { const e = Date.now() - j.t0; return e >= (i + 1) * j.stepMs ? "succeeded" : e >= i * j.stepMs ? "running" : "pending"; });
-  if (!j.done && st.every((s) => s === "succeeded")) { j.done = true; const I = insts.find((x) => x.id === j.inst); if (I) { I.updated_at = iso(); if (j.kind === "deploy") { I.state = "running"; I.released_at = null; } if (j.kind === "restart") tok[I.id] = Math.floor(Math.random() * 1e6); if (j.kind === "release") { I.state = "released"; I.released_at = iso(); } if (j.kind === "purge") { I.state = "purged"; I.purged_at = iso(); I.freed = true; } } }
+  if (!j.done && st.every((s) => s === "succeeded")) { j.done = true; const I = insts.find((x) => x.id === j.inst); if (I) { I.updated_at = iso(); if (j.kind === "deploy") { I.state = "running"; I.released_at = null; } if (j.kind === "restart") tok[I.id] = Math.floor(Math.random() * 1e6); if (j.kind === "release") { I.state = "released"; I.released_at = iso(); } if (j.kind === "purge") { I.state = "purged"; I.purged_at = iso(); I.freed = true; } }
+    // 发布工单不带实例（制品是站点级的），所以这段必须在 if (I) 外面：
+    // 20 record 过了才插行；同标签是原子替换——新行落库成功后才把旧行丢掉。
+    if (j.kind === "publish" && j.publish) { const { tag, origin, size, sha } = j.publish; arts = [{ id: ++artSeq, tag, size_bytes: size, sha256: sha, token: artTok(), origin, created_at: iso() }, ...arts.filter((x) => x.tag !== tag)]; } }
   return { kind: j.kind, state: j.done ? "succeeded" : "running", instance_id: j.inst, purpose: j.kind === "deploy" ? j.purpose ?? null : null, steps: j.steps.map(([s, t], i) => ({ seq: s, key: "k" + s, title: t, state: st[i], detail: st[i] === "succeeded" ? `通过 · 用时 ${(0.6 + i * 0.7).toFixed(1)} s` : st[i] === "running" ? "执行中…" : null })) }; }
 function logsFor(id, after) { const j = jobs[id]; if (!j) return { items: [], next: after }; const out = [];
+  if (j.kind === "publish" && j.publish) { const { tag, origin, size, sha } = j.publish, f = artFile(tag), gb = (n) => (n / 1e9).toFixed(2) + " GB";
+    const say = [[`$ ssh ${origin} docker save ${tag} | gzip -n > 制品库/${f}.tmp`, `  已落 ${gb(size * 0.44)} / ${gb(size)} · 面板内存管道，两台都不落盘`, `  收流完成 ${gb(size)}，退出码 0`],
+      [`$ sha256sum ${f}.tmp`, `  ${sha}  ${f}.tmp`, `改名去 .tmp 并登记一行（同标签的旧行等新行落库后才作废）`]];
+    const its = [];
+    say.forEach((ls, si) => ls.forEach((line, k) => { const lid = si * 3 + k + 1, at = j.t0 + si * j.stepMs + k * 700;
+      if (lid <= after || at > Date.now()) return; its.push({ id: lid, seq: j.steps[si][0], level: "info", line, ts: new Date(at).toISOString() }); }));
+    return { items: its, next: Math.max(after, its.length ? its[its.length - 1].id : after) }; }
   j.steps.forEach((s, si) => { for (let k = 0; k < 3; k++) { const lid = si * 3 + k + 1, at = j.t0 + si * j.stepMs + k * 700; if (lid <= after || at > Date.now()) continue;
     out.push({ id: lid, seq: s[0], level: "info", line: k === 0 ? `$ ssh ${hosts[si % 2].name} … # ${s[1]}` : k === 1 ? `← ${s[1]}：done (exit 0)` : "校验回读通过", ts: new Date(at).toISOString() }); } });
   return { items: out, next: Math.max(after, out.length ? out[out.length - 1].id : after) }; }
@@ -89,6 +119,21 @@ http.createServer(async (req, res) => {
   if (p === "/api/logout") return send(200, { ok: true });
   if (p === "/api/hosts") return send(200, hosts);
   if (p === "/api/overview") return send(200, { dns_zone: "example.com", running: insts.filter((i) => i.state === "running").length, unhealthy: insts.filter((i) => ["unhealthy", "restarting", "error"].includes(i.state)).length, released: insts.filter((i) => i.state === "released").length, hosts: hosts.length, by_host: hosts.map((h) => ({ host: h.name, note: h.note, total: insts.filter((i) => i.host_id === h.id).length, free_gb: h.id === 1 ? 1740 : 42 })) });
+  // —— 设置页（§4/§6.1.5）——
+  if (p === "/api/settings" && req.method === "GET") return send(200, settingsView());
+  if (p === "/api/settings" && req.method === "PUT") { const s2 = b.image_ship || {};
+    if (s2.mode !== undefined && s2.mode !== "ssh" && s2.mode !== "download") return send(422, { detail: { ok: false, error: "invalid_mode", message: "分发方式只有 ssh 与 download 两种" } });
+    if (s2.mode !== undefined) settings.image_ship.mode = s2.mode;
+    if (s2.base_url !== undefined) settings.image_ship.base_url = String(s2.base_url).trim();
+    return send(200, settingsView()); }   // PUT 也回全量生效值，前端拿回执直接渲染
+  if (p === "/api/images" && req.method === "GET") return send(200, { items: arts.map(artView), store_free_bytes: storeFree() });
+  if (p === "/api/images" && req.method === "POST") { const tag = String(b.tag ?? "").trim(), H = hosts.find((h) => h.id === Number(b.from_host_id));
+    if (!tag) return send(422, { detail: { ok: false, error: "tag_required", message: "要先写上镜像标签，比如 dsh-family:1.14.2" } });
+    if (!H) return send(404, { detail: { ok: false, error: "host_not_found", message: "源主机不存在，刷新页面重选一台" } });
+    return send(200, { job_id: mkPublish(tag, H.name) }); }
+  const ai = m(/^\/api\/images\/(\d+)$/);
+  if (ai && req.method === "DELETE") { const at = arts.findIndex((a) => a.id === Number(ai[1])); if (at < 0) return send(404, { detail: { ok: false, error: "not_found", message: "这条制品已经不在了" } });
+    arts.splice(at, 1); return send(200, { ok: true }); }   // 删行删文件：链接即刻失效
 if (p === "/api/instances/next-slug") { const s2 = nextSlug(); return send(200, { slug: s2, dns_name: s2 + ".example.com" }); }
 if (p === "/api/instances" && req.method === "GET") { const q = (u.searchParams.get("q") ?? "").toLowerCase(); return send(200, insts.filter((i) => !q || [i.slug, i.owner_label, i.dns_name].some((v) => v?.toLowerCase().includes(q))).map((i) => ({ ...i, host: hosts.find((h) => h.id === i.host_id), purged_at: i.purged_at ?? null, purge_after: purgeAfterOf(i), err: undefined }))); }
 if (p === "/api/instances" && req.method === "POST") { const nid = Math.max(0, ...insts.map((i) => i.id)) + 1, slug = nextSlug();

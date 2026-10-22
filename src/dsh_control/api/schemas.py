@@ -40,3 +40,23 @@ class DeployRequest(BaseModel):
     """§4 POST /instances/{id}/deploy 的可选 body：留空 = 站点当前目标 tag。"""
 
     image: str | None = Field(default=None, max_length=255)
+
+
+class ImageShipSettings(BaseModel):
+    """PUT /api/settings 的 image_ship 段（§6.1.5）：字段留 None = 不动该项。"""
+
+    mode: str | None = None              # ssh | download（其余 422）
+    base_url: str | None = Field(default=None, max_length=512)
+
+
+class PutSettingsRequest(BaseModel):
+    """局部更新：只认已知键，别的键忽略不报错（§4 PUT /api/settings）。"""
+
+    image_ship: ImageShipSettings | None = None
+
+
+class PublishImageRequest(BaseModel):
+    """§4 POST /api/images：从 from_host_id 那台机 save 该 tag 发布成制品。"""
+
+    tag: str = Field(max_length=255)
+    from_host_id: int

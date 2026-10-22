@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import select
 
 from ..db import repo
-from ..db.models import Instance
+from ..db.models import Credential, Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.dsh_config import annotate_model_drift
 from ..domain.frp_port import pick_direct_port, pick_free_port
@@ -290,6 +290,113 @@ async def _direct_port(ctx: JobCtx, host: Any, inst: Any) -> int:
     return new_port
 
 
+# ------------------------------------------------- 缺镜像自动搬运（§6.1.5 三岔口）
+
+_SHIP_LOAD_TIMEOUT = 1800   # GB 级制品下载 + load 的超时口径（与 publish save 同量级）
+
+
+def _have_dsh_images(stdout: str) -> str:
+    """把 docker images 探测输出里的现有 dsh 标签攒成一行人话（报错附录用）。"""
+    have = "; ".join(ln.strip() for ln in (stdout or "").splitlines()
+                     if ln.strip() and "[image]" not in ln)
+    return have or "（无 dsh 相关镜像）"
+
+
+async def _image_present(ctx: JobCtx, h: Any, image: str) -> bool:
+    """问任意一台主机有没有这个镜像——ctx.ssh 只到目标机，挑源机得自己发探测。"""
+    pem = ""
+    if h.ssh_credential_id:
+        cred = await ctx.s.get(Credential, h.ssh_credential_id)
+        pem = (cred.secret or {}).get("private_key_pem", "") if cred else ""
+    if not pem:
+        return False
+    r = await ctx.executor().run(
+        host=h.ssh_host, port=h.ssh_port, user=h.ssh_user, private_key_pem=pem,
+        command=f"docker image inspect '{image}' >/dev/null 2>&1 "
+                "&& echo '[image] PRESENT' || echo '[image] MISSING'",
+        timeout=60)
+    return "[image] PRESENT" in (r.stdout or "")
+
+
+async def _ship_missing_image(ctx: JobCtx, host: Any, image: str, have: str) -> None:
+    """第 20 步缺镜像分支（§6.1.5）：download 拉制品 / ssh 流式直传 / 报错点名。
+
+    成功=返回（镜像已在目标机）；办不到必须 StepFailed——「没镜像照跑」不存在。
+    """
+    mode, base = await repo.current_image_ship(ctx.s,
+                                               default_base=ctx.settings.public_base)
+    # 按主机登记的下载基址优先：入口机拨自家公网域是 hairpin 黑洞（§6.1.5）
+    host_base = (getattr(host, "image_base_url", "") or "").strip().rstrip("/")
+    if host_base:
+        base = host_base
+    art = await repo.get_artifact_by_tag(ctx.s, image)
+    if mode == "download" and art is not None:
+        if not base:
+            raise StepFailed(
+                f"分发方式=download 但下载基址没配（image_ship.base_url 与站点 "
+                f"public_base 都是空），目标机没镜像 {image} 且无处可拉")
+        url = f"{base}/dl/{art.token}/{art.filename}"
+        cache_dir = f"{host.data_root}/ship-cache"
+        dest = f"{cache_dir}/{art.filename}"
+        await ctx.log("info", f"缺镜像：按设置（download）从制品库拉 {image} "
+                              f"（{art.size_bytes / (1 << 20):.1f} MB，sha 强校验）")
+        # 契约三连一字不差：curl 下载 → sha256sum -c 强制校验 → docker load → 删缓存。
+        # 缓存放 {data_root}/ship-cache：不赌 /tmp 是不是 tmpfs（GB 级塞 tmpfs
+        # 直接把机器内存打爆）。
+        r = await ctx.ssh(
+            f"mkdir -p '{cache_dir}' && "
+            f"curl -fL --retry 3 '{url}' -o '{dest}' && "
+            f"echo '{art.sha256}  {dest}' | sha256sum -c - && "
+            f"docker load -i '{dest}' && rm -f '{dest}'",
+            timeout=_SHIP_LOAD_TIMEOUT)
+        if not r.ok:
+            raise StepFailed("目标机拉取或加载制品失败（download 方式，"
+                             f"含 curl/sha256sum -c/docker load 三连）:\n{r.tail()}")
+        if not await _image_present(ctx, host, image):
+            raise StepFailed(f"docker load 回执正常但复查 {host.name} 上仍无 {image}"
+                             "——load 进去的不是这个 tag")
+        await ctx.event("image_shipped", f"{image} 经 download 方式从制品库拉取并加载",
+                        {"image": image, "via": "download",
+                         "origin_host": art.origin_host})
+        return
+    if mode == "ssh":
+        # enabled 主机按 id 升序找有该镜像的第一台（契约 §6.1.5；面板所在宿主机
+        # 通常就是最先登记的那台，id 升序天然优先）。
+        cands = sorted((h for h in await repo.list_hosts(ctx.s)
+                        if h.enabled and h.id != host.id), key=lambda h: h.id)
+        for cand in cands:
+            if not await _image_present(ctx, cand, image):
+                continue
+            await ctx.log("info", f"缺镜像：{cand.name} 有 {image}，SSH 流式直传到 "
+                                  f"{host.name}（不落盘，两头之间不需要互信）")
+            from ..images import ship_image  # 局部 import：不进模块级依赖面
+            try:
+                out = await ship_image(ctx.db, ctx.providers, tag=image,
+                                       src_ref=cand.name, dst_ref=host.name)
+            except RuntimeError as exc:
+                raise StepFailed(f"SSH 直传失败: {exc}") from exc
+            if not await _image_present(ctx, host, image):
+                raise StepFailed(f"直传报成功但复查 {host.name} 上仍无 {image}")
+            await ctx.log("info", f"搬运完成：{out['bytes']} 字节 / {out['seconds']}s")
+            await ctx.event("image_shipped",
+                            f"{image} 经 SSH 从 {cand.name} 流式直传到 {host.name}",
+                            {"image": image, "via": "ssh", "from_host": cand.name})
+            return
+        raise StepFailed(
+            f"{host.name} 上没有镜像 {image}，也没有别的 enabled 主机有它"
+            f"（SSH 直传没有源可搬）。着手：先 cli images ship 把准备好的版本弄到"
+            f"任一 enabled 主机（cli images ship --tag {image} "
+            f"--from <有此镜像的主机> --to <enabled 主机>），"
+            f"或去设置页发布该 tag 的制品并把分发方式切到 download。"
+            f"（目标机现有 dsh 镜像：{have}）")
+    # mode=download 但库里没这个 tag 的制品
+    raise StepFailed(
+        f"{host.name} 上没有镜像 {image}，制品库里也没有它的制品"
+        "（当前分发方式=download）。着手：去设置页（镜像制品）从一台有此镜像的"
+        "机器发布该 tag 的制品，或把分发方式切回 SSH 直传。"
+        f"（目标机现有 dsh 镜像：{have}）")
+
+
 # 公网探活的重试口径：容器刚起来的几秒里首页可能还回 401（静态壳未就绪），
 # DNS 也可能刚建还没生效。单次探活会把"还没准备好"读成"路径坏了"——现网
 # dsh-02 就是 status=401 verdict=unexpected，事后从公网实测一切正常。
@@ -517,13 +624,11 @@ async def run_deploy(ctx: JobCtx) -> None:
             if line.strip():
                 await ctx.log("info", f"[image] {line.strip()}")
         if "[image] MISSING" in (r_img.stdout or ""):
-            have = "; ".join(
-                ln.strip() for ln in (r_img.stdout or "").splitlines()
-                if ln.strip() and "[image]" not in ln) or "（无 dsh 相关镜像）"
-            raise StepFailed(
-                f"{host.name} 上没有镜像 {image}。先搬运过去："
-                f"cli images ship --tag {image} --from <有此镜像的主机> "
-                f"--to {host.name}（该机现有 dsh 镜像：{have}）")
+            # 旧行为是甩一句「跑 cli images ship」就拦；§6.1.5 起先按设置自动搬：
+            # download 有制品就在目标机 curl 三连，ssh 模式找源机流式直传，
+            # 都办不到才拦（文案点名着手指路 + 附该机现有镜像）。
+            await _ship_missing_image(
+                ctx, host, image, _have_dsh_images(r_img.stdout))
         rendered = default_rendered(
             slug=slug, public_url=public_url, trusted_hosts=[dns_name],
             container_port=0, frp_remote_port=0, data_dir=data_dir,

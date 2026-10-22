@@ -181,6 +181,8 @@ async def seed_into(db: Db, site: dict[str, Any]) -> tuple[int, int]:
             host.direct_backend = str(h.get("direct_backend") or "").strip() or None
             # 模型入口按主机覆盖：云上机器拨不到局域网网关（§2）
             host.llm_base_url = str(h.get("llm_base_url") or "").strip() or None
+            # 制品下载基址按主机覆盖：入口机拨自家公网域是 hairpin 黑洞（§6.1.5）
+            host.image_base_url = str(h.get("image_base_url") or "").strip() or None
             host.enabled = bool(h.get("enabled", True))
             host.note = str(h.get("note", ""))
             n_host += 1

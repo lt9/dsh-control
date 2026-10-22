@@ -569,3 +569,15 @@ async def noop_env(tmp_path):
         yield Env(db=db, app=app, client=client, providers=providers,
                   runtime=runtime, journal=journal, settings=settings)
     await db.engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def ship_env(env, tmp_path):
+    """§6.1.5 镜像分发环境：给控制台挂一个真实可写的制品库目录（tmp_path 下）。
+
+    settings 是 app 与 runner 共用的同一对象（create_app 直接吃引用），这里改
+    image_store 对路由与工单同时生效。其余一切同 env。"""
+    store = tmp_path / "imgstore"
+    store.mkdir()
+    env.settings.image_store = str(store)
+    return env

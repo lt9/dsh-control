@@ -5,7 +5,7 @@
 export type InstanceState =
   | "pending" | "deploying" | "running" | "unhealthy"
   | "restarting" | "released" | "purged" | "error";
-export type JobKind = "deploy" | "release" | "restart" | "purge";
+export type JobKind = "deploy" | "release" | "restart" | "purge" | "publish";
 // §4：deploy 工单的来路，服务端入队时按当时状态写死（新建 / running 续建 / released 恢复）。
 // 工单页的标题与完成文案看这个，不看 URL——手敲链接、分享链接也得说对话。
 export type JobPurpose = "create" | "upgrade" | "restore";
@@ -109,6 +109,24 @@ export interface Job {
 export interface LogItem { id: number; seq: number; level: string; line: string; ts: string }
 export interface JobLogs { items: LogItem[]; next: number }
 export interface EventItem { id: number; kind: string; message: string; created_at: string; data?: unknown }
+
+/** §6.1.5 镜像分发方式：ssh=面板管道直传（局域网快路）；download=目标机自己从面板公网域拉制品。 */
+export type ShipMode = "ssh" | "download";
+/** GET /settings 返回的生效值：base_url 空串=吃站点的公网域，接口给的是**解析后**的那一个。 */
+export interface Settings {
+  image_ship: { mode: ShipMode; base_url: string };
+}
+/** PUT 是局部更新（只认已知键），所以这里两个字段都可选。 */
+export interface SettingsPatch {
+  image_ship?: { mode?: ShipMode; base_url?: string };
+}
+/** §4 制品行：token 就是门票（公开免鉴权下载），url 是解析后的完整链接。 */
+export interface ImageArtifact {
+  id: number; tag: string; size_bytes: number | null; sha256: string | null;
+  token: string | null; url: string | null;
+  origin_host: string | null; created_at: string | null;
+}
+export interface ImageList { items: ImageArtifact[]; store_free_bytes: number | null }
 
 export class ApiError extends Error {
   status: number;
@@ -278,4 +296,34 @@ export const api = {
   jobStreamUrl: (id: number | string) => `/api/jobs/${id}/stream`,
   events: async (id: number | string): Promise<EventItem[]> =>
     toList(await http<unknown>(`/instances/${id}/events`)) as unknown as EventItem[],
+
+  // —— 设置页（§6.1.5 镜像分发）——
+  /** GET /settings：base_url 给的是**解析后的生效值**（留空时=站点公网域）。 */
+  settings: () => http<Settings>("/settings"),
+  /** PUT 是局部更新（§4：只认已知键），改完不重启生效，所以切完直接拿回执渲染。 */
+  putSettings: (patch: SettingsPatch) =>
+    http<Settings>("/settings", { method: "PUT", json: patch }),
+  images: async (): Promise<ImageList> => {
+    const raw = await http<unknown>("/images");
+    const o = (Array.isArray(raw) ? { items: raw } : raw) as
+      { items?: unknown[]; store_free_bytes?: number | null } | null;
+    const items = ((o?.items ?? []) as Record<string, unknown>[]).map((a) => ({
+      id: Number(a.id),
+      tag: String(a.tag ?? ""),
+      size_bytes: (a.size_bytes as number) ?? null,
+      sha256: (a.sha256 as string) ?? null,
+      token: (a.token as string) ?? null,
+      url: (a.url as string) ?? null,
+      origin_host: typeof a.origin_host === "string" ? a.origin_host
+        : pickHost(a.origin_host).name,
+      created_at: (a.created_at as string) ?? null,
+    }));
+    return { items, store_free_bytes: (o?.store_free_bytes as number) ?? null };
+  },
+  /** 发布 = 开一张 publish 工单，进度照常规工单页看（§6.1.5）。 */
+  publishImage: (body: { tag: string; from_host_id?: number }) =>
+    http<{ job_id: number }>("/images", { method: "POST", json: body }),
+  /** 下架：删行删文件，公开链接即刻失效（§4）。不可逆，界面上走长按确认。 */
+  deleteImage: (id: number | string) =>
+    http<unknown>(`/images/${id}`, { method: "DELETE", json: {} }),
 };

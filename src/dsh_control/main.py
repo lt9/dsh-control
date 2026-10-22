@@ -21,11 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from .api.auth import AuthState, session_from_request
-from .api.routes import public_router, router
+from .api.routes import dl_router, public_router, router
 from .db import repo
 from .db.models import Credential, DeployJob, utcnow
 from .db.session import Db, make_db
 from .jobs.deploy import run_deploy
+from .jobs.publish import run_publish
 from .jobs.purge import run_purge
 from .jobs.release import run_release
 from .jobs.restart import run_restart
@@ -104,7 +105,8 @@ def create_app(db: Db | None = None, providers: Any | None = None,
                  for c in creds])
             st.runner = JobRunner(st.db, st.providers, st.settings)
             st.runner.register_flows({"deploy": run_deploy, "restart": run_restart,
-                                      "release": run_release, "purge": run_purge})
+                                      "release": run_release, "purge": run_purge,
+                                      "publish": run_publish})
         interrupted = await fail_interrupted_jobs(st.db)
         if interrupted:
             log.warning("中断了 %s 个遗留任务", interrupted)
@@ -134,9 +136,13 @@ def create_app(db: Db | None = None, providers: Any | None = None,
     app.state.watcher_enabled = start_watcher
     runner = JobRunner(app.state.db, providers or _LazyProviders(app), settings)
     runner.register_flows({"deploy": run_deploy, "restart": run_restart,
-                           "release": run_release, "purge": run_purge})
+                           "release": run_release, "purge": run_purge,
+                           "publish": run_publish})
     app.state.runner = runner
 
+    # /dl 是公开前缀（§6.1.5：token 即门票），单独 router，不挂会话依赖；
+    # 必须注册在 SPA 兜底路由之前，否则会被前端 catch-all 吃掉。
+    app.include_router(dl_router)
     app.include_router(public_router, prefix="/api")
     app.include_router(router, prefix="/api",
                        dependencies=[Depends(_require_session)])

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { STATE_META, type Tone } from "../lib/format";
 import type { InstanceState } from "../api/client";
 
@@ -35,6 +35,12 @@ export function Icon({ name, size = 14 }: { name: string; size?: number }) {
     case "purge":    return <svg {...p}><path d="M3.2 4.4h9.6" /><path d="M6.2 4.4V3.1h3.6v1.3" /><path d="M4.4 4.4l.7 8.5h5.8l.7-8.5" /><path d="M6.7 6.6v4M9.3 6.6v4" /></svg>;
     // purged 的印记：圈上划一道——记录还在，东西没了。
     case "void":     return <svg {...p}><circle cx="8" cy="8" r="5.2" /><path d="M4.6 11.4 11.4 4.6" /></svg>;
+    // 设置：齿轮（八根辐条 + 芯），顶栏导航用
+    case "gear":     return <svg {...p}><circle cx="8" cy="8" r="2.4" /><path d="M8 1.6v2.2M8 12.2v2.2M1.6 8h2.2M12.2 8h2.2M3.5 3.5l1.6 1.6M10.9 10.9l1.6 1.6M12.5 3.5l-1.6 1.6M5.1 10.9l-1.6 1.6" /></svg>;
+    // 制品库：一个装着图的箱子——里面是发布好的镜像文件，不是镜像本身
+    case "image":    return <svg {...p}><rect x="2.4" y="3.6" width="11.2" height="8.8" rx="1.2" /><circle cx="6" cy="6.6" r=".9" /><path d="M2.8 10.6l3-2.6 2.5 2.1 2.4-2.5 2.5 2.7" /></svg>;
+    // 发布：把镜像抬进制品库（向上的箭头 + 箱子口）
+    case "publish":  return <svg {...p}><path d="M8 10.4V2.8" /><path d="M5.4 5.4 8 2.8l2.6 2.6" /><path d="M2.8 10v3h10.4v-3" /></svg>;
     default:         return null;
   }
 }
@@ -228,5 +234,28 @@ export function Modal({ title, onClose, children, wide = false }: {
       </div>
       <div className="modal-body">{children}</div>
     </dialog>
+  );
+}
+
+/** 一次性回执：设置页那种「改完了」的小条，2.6 秒自己走（§9 动完要给明确反馈）。
+ *  用 toast 而不是弹窗——改一个开关不该要人手点一下才能继续看页面。 */
+export function useToast(ms = 2600): { toast: string | null; say: (msg: string) => void } {
+  const [toast, setToast] = useState<string | null>(null);
+  const timer = useRef<number>();
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const say = useCallback((msg: string) => {
+    setToast(msg);
+    clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setToast(null), ms);
+  }, [ms]);
+  return { toast, say };
+}
+
+export function Toast({ text }: { text: string }) {
+  return (
+    <div className="toast" role="status">
+      <Icon name="check" />
+      <span>{text}</span>
+    </div>
   );
 }

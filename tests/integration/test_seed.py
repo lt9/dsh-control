@@ -48,6 +48,7 @@ async def test_seed_into_populates_site_creds_hosts(env):
              "kit_path": "/srv/kit", "data_root": "/srv/dsh",
              "upstream_mode": "direct", "mem_limit": "1g", "cpu_limit": "2",
              "direct_backend": "198.51.100.77", "llm_base_url": "http://198.51.100.77:7777/v1",
+             "image_base_url": "http://198.51.100.77:4893",
              "credential_name": "console-ed25519"},
         ],
     }
@@ -81,11 +82,13 @@ async def test_seed_into_populates_site_creds_hosts(env):
         assert host.mem_limit is None and host.cpu_limit is None
         # 没登记回源/模型覆盖 = None：普通机走 §6.1.4 原口径，零变化
         assert host.direct_backend is None and host.llm_base_url is None
+        assert host.image_base_url is None
         vps = (await s.scalars(select(Host).where(Host.name == "vps-y"))).one()
         assert vps.upstream_mode == "direct"
         assert vps.mem_limit == "1g" and vps.cpu_limit == "2"
         assert vps.direct_backend == "198.51.100.77"
         assert vps.llm_base_url == "http://198.51.100.77:7777/v1"
+        assert vps.image_base_url == "http://198.51.100.77:4893"
 
     from dsh_control.settings import Settings, apply_site_overrides
     st = apply_site_overrides(Settings(_env_file=None), site["site"])

@@ -35,7 +35,7 @@ BigIntPk = BigInteger().with_variant(Integer, "sqlite")
 INSTANCE_STATES = ("pending", "deploying", "running", "unhealthy", "restarting",
                    "released", "purged", "error")
 DESIRED_STATES = ("running", "released")
-JOB_KINDS = ("deploy", "restart", "release", "purge")
+JOB_KINDS = ("deploy", "restart", "release", "purge", "publish")
 JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
@@ -129,6 +129,11 @@ class Host(Base):
         comment="该机实例的模型入口覆盖（如 http://198.51.100.77:7777/v1）：站点 "
                 "llm_base_url 是局域网网关，云上机器拨不到时用这里覆盖；空=用站点"
                 "值。只换地址不换密钥（§2/§6.1.4）")
+    image_base_url: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="该机拉镜像制品的下载基址覆盖（如 http://198.51.100.77:4893）："
+                "公网域解析回自家 EIP 的入口机（hairpin 黑洞，§6.1.4）登记一个"
+                "够得着的入口；空=用设置页/站点的生效值（§6.1.5）")
     enabled: Mapped[bool] = mapped_column(default=True, comment="是否参与新实例分配")
     note: Mapped[str] = mapped_column(Text, default="", comment="备注")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
@@ -261,14 +266,15 @@ class DeployJob(Base):
     __table_args__ = (
         _in("kind", JOB_KINDS),
         _in("state", JOB_STATES),
-        {"comment": "一次性任务：deploy/restart/release/purge 状态机"},
+        {"comment": "一次性任务：deploy/restart/release/purge/publish 状态机"},
     )
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     instance_id: Mapped[int] = mapped_column(BigInteger, index=True,
-                                             comment="逻辑指向 instances.id，无外键")
+                                             comment="逻辑指向 instances.id，无外键；"
+                                                     "0=不挂实例（publish 这类全站工单）")
     kind: Mapped[str] = mapped_column(String(16),
-                                      comment="任务类型：deploy/restart/release/purge")
+                                      comment="任务类型：deploy/restart/release/purge/publish")
     state: Mapped[str] = mapped_column(String(16), default="pending", index=True,
                                        comment="任务状态：pending/running/succeeded/failed")
     params: Mapped[dict[str, Any] | None] = mapped_column(
@@ -348,3 +354,36 @@ class Event(Base):
                                                  comment="结构化附加信息（redact 后）")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
                                                  comment="发生时间（UTC）")
+
+
+class ImageArtifact(Base):
+    """镜像制品库（契约 §6.1.5）：一行 = 一个 tag 的完整落库文件。
+
+    「行存在即文件已完整落库」是硬约定：发布工单先把文件写完、改好名，
+    才插这一行；换行成功后才删旧行旧文件。任何时刻按这行去 store 目录取
+    文件都必须取得到完整内容——下载端点不猜、不兜底。
+    """
+
+    __tablename__ = "image_artifacts"
+    __table_args__ = (
+        UniqueConstraint("tag"),
+        UniqueConstraint("token"),
+        {"comment": "镜像制品库：一行一个 tag，行存在即文件已完整落库（§6.1.5）"},
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    tag: Mapped[str] = mapped_column(String(255), unique=True,
+                                     comment="镜像标签（docker save 的那个 tag）")
+    filename: Mapped[str] = mapped_column(String(255),
+                                          comment="store 目录内的文件名（tag 安全化 + .tar.gz），"
+                                                  "下载路径只认 token、这列只做落盘与展示")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, comment="文件字节数")
+    sha256: Mapped[str] = mapped_column(String(64),
+                                        comment="文件 sha256（发布时算好；目标机拉完强制 sha256sum -c）")
+    token: Mapped[str] = mapped_column(String(32), unique=True, index=True,
+                                       comment="公开下载链接的凭证（随机 26 字符 urlsafe）；"
+                                               "免鉴权，token 即门票；撤销=删行删文件链接立死")
+    origin_host: Mapped[str] = mapped_column(String(128), default="",
+                                             comment="从哪台主机 save 出来的；空串=手工投放")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 comment="发布时间（UTC）")

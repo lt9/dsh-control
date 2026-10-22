@@ -28,6 +28,7 @@ async def test_missing_image_fails_before_any_external_write(env):
     by_key = {st["key"]: st for st in job["steps"]}
     assert by_key["host_prepare"]["state"] == "failed"
     assert f"cli images ship --tag {IMG_TAG}" in (job["error"] or "")
+    assert "设置页" in (job["error"] or "")  # §6.1.5：ssh 也没源时点名发布制品这条路
     assert "dsh-other:v1" in (job["error"] or "")  # 现有可选标签一眼可见
     assert not any(ln.startswith(("dns.create", "frp.ensure", "ng.ensure"))
                    for ln in env.journal)

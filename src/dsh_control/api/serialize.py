@@ -194,3 +194,21 @@ def event_item(ev) -> dict[str, Any]:
         "data": ev.data,
         "created_at": iso(ev.created_at),
     }
+
+
+def image_artifact_item(art, *, base_url: str) -> dict[str, Any]:
+    """制品行（§4 GET /api/images）：url = 解析后的 base_url + /dl/{token}/{filename}。
+
+    token 出现在这里与下载链接里——公开链接本来就是免鉴权的（镜像非机密，
+    §6.1.5），所以不算泄密；但列表本身在鉴权面内，只有登录者看得到。
+    """
+    return {
+        "id": art.id,
+        "tag": art.tag,
+        "size_bytes": art.size_bytes,
+        "sha256": art.sha256,
+        "token": art.token,
+        "url": f"{base_url}/dl/{art.token}/{art.filename}",
+        "origin_host": art.origin_host,
+        "created_at": iso(art.created_at),
+    }

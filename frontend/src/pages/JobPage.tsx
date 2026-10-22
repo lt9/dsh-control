@@ -62,6 +62,16 @@ export default function JobPage() {
             台账这一条与它的工单、事件都留着，只读——要再用只能新建一台。</p>
         </div>
       )}
+      {job?.state === "succeeded" && kind === "publish" && (
+        <div className="card done-panel">
+          <h2>已发布</h2>
+          <p className="mut">镜像已经落进制品库，公开链接也一起生成了——在设置页的制品表里复制给目标机用。<br />
+            同一个标签以后再重发，今天这条链接就会作废。</p>
+          <p style={{ marginTop: 10 }}>
+            <button type="button" className="btn" onClick={() => nav("/settings")}>去制品表看链接</button>
+          </p>
+        </div>
+      )}
       {job?.state === "failed" && (
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-head"><h2 className="tone-err" style={{ color: "var(--err)" }}>任务失败</h2></div>

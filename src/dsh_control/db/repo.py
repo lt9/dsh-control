@@ -16,6 +16,7 @@ from .models import (
     DeployStep,
     Event,
     Host,
+    ImageArtifact,
     Instance,
     InstanceConfig,
     InstanceSnapshot,
@@ -53,6 +54,61 @@ async def current_purge_after_days(s: AsyncSession, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return value if value >= 0 else fallback
+
+
+SHIP_MODES = ("ssh", "download")
+
+
+async def current_image_ship(s: AsyncSession, *, default_base: str = "") -> tuple[str, str]:
+    """镜像分发方式的当前值（§6.1.5）：(mode, base_url)，与 purge 保留期同一个活读模式。
+
+    site 凭据 secret 的 image_ship 优先；读不到或读坏回落 ("ssh", 站点 public_base)。
+    base_url 空串=吃 site 的 public_base——返回的永远是**解析后的生效值**（§4）。
+    default_base 是 settings.public_base 的兜底（site 行还没灌时）。
+    """
+    raw = await get_site_value(s, "image_ship")
+    mode = raw.get("mode") if isinstance(raw, dict) else None
+    if mode not in SHIP_MODES:
+        mode = "ssh"
+    base = ""
+    if isinstance(raw, dict):
+        base = str(raw.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        base = str(await get_site_value(s, "public_base") or default_base or "").strip()
+        base = base.rstrip("/")
+    return mode, base
+
+
+# ---------------------------------------------------------------- image_artifacts
+
+async def get_artifact(s: AsyncSession, artifact_id: int) -> ImageArtifact | None:
+    return await s.get(ImageArtifact, artifact_id)
+
+
+async def get_artifact_by_tag(s: AsyncSession, tag: str) -> ImageArtifact | None:
+    return await s.scalar(select(ImageArtifact).where(ImageArtifact.tag == tag))
+
+
+async def get_artifact_by_token(s: AsyncSession, token: str) -> ImageArtifact | None:
+    if not token:
+        return None
+    return await s.scalar(select(ImageArtifact).where(ImageArtifact.token == token))
+
+
+async def list_artifacts(s: AsyncSession) -> Sequence[ImageArtifact]:
+    return (await s.scalars(
+        select(ImageArtifact).order_by(ImageArtifact.created_at.desc(),
+                                       ImageArtifact.id.desc())
+    )).all()
+
+
+async def add_artifact(s: AsyncSession, *, tag: str, filename: str, size_bytes: int,
+                       sha256: str, token: str, origin_host: str) -> ImageArtifact:
+    art = ImageArtifact(tag=tag, filename=filename, size_bytes=size_bytes,
+                        sha256=sha256, token=token, origin_host=origin_host)
+    s.add(art)
+    await s.commit()
+    return art
 
 
 async def upsert_credential(
@@ -370,3 +426,9 @@ async def instance_counts(s: AsyncSession) -> dict[str, Any]:
         "hosts": total_hosts or 0,
         "by_host": sorted(by_host.values(), key=lambda x: x["host_id"]),
     }
+
+
+async def delete_artifact(s: AsyncSession, art: ImageArtifact) -> None:
+    """下架：删行。文件删除由调用方在提交后尽力收尾——行没了链接就死了。"""
+    await s.delete(art)
+    await s.commit()
