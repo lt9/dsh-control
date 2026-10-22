@@ -195,7 +195,7 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | GET | `/api/instances/{id}/events` | 事件时间线 |
 | GET | `/api/settings` | 面板运行设置（§6.1.5）：`{image_ship: {mode, base_url}}`；`base_url` 空串=吃 site 的 `public_base`，返回的是解析后的生效值 |
 | PUT | `/api/settings` | 局部更新（只认已知键）：`mode` 非 `ssh|download` → 422；写进 site 凭据 secret 的 `image_ship`，deploy 每轮现读，改完不重启生效 |
-| GET | `/api/images` | 制品列表：`{items:[{id,tag,size_bytes,sha256,token,url,origin_host,created_at}], store_free_bytes}`；`url` = 解析后的 base_url + `/dl/{token}/{filename}` |
+| GET | `/api/images` | 制品列表：`{items:[{id,tag,size_bytes,sha256,token,url,origin_host,created_at}], store_free_bytes}`；`url` = 解析后的 base_url + `/dl/{token}/{filename}`；`store_free_bytes` null=制品库不可用（未挂载/不可写），前端可不显示该栏，可用性点名留给发布/搬运失败 |
 | POST | `/api/images` | `{tag, from_host_id}` → `{job_id}`（kind=publish，§6.1.5）。同 tag 重发=原子替换，旧链接立死 |
 | DELETE | `/api/images/{id}` | 下架：删行删文件，链接即刻失效 |
 | GET | `/dl/{token}/{filename}` | **公开免登录**流式下载（§6.1.5）；支持单区间 `Range` 续传；token 不认识 404；`filename` 只做展示名，认 token 不认它 |
@@ -270,6 +270,7 @@ upgrade/restore 三个互不重叠；列表行携带与详情相同的
 | `already_released` | 409 | 重复释放 | 已经释放过了 |
 | `cannot_deploy_from_<state>` | 409 | 从 purged/deploying 等不可续建状态发 deploy | 当前状态不能重新开通 |
 | `cannot_purge_from_<state>` | 409 | 从非 released 状态发起彻底释放（purged 也在其列） | 只有已释放的实例能彻底释放 |
+| `invalid_mode` | 422 | `PUT /api/settings` 的 `image_ship.mode` 不是 `ssh|download` | 分发方式只有两种，页面数据错了 |
 
 不在表里但会遇到的两种：
 
@@ -527,6 +528,10 @@ curl -fL --retry 3 '<url>' -o <文件> && echo '<sha256>  <文件>' | sha256sum 
   实例自己的准入 token），泄链接=泄镜像，接受；撤销=设置页下架，链接立死。
 - 文件 `<tag 安全化>.tar.gz` 存 `DSHC_IMAGE_STORE` 目录；只用 gzip——gzip 全员
   自带，不赌目标机装没装 zstd/xz。sha256 发布时算好，拉取时强制 `sha256sum -c`。
+- 每台机从哪拉可以单独指定：`hosts.image_base_url`（登记值优先，空=设置页的
+  base_url）。必填场景：入口机=目标机本身时，公网域名解析回自家 EIP 是 hairpin
+  黑洞（§6.1.4 实测同款），登记一个够得着的入口——如 frps 隧道口
+  `http://198.51.100.77:4893` 这类本机可达的门（与 NG 回源同路）。
 
 发布（`POST /api/images` → 工单 `kind=publish`，两步）：
 `10 save`：源主机 `docker save <tag> | gzip -n` 流进制品库 `<file>.tmp`，按已落
@@ -642,7 +647,7 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 5. 设置页：镜像分发方式单选（SSH 直传=局域网快路 / 控制台下载=公网机自取，各配一句
    适用说明）+ 下载基址（留空=用站点公网域）+ 制品表（tag、大小、时间、sha256 短码、
    公开链接一键复制、长按下架——下架是删文件，照 §9 长按确认）+「从主机发布」表单
-   （源主机下拉 × tag 输入），发布进度点进常规工单页。
+   （源主机下拉 × tag 输入——全站唯一要打字的地方，datalist 给出库内已有 tag 兜底），发布进度点进常规工单页。下架不加 HTTP 层确认词：误操作防线是 UI 长按，接口层已有 CSRF 头与单运维密钥。
 
 约定：中文界面；状态色语义固定（running 绿、unhealthy/restarting 琥珀、error 红、
 released 灰）；所有时间按 `Asia/Shanghai`；复制成功要有可见反馈；表格与日志里的

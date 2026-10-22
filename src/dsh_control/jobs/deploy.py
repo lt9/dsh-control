@@ -325,6 +325,10 @@ async def _ship_missing_image(ctx: JobCtx, host: Any, image: str, have: str) -> 
     """
     mode, base = await repo.current_image_ship(ctx.s,
                                                default_base=ctx.settings.public_base)
+    # 按主机登记的下载基址优先：入口机拨自家公网域是 hairpin 黑洞（§6.1.5）
+    host_base = (getattr(host, "image_base_url", "") or "").strip().rstrip("/")
+    if host_base:
+        base = host_base
     art = await repo.get_artifact_by_tag(ctx.s, image)
     if mode == "download" and art is not None:
         if not base:

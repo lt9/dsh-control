@@ -129,6 +129,11 @@ class Host(Base):
         comment="该机实例的模型入口覆盖（如 http://198.51.100.77:7777/v1）：站点 "
                 "llm_base_url 是局域网网关，云上机器拨不到时用这里覆盖；空=用站点"
                 "值。只换地址不换密钥（§2/§6.1.4）")
+    image_base_url: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="该机拉镜像制品的下载基址覆盖（如 http://198.51.100.77:4893）："
+                "公网域解析回自家 EIP 的入口机（hairpin 黑洞，§6.1.4）登记一个"
+                "够得着的入口；空=用设置页/站点的生效值（§6.1.5）")
     enabled: Mapped[bool] = mapped_column(default=True, comment="是否参与新实例分配")
     note: Mapped[str] = mapped_column(Text, default="", comment="备注")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,

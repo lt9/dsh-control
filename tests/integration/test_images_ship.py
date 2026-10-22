@@ -378,3 +378,38 @@ async def test_step20_ssh_mode_no_source_anywhere_fails_with_pointers(env, monke
     err = job["error"] or ""
     assert "cli images ship" in err and "设置页" in err, "点名著手路径"
     assert "dsh-old:v0" in err
+
+
+async def test_host_image_base_url_wins_over_ship_base(ship_env, monkeypatch):
+    """按主机登记的下载基址压过设置页的：入口机拨自家公网域是 hairpin 黑洞
+    （§6.1.4 同款），它必须从够得着的门拉——登记值优先，站点值靠边。"""
+    payload = b"tarstream"
+    tok, _ = await _seed_artifact(ship_env, payload, tag=IMG)
+    r = await ship_env.client.put("/api/settings", json={"image_ship": {
+        "mode": "download", "base_url": "https://console.example.test/"}}, headers=XRW)
+    assert r.status_code == 200
+    async with ship_env.db.session() as s:
+        h = await repo.get_host(s, ship_env.host_nas)
+        h.image_base_url = "http://198.51.100.77:4893/"   # 尾斜杠也得给我吃掉
+        await s.commit()
+
+    ex = ship_env.providers.executor
+    real = ex.run
+    loaded = {"done": False}
+
+    async def run(*, command, **kw):
+        if "docker image inspect" in command and "HostConfig" not in command:
+            return (ExecResult(0, "[image] PRESENT\n", "") if loaded["done"]
+                    else ExecResult(0, "[image] MISSING\n", ""))
+        if "docker load" in command:
+            loaded["done"] = True
+        return await real(command=command, **kw)
+    monkeypatch.setattr(ex, "run", run)
+
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    pull = next(c for c in ex.commands if "curl -fL" in c)
+    assert f"http://198.51.100.77:4893/dl/{tok}/" in pull, "主机登记值必须顶掉站点值"
+    assert "console.example.test" not in pull
