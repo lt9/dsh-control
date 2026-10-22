@@ -99,6 +99,34 @@ a { color: var(--accent-700); text-underline-offset: 3px; text-decoration-thickn
 .link-dark { color: var(--shell-mut); background: none; border: 0; font: inherit; cursor: pointer; padding: 4px 6px; border-radius: var(--r-1); }
 .link-dark:hover { color: var(--shell-ink); text-decoration: underline; text-underline-offset: 3px; }
 
+/* 账户下拉：站点级入口收在这儿，左边只留业务导航 */
+.acct { position: relative; display: flex; align-items: center; }
+.acct-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 29px; height: 29px; padding: 0; cursor: pointer; border-radius: 9px;
+  background: var(--shell-800); color: var(--shell-mut); border: 1px solid var(--shell-700);
+}
+.acct-btn:hover, .acct-btn.on { background: var(--shell-700); color: var(--shell-ink); }
+.acct-menu {
+  position: absolute; right: 0; top: calc(100% + 9px); z-index: 40; min-width: 214px; padding: 6px;
+  background: var(--shell-900); color: var(--shell-ink);
+  border: 1px solid var(--shell-700); border-radius: var(--r-2); box-shadow: var(--shadow-2);
+  animation: acct-in .12s ease-out;
+}
+@keyframes acct-in { from { opacity: 0; transform: translateY(-4px); } }
+.acct-head { padding: 7px 10px 9px; margin-bottom: 5px; font-size: 12px; color: var(--shell-mut);
+  border-bottom: 1px solid var(--shell-800); }
+.acct-head b { font-weight: 550; color: var(--shell-ink); }
+.acct-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px;
+  background: none; border: 0; border-radius: var(--r-1); cursor: pointer;
+  color: var(--shell-mut); font: inherit; font-size: 13px; text-align: left; text-decoration: none;
+}
+.acct-item:hover { background: var(--shell-800); color: var(--shell-ink); }
+/* 当前页的标记跟左侧导航的当前态同一套语言：同一层底色 + 提亮的字 */
+.acct-item.on { background: var(--shell-700); color: var(--shell-ink); }
+.acct-sep { height: 1px; margin: 5px 4px; background: var(--shell-800); }
+
 .shell { max-width: 1280px; margin: 0 auto; padding: 22px 20px 64px; }
 
 /* ————— 印章式状态标签 ————— */
@@ -480,26 +508,46 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
 .input:disabled { color: var(--ink-disabled); background: var(--panel); }
 .field-cap { font-size: 13px; color: var(--ink-2); }
 
-/* 分发方式二选一：整张卡就是按钮，说明写在卡里——选错方向只有传过一次
-   GB 级镜像的人才知道疼，所以适用场景必须出现在眼前而不是文档里。 */
+/* 分发方式二选一：卡片那一行就是选项，长说明收进标题旁的 ? ——
+   选错方向只有传过一次 GB 级镜像的人才知道疼，所以定位短语留在脸上。 */
 .mode-pick { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .mode-card {
-  display: block; text-align: left; padding: 11px 13px 12px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; text-align: left; padding: 11px 12px;
   background: var(--card); color: var(--ink); border: 1px solid var(--line-2);
-  border-radius: var(--r-2); box-shadow: var(--shadow-1); font: inherit;
+  border-radius: var(--r-2); box-shadow: var(--shadow-1);
   transition: border-color .15s ease, background .15s ease;
 }
-.mode-card:hover:not(:disabled) { border-color: var(--ink-3); }
+.mode-card:hover { border-color: var(--ink-3); }
 .mode-card.on { border-color: var(--accent); background: var(--accent-tint); box-shadow: inset 0 0 0 1px var(--accent); }
-.mode-card:disabled { cursor: default; }
-.mc-top { display: flex; align-items: center; gap: 8px; }
-.mc-top b { font-size: 14px; }
+.mc-pick {
+  display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; padding: 0;
+  background: none; border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.mc-pick:focus-visible { outline-offset: 4px; }
 .mc-dot { flex: none; width: 12px; height: 12px; border: 1px solid var(--line-2);
   border-radius: 50%; background: var(--card); }
 .mode-card.on .mc-dot { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 2px var(--accent-tint); }
 .mc-use { font-size: 12px; color: var(--ink-2); }
 .mc-on-tag { margin-left: auto; font-size: 11px; letter-spacing: .12em; color: var(--accent-700); }
-.mc-note { display: block; margin-top: 6px; font-size: 12.5px; line-height: 1.6; color: var(--ink-2); }
+
+/* ? 轻提示：解释性文案一律收在这儿，页面上只留一个小圈。
+   气泡用 fixed 定位——列表那些 overflow 容器会把 absolute 的气泡裁掉。 */
+.help-wrap { position: relative; display: inline-flex; vertical-align: middle; margin-left: 5px; }
+.help {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 17px; height: 17px; padding: 0; border: 0; border-radius: 50%;
+  background: none; color: var(--ink-3); cursor: help;
+}
+.help:hover, .help.on { color: var(--accent-700); }
+.help-tip {
+  position: fixed; z-index: 50; width: max-content; max-width: 320px; padding: 8px 11px;
+  background: var(--shell-900); color: var(--shell-ink);
+  border: 1px solid var(--shell-700); border-radius: var(--r-2); box-shadow: var(--shadow-2);
+  font: 12px/1.65 var(--sans); text-align: left;
+  animation: help-in .1s ease-out;
+}
+.help-tip.measuring { visibility: hidden; }
+@keyframes help-in { from { opacity: 0; } }
 
 .base-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
@@ -546,7 +594,6 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
   .kv { grid-template-columns: 1fr; gap: 2px; }
   .kv dt { margin-top: 8px; }
   .topbar-right { gap: 8px; }
-  .topbar-right > span { display: none; }
   .mode-pick { grid-template-columns: 1fr; }
   .base-row .btn, .pub-form .btn-lg { flex: 1; justify-content: center; }
 }

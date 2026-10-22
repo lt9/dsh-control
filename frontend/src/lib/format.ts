@@ -102,12 +102,12 @@ export const JOB_META: Record<JobKind, { zh: string }> = {
 export const SHIP_MODE_META: Record<ShipMode, { zh: string; use: string; note: string }> = {
   ssh: {
     zh: "SSH 直传",
-    use: "局域网首选",
+    use: "局域网快路",
     note: "源机 docker save 的流经面板内存直接灌进目标机 docker load，两边都不落盘、两台之间也不用互信。慢的地方是它两头都吃控制台带宽——公网机之间走这条会很难看。",
   },
   download: {
     zh: "控制台下载",
-    use: "公网机首选",
+    use: "公网机自取",
     note: "先把镜像发布成制品，目标机自己 curl 控制台公网域名去拉，拉完强制校验 sha256 再 load。控制台只被每台目标机拉一次，不再当转发的管道。",
   },
 };

@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback, useEffect, useId, useLayoutEffect, useRef, useState,
+  type PointerEvent as RPointerEvent, type ReactNode,
+} from "react";
 import { STATE_META, type Tone } from "../lib/format";
 import type { InstanceState } from "../api/client";
 
@@ -37,6 +40,8 @@ export function Icon({ name, size = 14 }: { name: string; size?: number }) {
     case "void":     return <svg {...p}><circle cx="8" cy="8" r="5.2" /><path d="M4.6 11.4 11.4 4.6" /></svg>;
     // 设置：齿轮（八根辐条 + 芯），顶栏导航用
     case "gear":     return <svg {...p}><circle cx="8" cy="8" r="2.4" /><path d="M8 1.6v2.2M8 12.2v2.2M1.6 8h2.2M12.2 8h2.2M3.5 3.5l1.6 1.6M10.9 10.9l1.6 1.6M12.5 3.5l-1.6 1.6M5.1 10.9l-1.6 1.6" /></svg>;
+    // 账户占位：这颗面板没有个人中心，先用一个人形剪影占住"这是账户"的位置
+    case "person":   return <svg {...p}><circle cx="8" cy="5.9" r="2.7" /><path d="M2.9 13.6c.6-2.7 2.6-4 5.1-4s4.5 1.3 5.1 4" /></svg>;
     // 制品库：一个装着图的箱子——里面是发布好的镜像文件，不是镜像本身
     case "image":    return <svg {...p}><rect x="2.4" y="3.6" width="11.2" height="8.8" rx="1.2" /><circle cx="6" cy="6.6" r=".9" /><path d="M2.8 10.6l3-2.6 2.5 2.1 2.4-2.5 2.5 2.7" /></svg>;
     // 发布：把镜像抬进制品库（向上的箭头 + 箱子口）
@@ -257,5 +262,86 @@ export function Toast({ text }: { text: string }) {
       <Icon name="check" />
       <span>{text}</span>
     </div>
+  );
+}
+
+/** ? 轻提示：hover 出、挪开散；键盘 focus 也出、blur 散；触屏点按切换。
+ *  它只是解释，不是对话框——所以 Esc 不收它（Esc 归菜单和弹窗管）。
+ *  气泡走 fixed 定位：卡片里 `.tbl-wrap` 那种 overflow 容器会把 absolute 的气泡裁掉，
+ *  列头挂的提示尤其容易被切；顺带自己躲视口上沿（贴顶栏就朝下开）。 */
+export function HelpTip({ text, label = "说明" }: { text: string; label?: string }) {
+  const id = useId();
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const tipRef = useRef<HTMLSpanElement>(null);
+  const timer = useRef<number>();
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; top: number; place: "up" | "down" } | null>(null);
+  const closedByTouch = useRef(0);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const hide = useCallback(() => { clearTimeout(timer.current); setOpen(false); }, []);
+
+  const show = useCallback(() => {
+    clearTimeout(timer.current);
+    // 80ms 的进场延迟：鼠标扫过去不该一路弹过去，停一下才是真的在看它
+    timer.current = window.setTimeout(() => { setPos(null); setOpen(true); }, 80);
+  }, []);
+  // 先量一次尺寸再定坐标（第一帧藏起来，量完才露脸）
+  useLayoutEffect(() => {
+    if (!open || pos || !btnRef.current || !tipRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    const w = tipRef.current.offsetWidth, h = tipRef.current.offsetHeight;
+    const left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), Math.max(8, window.innerWidth - 8 - w));
+    // 上方留给 sticky 顶栏：宁可朝下开，也别把气泡压在顶栏身上
+    const up = r.top - h - 8 >= 56;
+    setPos({ left, top: up ? r.top - h - 8 : r.bottom + 8, place: up ? "up" : "down" });
+  }, [open, pos]);
+  useEffect(() => {
+    if (!open) return;
+    // 一动页面就收：fixed 的坐标不跟着滚，留着一个错位的气泡比收掉更糟。
+    // 但刚开这一下的滚动不算——键盘 Tab 到屏幕外的那个 ? 时，浏览器会先把它滚进
+    // 视野，那一下是"打开"自己带出来的，不该反过来把气泡关掉。
+    const openedAt = Date.now();
+    const off = () => { if (Date.now() - openedAt > 160) hide(); };
+    const away = (e: PointerEvent) => { if (!btnRef.current?.contains(e.target as Node)) hide(); };
+    window.addEventListener("scroll", off, true);
+    window.addEventListener("resize", off);
+    document.addEventListener("pointerdown", away);
+    return () => {
+      window.removeEventListener("scroll", off, true);
+      window.removeEventListener("resize", off);
+      document.removeEventListener("pointerdown", away);
+    };
+  }, [open, hide]);
+
+  // 手指抬起时浏览器会给这个指针补发一次 leave，所以悬停那条路只认鼠标/触控笔；
+  // 触屏的进与出都走下面 pointerdown 的点按切换。
+  const hover = (e: RPointerEvent<HTMLButtonElement>, on: boolean) => {
+    if (e.pointerType === "touch") return;
+    if (on) show(); else hide();
+  };
+  return (
+    <span className="help-wrap">
+      <button type="button" ref={btnRef} className={`help${open ? " on" : ""}`}
+        aria-label={`解释：${label}`} aria-describedby={open ? id : undefined}
+        onPointerEnter={(e) => hover(e, true)} onPointerLeave={(e) => hover(e, false)}
+        onFocus={() => {
+          // 有的浏览器点一下也会把焦点放到按钮上：刚被手指关掉的气泡不该又被 focus 打开
+          if (Date.now() - closedByTouch.current < 400) return;
+          show();
+        }}
+        onBlur={hide}
+        onPointerDown={(e) => {
+          if (e.pointerType === "mouse") return;
+          e.preventDefault();
+          if (open) { closedByTouch.current = Date.now(); hide(); } else { show(); }
+        }}>
+        <Icon name="help" size={13} />
+      </button>
+      {open && (
+        <span ref={tipRef} id={id} role="tooltip"
+          className={`help-tip${pos ? ` ${pos.place}` : " measuring"}`}
+          style={pos ? { left: pos.left, top: pos.top } : undefined}>{text}</span>
+      )}
+    </span>
   );
 }
