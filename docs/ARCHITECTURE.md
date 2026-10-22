@@ -602,7 +602,9 @@ GitHub 同 tag 内同名 asset 先删旧再传新（幂等重跑不叠 asset，�
 curl -fsL --max-time 8 -r 0-0 -o /dev/null '<入口 url>' && echo OK
 ```
 
-第一个 OK 的渠道胜出；取货脚本按渠道分支（github/console=整发三连；gitee=下
+第一个 OK 的渠道胜出。**就近例外**：主机显式登记了 `image_base_url`（局域网/
+回环这类近端入口）时，console 候选提到探测队首——那是运维明写的就近意图，
+制品就在本地还绕外网是南辕北辙（实测：主机自取 53s vs gitee CDN 206s）。取货脚本按渠道分支（github/console=整发三连；gitee=下
 manifest→按序拉全部 parts→`cat` 拼回→**整包 sha256 强校验**→load→删缓存）。
 全败 → StepFailed 逐渠道点名探测结果。探测与取货全程用目标机自己的网络。
 

@@ -350,6 +350,12 @@ async def _ship_missing_image(ctx: JobCtx, host: Any, image: str, have: str) -> 
                 f"分发方式=download，制品 {image} 存在但没有任何可用下载入口："
                 "console 基址没配（base_url/public_base 都空）、外部渠道没有 "
                 "state=ok 的行。去设置页配好基址，或发布时把渠道推成功。")
+        if host_base:
+            # 主机显式登记了 image_base_url（局域网/回环这类近端入口）=运维的
+            # 就近意图：console 排最前，外部渠道退居备胎（稳定排序，其余相对序
+            # 不动）。实测教训：VPS 拉 gitee CDN 206s、自家隧道只要 53s；文件
+            # 就在主机本地时（127.0.0.1 基址）更不该绕外网一圈。
+            cands.sort(key=lambda c: c[0] != "console")
         picked: tuple[str, str] | None = None
         tried: dict[str, str] = {}
         for ch, url in cands:

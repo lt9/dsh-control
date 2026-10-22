@@ -777,6 +777,35 @@ async def test_step20_skips_unreachable_channel_in_order(ship_env, monkeypatch):
                for e in evs), "事件里点名选了哪条渠道"
 
 
+async def test_step20_host_base_url_forwards_console_past_channels(
+        ship_env, monkeypatch):
+    """主机显式登记 image_base_url=就近意图：console 必须排到外部渠道前面。
+    实测教训：NAS/主机上制品就在本地，按默认 gitee 优先去绕外网是南辕北辙。"""
+    await _seed_artifact(ship_env, b"tarstream", tag=IMG)
+    await _prep_download_mode(ship_env, IMG)
+    await _seed_channel(ship_env, IMG, "gitee",
+                        url="https://gitee.example/dsh-test_v9.tar.gz.manifest.json")
+    await _seed_channel(ship_env, IMG, "github",
+                        url="https://gt.example/download/image-dsh-test_v9/dsh-test_v9.tar.gz")
+    async with ship_env.db.session() as s:
+        h = await repo.get_host(s, ship_env.host_nas)
+        h.image_base_url = "http://198.51.100.77:4893"
+        await s.commit()
+
+    ex = ship_env.providers.executor
+    loaded = {"done": False}
+    monkeypatch.setattr(ex, "run", _probe_runner(ex, ex.run, loaded))
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert len(probes) == 1 and "/dl/" in probes[0], \
+        "登记了近端基址，第一条探测就该是 console，赢了不许再探外部渠道"
+    pull = next(c for c in ex.commands if "curl -fL" in c)
+    assert "198.51.100.77:4893/dl/" in pull and "sha256sum -c" in pull
+
+
 async def test_step20_gitee_reassembles_with_full_sha_check(ship_env, monkeypatch):
     await _seed_artifact(ship_env, b"tarstream", tag=IMG)
     await _prep_download_mode(ship_env, IMG)
