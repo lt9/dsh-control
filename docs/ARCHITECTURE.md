@@ -134,7 +134,17 @@ image_artifacts    镜像制品库（§6.1.5）：一行一个 tag，行存在�
   id, tag UNIQUE, filename, size_bytes, sha256,
   token UNIQUE,             # 公开链接的凭证（随机 26 字符，撤销=删行删文件）
   origin_host, created_at   # origin_host: 从哪台机 save 的；空串=手工投放
+
+image_channels     制品的外部分发渠道（§6.1.6）：一制品一渠道一行，没有行=没推过
+  id, artifact_id, channel(github|gitee), state(pending|ok|failed),
+  url,                      # 目标机可直连的入口：github=asset 直链；gitee=manifest 直链
+  release_tag, error, updated_at
+  UNIQUE(artifact_id, channel)
 ```
+
+分发渠道的令牌是 `credentials(kind=mirror_token)`（name=github/gitee）：**只写不回显**
+（API 任何出口都只给 `token_set: true/false`）——与运维密钥的「明文可读回」刻意不同：
+那是自己的门，这是第三方的门，泄露面多一处都是白送。
 
 上面每个 `id` 类关联列都只建普通索引，不建外键；`instance_id`/`job_id`/`host_id`/`ssh_credential_id` 的取值合法性由仓储层在写入前校验。
 
@@ -194,7 +204,9 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | GET | `/api/jobs/{id}/stream` | SSE，`step` / `log` / `done` 三种事件 |
 | GET | `/api/instances/{id}/events` | 事件时间线 |
 | GET | `/api/settings` | 面板运行设置（§6.1.5）：`{image_ship: {mode, base_url}}`；`base_url` 空串=吃 site 的 `public_base`，返回的是解析后的生效值 |
-| PUT | `/api/settings` | 局部更新（只认已知键）：`mode` 非 `ssh|download` → 422；写进 site 凭据 secret 的 `image_ship`，deploy 每轮现读，改完不重启生效 |
+| PUT | `/api/settings` | 局部更新（只认已知键）：`mode` 非 `ssh|download` → 422；写进 site 凭据 secret 的 `image_ship`，deploy 每轮现读，改完不重启生效。可扩展键：`mirror_order`（`gitee/github/console` 的排列，探测优先序，§6.1.6）、`auto_mirror`（发布是否顺道推外部渠道，默认 true）；`mirrors.{channel}.repo` 也在 PUT 白名单（如 `lt9/dsh-control`） |
+| GET | `/api/settings` 的 `mirrors` 段 | 每渠道 `{repo, token_set, state?}`——**token 永不出网**（§6.1.6） |
+| PUT | `/api/mirror-tokens/{channel}` | `{token}` → upsert `credentials(kind=mirror_token)`；channel 非 github/gitee → 422；写后任何 GET 只回 `token_set`（§6.1.6） |
 | GET | `/api/images` | 制品列表：`{items:[{id,tag,size_bytes,sha256,token,url,origin_host,created_at}], store_free_bytes}`；`url` = 解析后的 base_url + `/dl/{token}/{filename}`；`store_free_bytes` null=制品库不可用（未挂载/不可写），前端可不显示该栏，可用性点名留给发布/搬运失败 |
 | POST | `/api/images` | `{tag, from_host_id}` → `{job_id}`（kind=publish，§6.1.5）。同 tag 重发=原子替换，旧链接立死 |
 | DELETE | `/api/images/{id}` | 下架：删行删文件，链接即刻失效 |
@@ -533,21 +545,59 @@ curl -fL --retry 3 '<url>' -o <文件> && echo '<sha256>  <文件>' | sha256sum 
   黑洞（§6.1.4 实测同款），登记一个够得着的入口——如 frps 隧道口
   `http://198.51.100.77:4893` 这类本机可达的门（与 NG 回源同路）。
 
-发布（`POST /api/images` → 工单 `kind=publish`，两步）：
+发布（`POST /api/images` → 工单 `kind=publish`，2+2 步）：
 `10 save`：源主机 `docker save <tag> | gzip -n` 流进制品库 `<file>.tmp`，按已落
 字节回显进度（GB 级超时给足 1800s）；
 `20 record`：算 sha256/size，改名去 `.tmp`，**文件落定才插行/换行**——表里的行
 永远指向完整文件。同 tag 重发：新行落库成功后才删旧行旧文件。
+`30 mirror_github` / `40 mirror_gitee`：§6.1.6。未配 token 或 `auto_mirror=false`
+→ skipped（不拦 publish）；配了却失败 → 工单红（渠道状态落 `image_channels`，
+修好重跑 publish 全部重来是幂等的）。
 
 deploy 第 20 步缺镜像分支（替代旧「报错让人跑 CLI」）：
-- `mode=download` 且该 tag 有制品 → 目标机跑上面 curl 三连；缓存放
-  `{data_root}/ship-cache/`，不赌 /tmp 是不是 tmpfs；哪步挂了 StepFailed 写清哪步。
+- `mode=download` 且该 tag 有制品 → 按 §6.1.6 探测选路后，目标机跑 curl 三连
+  （gitee 是分卷版三连）；缓存放 `{data_root}/ship-cache/`，不赌 /tmp 是不是
+  tmpfs；哪步挂了 StepFailed 写清哪步。
 - `mode=ssh` → 在 enabled 主机里找有该镜像的（优先面板所在宿主机），流式直传后复查。
 - 没制品/没源机 → StepFailed：点名去设置页发布该 tag 的制品或切回 SSH 直传，
   并附目标机现有 dsh 镜像列表。
 
 前置：目标机有 `curl`（kit 的 verify.sh 本来就依赖它）；`download` 模式还要
 `DSHC_IMAGE_STORE` 挂得出可写目录，发布/搬运遇不可写直接报错，不静默降级。
+
+### 6.1.6 制品多路分发：控制台 / GitHub Releases / Gitee Releases
+
+公网机从控制台拉制品要绕「自家出口→入口机→隧道→控制台」一整圈，还吃控制台带宽。
+把制品镜像到公共代码托管平台的 Releases，就白嫖它们的 CDN——**匿名 curl 直链、
+无需 token**（GitHub Packages 排除：下载普遍要鉴权、按包型设计，不是给 curl 直取
+准备的）。本站仓库全公开，制品上公共渠道不新增泄露面（镜像本就公开可取）。
+
+**渠道与格式**：
+- **github**：一个制品一个 release（tag=`image-<tag安全化>`，body 写明是面板自动
+  发布的镜像制品与 sha256），asset=完整 `<file>.tar.gz`。历史 release 保留不限。
+  API：`POST /repos/{repo}/releases` + uploads 域名挂 asset。
+- **gitee**：国内机快路。**硬限制：单附件 ≤100M、仓库附件总量 ≤1G**（官方口径），
+  所以制品**分卷**：`split -b 95m` 出 `.part-aa…`，加一个 `<file>.manifest.json`
+  （file/sha256/size/parts[{name,size,sha256,url}]）。发布新版本时先传新（两版并
+  存 814M<1G 刚好过）再删旧 tag 的 release——仓库永远只有最新一版。gitee 渠道行
+  的 `url` 指向 manifest。
+- **console**：§6.1.5 的 `/dl/{token}/`，永远兜底。
+
+**探测选路（在目标机上做，不在面板上）**：面板装了梯子≠目标机有梯子，探测结果
+没有参考价值。download 模式缺镜像时，按 `mirror_order`（默认 gitee→github→console，
+= 国内优先 gitee、国外机器 gitee 探测不通自然滑向 github）对**该制品状态 ok 的
+渠道**逐个在目标机探测：
+
+```
+curl -fsL --max-time 8 -r 0-0 -o /dev/null '<入口 url>' && echo OK
+```
+
+第一个 OK 的渠道胜出；取货脚本按渠道分支（github/console=整发三连；gitee=下
+manifest→按序拉全部 parts→`cat` 拼回→**整包 sha256 强校验**→load→删缓存）。
+全败 → StepFailed 逐渠道点名探测结果。探测与取货全程用目标机自己的网络。
+
+**令牌**：`credentials(kind=mirror_token)`，UI 写入（§4），**只写不回显**；
+删除渠道 = 把 token 抹掉 + 对应 release 留着无妨（公开仓库，可再手动删）。
 
 ### 6.2 释放 `release`（二次确认后）
 
@@ -648,6 +698,9 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
    适用说明）+ 下载基址（留空=用站点公网域）+ 制品表（tag、大小、时间、sha256 短码、
    公开链接一键复制、长按下架——下架是删文件，照 §9 长按确认）+「从主机发布」表单
    （源主机下拉 × tag 输入——全站唯一要打字的地方，datalist 给出库内已有 tag 兜底），发布进度点进常规工单页。下架不加 HTTP 层确认词：误操作防线是 UI 长按，接口层已有 CSRF 头与单运维密钥。
+   多路分发区（§6.1.6）：渠道表（控制台/GitHub/Gitee：仓库名可改、token 状态灯只显
+   「已配置/未配置」、最新制品在该渠道的状态与直链复制）、探测优先序的上下调、
+   token 输入框写完即焚（保存后清空，永不回填）。Gitee 行挂 ? 讲分卷与只留最新一版。
 
 约定：中文界面；状态色语义固定（running 绿、unhealthy/restarting 琥珀、error 红、
 released 灰）；所有时间按 `Asia/Shanghai`；复制成功要有可见反馈；表格与日志里的
