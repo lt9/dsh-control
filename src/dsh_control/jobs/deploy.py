@@ -20,7 +20,7 @@ from ..db import repo
 from ..db.models import Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
 from ..domain.dsh_config import annotate_model_drift
-from ..domain.frp_port import pick_free_port
+from ..domain.frp_port import pick_direct_port, pick_free_port
 from ..domain.safety import MUST_BE_DISABLED, config_violations
 from ..domain.slug import derive, dns_rr
 from .capabilities import apply_capabilities, read_dsh_config
@@ -138,6 +138,15 @@ async def _pick_frp_port(ctx: JobCtx) -> int:
         raise StepFailed(str(exc)) from exc
 
 
+#: 「删行 + 追加」小助手：值可能含 / & 等 sed 分隔符，一律不用 sed 替换。
+#: 引号是命门：原实现写的是 '^$1='（单引号），$1 在函数体内不展开，删行从来没
+#: 删掉过——2026-10-22 现网发现 dsh 实例的 .env 里堆了 7 行 LLM_BASE_URL（每次
+#: 开通追加一行）。compose 取最后一行才没炸生产，但垃圾一直吃进来。改双引号后
+#: 每次写都真正清场，历史重复行也会被下一次开通顺手洗干净。
+_PUT_FN = ('put() { grep -v "^$1=" "$f" > "$f.tmp" || true; '
+           'mv "$f.tmp" "$f"; printf \'%s=%s\\n\' "$1" "$2" >> "$f"; }')
+
+
 async def _llm_material(ctx: JobCtx) -> dict[str, str]:
     """取站点级模型配置：地址在 settings，密钥在 credentials(kind=llm_key)。
 
@@ -204,6 +213,81 @@ async def _reuse_or_pick_port(ctx: JobCtx, names: Any, host: Any,
                         {"saved_port": saved, "new_port": new_port})
         return new_port, None
     return await _pick_frp_port(ctx), None
+
+
+# ------------------------------------------------------ direct 主机端口（§6.1.4）
+
+
+async def _direct_taken_probe(ctx: JobCtx, host: Any, inst: Any):
+    """direct 主机的「端口被占」判据工厂：**探测在目标机上做**，不问 frp-panel。
+
+    占用 = 本机 `ss -ltn` 实听的端口 ∪ 库里同机其它实例已发布的端口。
+    一次 ssh 把整表拉回来本地判，别每个端口探一次（起点到找到最多 200 次 ssh）。
+    """
+    r = await ctx.ssh(
+        "ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*[:.]//' ",
+        timeout=30)
+    listening: set[int] = set()
+    for tok in (r.stdout or "").split():
+        if tok.isdigit():
+            listening.add(int(tok))
+    if not r.ok and not listening:
+        # ss 缺失/无权限：只剩库里那半边事实，探测弱了一半——说破，别装没看见
+        await ctx.log("warn", "本机 ss -ltn 实探失败，端口占用只认库里登记（请核对目标机）")
+    db_ports = await repo.host_in_use_ports(ctx.s, host.id,
+                                            exclude_instance_id=inst.id)
+    taken = listening | db_ports
+
+    async def is_taken(port: int) -> bool:
+        return port in taken
+
+    return is_taken
+
+
+async def _pick_direct_port(ctx: JobCtx, host: Any, inst: Any) -> int:
+    try:
+        return await pick_direct_port(
+            ctx.s, ctx.settings, await _direct_taken_probe(ctx, host, inst),
+            log=lambda m: ctx.log("info", m))
+    except RuntimeError as exc:
+        raise StepFailed(str(exc)) from exc
+
+
+async def _own_container_holds_port(ctx: JobCtx, inst: Any, port: int) -> bool:
+    """监听 saved 端口的是不是**它自己的容器**——running 直连机重跑 deploy
+    （切镜像）时旧容器还没让出端口，ss 会把它读成"占用"，那是自己吓自己：
+    compose 重建会先释放再绑回，端口照旧赎回。"""
+    name = (inst.container_name or "").strip()
+    if not name:
+        return False
+    r = await ctx.ssh(
+        "docker inspect -f "
+        "'{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} "
+        "{{end}}{{end}}' " + shlex.quote(name) + " 2>/dev/null || true", timeout=60)
+    return str(port) in (r.stdout or "").split()
+
+
+async def _direct_port(ctx: JobCtx, host: Any, inst: Any) -> int:
+    """direct 主机的公网端口：续建/恢复先赎回原端口（本机没在听就当可用），
+    没有原端口或被占才新挑。frp_remote_port 列名沿用不改，就是本机发布端口。"""
+    saved = int(inst.frp_remote_port or 0)
+    if not saved:
+        return await _pick_direct_port(ctx, host, inst)
+    is_taken = await _direct_taken_probe(ctx, host, inst)
+    if not await is_taken(saved):
+        await ctx.log("info", f"恢复：赎回原本机公网端口 :{saved}"
+                              "（释放时特意保留、其它实例永不复用）")
+        return saved
+    if await _own_container_holds_port(ctx, inst, saved):
+        await ctx.log("info", f"端口 :{saved} 正被这台实例自己的容器占着"
+                              "（compose 重建会让出再绑回），照常赎回")
+        return saved
+    new_port = await _pick_direct_port(ctx, host, inst)
+    await ctx.log("warn", f"本机公网端口 :{saved} 已被占用，改用 :{new_port}")
+    await ctx.event("frp_port_fallback",
+                    f"本机原公网端口 :{saved} 被占，改用 :{new_port}",
+                    {"saved_port": saved, "new_port": new_port, "mode": "direct"})
+    return new_port
 
 
 # 公网探活的重试口径：容器刚起来的几秒里首页可能还回 401（静态壳未就绪），
@@ -512,8 +596,21 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 40 frp_create：先探测端口再建隧道；失败删刚建的
     async with ctx.step(40, "frp_create", "创建 frp 隧道") as st:
-        port, prior = await _reuse_or_pick_port(ctx, names, host, inst)
-        if _manual(ctx, "frp"):
+        if host.upstream_mode == "direct":
+            # §6.1.4：本机有公网 IP 的机器不过隧道——整步 skipped，没有隧道
+            # 也就没有回滚动作；端口照走同一个池，写进 frp_remote_port
+            # （列名沿用不改），它就是容器在本机发布的公网端口。
+            port = await _direct_port(ctx, host, inst)
+            inst.frp_remote_port = port
+            inst.container_port = port
+            await ctx.s.commit()
+            st.state = "skipped"
+            st.detail = (
+                f"direct 主机不建隧道（§6.1.4）：本机公网 {host.ssh_host} 直发 :{port}"
+                "（容器发布端口同号），frp_proxy_id 留空；\n"
+                "  端口占用探测在目标机上做（ss -ltn 实听 + 库里同机实例），没问 frp-panel。")
+        elif _manual(ctx, "frp"):
+            port, _prior = await _reuse_or_pick_port(ctx, names, host, inst)
             st.state = "skipped"
             await ctx.frp().ensure(
                 name=names.tunnel, client_id=host.frpc_client_id,
@@ -531,6 +628,7 @@ async def run_deploy(ctx: JobCtx) -> None:
             inst.container_port = port
             await ctx.s.commit()
         else:
+            port, prior = await _reuse_or_pick_port(ctx, names, host, inst)
             # 复用到上次建的隧道就不新建：ensure 见到端口不一致会拒改既有隧道，
             # 那是它对别人的保护，我们自己本来就不该走到那一步。
             tunnel = prior if prior is not None else await ctx.frp().ensure(
@@ -588,45 +686,62 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 50 ng_create：upstream + 反代站点（location：$host + websocket）
     async with ctx.step(50, "ng_create", f"创建反代站点 {dns_name}") as st:
+        # upstream 后端主机（§6.1.4）：direct = 这台机自己的公网地址（NG 仍在入口机，
+        # 证书与 location 规则一字不变）；登记了 direct_backend 就用它——云轻量服务器
+        # （SWAS 这类）的 EIP 是云端 NAT 映射，网卡上根本没有，入口机恰好=这台机时
+        # 拨自家 EIP 出网卡绕云端 hairpin 黑洞（2026-10-22 dsh-05 现网实测），必须
+        # 用网卡实址回源。frp = 入口机口径（frps_upstream_host，别动）。
+        backend = (host.direct_backend or "").strip()
+        if host.upstream_mode == "direct":
+            upstream_host = backend or host.ssh_host
+        else:
+            upstream_host = ctx.settings.require("frps_upstream_host")
+        upstream_server = f"{upstream_host}:{inst.frp_remote_port}"
+        fw_note = ""
+        if host.upstream_mode == "direct":
+            if backend:
+                fw_note = (f"\n【§6.1.4 云轻量】回源走登记地址 {backend}（EIP 在云端"
+                           f"NAT 不在本机网卡，拨 EIP 回源是 hairpin 黑洞）；第 60 步"
+                           f"把实例端口绑到 {backend}，公网路由不到它，云防火墙无需"
+                           "放行——比原红线更小的暴露面。")
+            else:
+                fw_note = (f"\n【防火墙红线 §6.1.4】实例端口 :{inst.frp_remote_port} "
+                           f"只应对入口机 {ctx.settings.require('ingress_ip')}"
+                           "（DSHC_INGRESS_IP）放行，不对全世界开放；云防火墙/安全组"
+                           "不由本控制台管理，请运维在云上补。")
         if _manual(ctx, "ng"):
             st.state = "skipped"
             await ctx.ng().ensure_site(
                 server_name=dns_name, upstream_name=names.upstream,
-                upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
-                                f":{inst.frp_remote_port}",
+                upstream_server=upstream_server,
                 listen_port=443, header_host="$host", websocket=True,
                 cert_name=ctx.settings.require("wildcard_cert_name"),
             )
             st.detail = (
                 "NG provider = noop，需人工配置反向代理：\n"
-                f"  upstream {names.upstream}: "
-                f"{ctx.settings.require('frps_upstream_host')}"
-                f":{inst.frp_remote_port}\n"
+                f"  upstream {names.upstream}: {upstream_server}\n"
                 f"  server_name {dns_name}，location / 反代到该 upstream，"
                 "headerHost=$host，websocket=true\n"
                 f"  证书：{ctx.settings.wildcard_cert_name}"
                 "（443 必须挂证书，否则面板配置过不了 nginx -t）\n"
                 "（headerHost 带端口会让 /api/remote.mux 403，见 docs/site/NG-API.md）"
-                + _drained(ctx, "ng")
+                + _drained(ctx, "ng") + fw_note
             )
             await ctx.s.commit()
         else:
             site = await ctx.ng().ensure_site(
                 server_name=dns_name, upstream_name=names.upstream,
-                upstream_server=f"{ctx.settings.require('frps_upstream_host')}"
-                                f":{inst.frp_remote_port}",
+                upstream_server=upstream_server,
                 listen_port=443, header_host="$host", websocket=True,
                 cert_name=ctx.settings.require("wildcard_cert_name"),
             )
             if _synthetic_id(site.server_id):
                 st.state = "skipped"
                 st.detail = ("provider 返回合成 server_id，未登记。这一层要人工补做：\n"
-                             f"  upstream {names.upstream}: "
-                             f"{ctx.settings.require('frps_upstream_host')}"
-                             f":{inst.frp_remote_port}\n"
+                             f"  upstream {names.upstream}: {upstream_server}\n"
                              f"  server_name {dns_name}（headerHost=$host，websocket=true）\n"
                              "  补做后把真实 server_id 人工回填，否则释放时删不到。"
-                             + _drained(ctx, "ng"))
+                             + _drained(ctx, "ng") + fw_note)
                 await ctx.s.commit()
                 await ctx.event("ng_manual_pending",
                                 f"NG 层返回合成 id，需人工补做并回填: {dns_name}",
@@ -658,6 +773,10 @@ async def run_deploy(ctx: JobCtx) -> None:
                                        else site.upstream_id)
                 inst.ng_server_id = site.server_id
                 inst.ng_location_id = site.location_id
+                st.detail = (f"upstream {names.upstream} → {upstream_server}；"
+                             f"server_name {dns_name}（headerHost=$host，"
+                             f"websocket=true，证书 {ctx.settings.wildcard_cert_name}）"
+                             + fw_note)
                 await ctx.s.commit()
                 await ctx.event("ng_created", f"站点 {dns_name} server_id={site.server_id}",
                                 {"server_id": site.server_id, "upstream": names.upstream,
@@ -690,6 +809,45 @@ async def run_deploy(ctx: JobCtx) -> None:
         # DSH 准入墙会把 /api 判 403；PUBLIC_URL 缺了，容器日志里打的一键登录地址
         # 就是局域网地址，抓到的 token 拼出的链接对外没用。镜像也在这里落到 .env。
         llm = await _llm_material(ctx)  # 现取现用：中途可能换密钥
+        # 按主机的模型入口覆盖（§2/§6.1.4）：站点值是局域网网关地址，云上机器拨不到；
+        # 登记了 host.llm_base_url 就换地址不换密钥（同一网关的公网门/隧道口）。
+        host_llm = (host.llm_base_url or "").strip()
+        if host_llm:
+            llm["base_url"] = host_llm
+            await ctx.log("info", f"[env] 该机登记了模型入口覆盖，LLM_BASE_URL 用它：{host_llm}")
+        # 资源红线（§2/§6.1.4）：主机配额有值（去空白非空串）就改写进实例 .env，
+        # 无值一行都不写——kit 默认（4g/4 核）只该保护独占机，挤共享机必设配额。
+        # 改写写法沿用上面 DSH_IMAGE 的 if-grep-sed-else-printf。
+        limit_lines: list[str] = []
+        echo_keys = ["HOST_PORT", "TRUSTED_HOSTS", "PUBLIC_URL", "DSH_IMAGE",
+                     "DATA_DIR", "LLM_BASE_URL", "LLM_MODEL_ID"]
+        for key, val in (("MEM_LIMIT", (host.mem_limit or "").strip()),
+                         ("CPU_LIMIT", (host.cpu_limit or "").strip())):
+            if not val:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9._]+", val):
+                await ctx.log("warn", f"主机配额 {key}={val!r} 含意外字符，"
+                                      "跳过写入（该机实例吃 kit 默认，请改登记）")
+                continue
+            limit_lines.append(
+                f'if grep -q "^{key}=" "$f"; then '
+                f'sed -i "s|^{key}=.*|{key}={val}|" "$f"; '
+                f'else printf "{key}=%s\\n" {shlex.quote(val)} >> "$f"; fi')
+            echo_keys.append(key)
+        # direct_backend 兼作监听地址（§6.1.4）：端口只绑登记址（云轻量机=网卡实址），
+        # 公网路由不到它，云防火墙一行都不用放行。字符白名单同配额，不过就跳过并 warn。
+        if backend:
+            if re.fullmatch(r"[A-Za-z0-9._-]+", backend):
+                limit_lines.append(
+                    f'if grep -q "^HOST_BIND_IP=" "$f"; then '
+                    f'sed -i "s|^HOST_BIND_IP=.*|HOST_BIND_IP={backend}|" "$f"; '
+                    f'else printf "HOST_BIND_IP=%s\\n" {shlex.quote(backend)} >> "$f"; fi')
+                echo_keys.append("HOST_BIND_IP")
+            else:
+                await ctx.log("warn", f"主机 direct_backend {backend!r} 含意外字符，"
+                                      "跳过 HOST_BIND_IP 写入（实例将监听 0.0.0.0，"
+                                      "请改登记）")
+        echo_re = "|".join(echo_keys)
         patch = "\n".join([
             "set -e",
             f"f={shlex.quote(env_file)}",
@@ -703,9 +861,9 @@ async def run_deploy(ctx: JobCtx) -> None:
             (f'if grep -q "^DSH_IMAGE=" "$f"; then '
              f'sed -i "s|^DSH_IMAGE=.*|DSH_IMAGE={image}|" "$f"; '
              f'else printf "DSH_IMAGE=%s\\n" {shlex.quote(image)} >> "$f"; fi'),
+            *limit_lines,
             # 值可能含 / & 等 sed 分隔符，一律"删行 + 追加"，不用 sed 替换
-            ("put() { grep -v '^$1=' \"$f\" > \"$f.tmp\" || true; "
-             "mv \"$f.tmp\" \"$f\"; printf '%s=%s\\n' \"$1\" \"$2\" >> \"$f\"; }"),
+            _PUT_FN,
             f'put LLM_BASE_URL {shlex.quote(llm["base_url"])}',
             # 密钥从 stdin 进来：命令行会进任务日志，也在目标机 ps 里裸奔
             "read -r llm_api_key",
@@ -715,8 +873,7 @@ async def run_deploy(ctx: JobCtx) -> None:
             (f'put LLM_MODEL_ID {shlex.quote(llm["model_id"])}'
              if llm["model_id"] else ":"),
             # 回显白名单里刻意没有 LLM_API_KEY / SEARCH_API_KEY
-            ('grep -E "^(HOST_PORT|TRUSTED_HOSTS|PUBLIC_URL|DSH_IMAGE|DATA_DIR'
-             '|LLM_BASE_URL|LLM_MODEL_ID)=" "$f"'),
+            f'grep -E "^({echo_re})=" "$f"',
             ('if grep -q "^LLM_API_KEY=." "$f"; then echo "LLM_API_KEY 已写入（值不回显）"; '
              'else echo "LLM_API_KEY 缺失"; exit 1; fi'),
         ])
@@ -880,12 +1037,16 @@ async def run_deploy(ctx: JobCtx) -> None:
             f"docker exec {shlex.quote(inst.container_name or names.container)} sh -c "
             + shlex.quote('cd "${DSH_HOME:-/data}" && dsh web --dump-config'),
             timeout=180, quiet=True)  # 整份配置不进日志，只写一行结论
-        bad = config_violations(gate.stdout or "", base_url=ctx.settings.llm_base_url)
+        # 期望端点：主机登记了覆盖就用覆盖（§6.1.4：云上机器拨不到局域网网关，
+        # 覆盖值是人写进库里的，走的是自家 frps 隧道——换门不换网关，授权成立）。
+        expect_llm = (host.llm_base_url or "").strip() or ctx.settings.llm_base_url
+        bad = config_violations(gate.stdout or "", base_url=expect_llm)
         if bad:
             raise StepFailed("安全门不通过（花钱/外传这两条不外包给脚本）：\n  - "
                              + "\n  - ".join(bad))
         await ctx.log("info", f"安全门：{len(MUST_BE_DISABLED)} 条云端路径确认已断开，"
-                              f"模型端点确认为 {ctx.settings.llm_base_url}")
+                              f"模型端点确认为 {expect_llm}"
+                              + ("（主机登记的入口覆盖）" if host.llm_base_url else ""))
 
         r = await ctx.ssh(f"cd {shlex.quote(host.kit_path)} && "
                           f"./scripts/verify.sh {shlex.quote(slug)}", timeout=300)

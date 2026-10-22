@@ -41,6 +41,7 @@ STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
 CREDENTIAL_KINDS = ("ssh_key", "ssh_password", "aliyun_ak", "frp_panel",
                     "ng_panel", "operator_key", "site", "llm_key", "image_key")
+HOST_UPSTREAM_MODES = ("frp", "direct")
 
 
 def _in(col: str, values: tuple[str, ...]) -> CheckConstraint:
@@ -83,7 +84,11 @@ class Credential(Base):
 
 class Host(Base):
     __tablename__ = "hosts"
-    __table_args__ = ({"comment": "被管主机：SSH + docker，dsh-family kit 所在"},)
+    __table_args__ = (
+        _in("upstream_mode", HOST_UPSTREAM_MODES),
+        {"comment": "被管主机：SSH + docker，dsh-family kit 所在；"
+                    "upstream_mode 决定实例公网回源走隧道还是本机直连（§6.1.4）"},
+    )
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
     name: Mapped[str] = mapped_column(String(128), unique=True,
@@ -101,6 +106,29 @@ class Host(Base):
                                            comment="实例数据根目录（必须落在机械盘）")
     frpc_client_id: Mapped[str] = mapped_column(String(255), default="",
                                                 comment="frp-panel 里的客户端 id")
+    upstream_mode: Mapped[str] = mapped_column(
+        String(16), default="frp",
+        comment="公网回源方式：frp=走隧道（默认，NAT 后的机器）；direct=本机有公网 IP "
+                "直连，不建隧道，NG 直接回源 ssh_host（§6.1.4）")
+    mem_limit: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="该机实例内存上限（如 \"1g\"/\"512m\"），开通第 60 步写进实例 .env 的 "
+                "MEM_LIMIT；留空=kit 默认 4g。共享机必填，防 OOM 伤及同机服务（§2）")
+    cpu_limit: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="该机实例 CPU 上限（如 \"2\"），开通第 60 步写进实例 .env 的 "
+                "CPU_LIMIT；留空=kit 默认 4 核。共享机必填（§2）")
+    direct_backend: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment="direct 主机 NG 回源实际拨的地址；空=ssh_host。云轻量服务器（SWAS 等）"
+                "公网 EIP 是云端 NAT 映射不在网卡上，入口机=本机时回源拨 EIP 走云端 "
+                "hairpin 黑洞，须登记网卡实址；同时第 60 步写入实例 .env "
+                "HOST_BIND_IP，端口只绑该址（§6.1.4）")
+    llm_base_url: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="该机实例的模型入口覆盖（如 http://198.51.100.77:7777/v1）：站点 "
+                "llm_base_url 是局域网网关，云上机器拨不到时用这里覆盖；空=用站点"
+                "值。只换地址不换密钥（§2/§6.1.4）")
     enabled: Mapped[bool] = mapped_column(default=True, comment="是否参与新实例分配")
     note: Mapped[str] = mapped_column(Text, default="", comment="备注")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,

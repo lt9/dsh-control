@@ -124,6 +124,9 @@ async def instance_detail(
         "network": {
             "dns_name": inst.dns_name,
             "public_url": inst.public_url,
+            # 回源方式来自主机（§6.1.4）：direct 的 frp_proxy_id 为 null 是常态
+            # （不建隧道），前端拿这个字段别再当异常提示
+            "upstream_mode": host.upstream_mode if host else None,
             "frp_remote_port": inst.frp_remote_port,
             "frp_proxy_id": inst.frp_proxy_id,
             "dns_record_id": inst.dns_record_id,

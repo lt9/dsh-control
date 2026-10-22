@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy import select
 
 from .db import repo
-from .db.models import Credential, Host
+from .db.models import HOST_UPSTREAM_MODES, Credential, Host
 from .db.session import Db, make_db
 from .jobs.runner import redact_text
 from .settings import get_settings
@@ -167,6 +167,20 @@ async def seed_into(db: Db, site: dict[str, Any]) -> tuple[int, int]:
             host.kit_path = str(h.get("kit_path", ""))
             host.data_root = str(h.get("data_root", ""))
             host.frpc_client_id = str(h.get("frpc_client_id", ""))
+            # 直连主机与资源配额（§2/§6.1.4）：direct 不建隧道、NG 直接回源 ssh_host；
+            # mem/cpu 限额开通时写进实例 .env，共享机必填的护栏在这里登记
+            mode = str(h.get("upstream_mode", "frp")).strip() or "frp"
+            if mode not in HOST_UPSTREAM_MODES:
+                raise SystemExit(
+                    f"hosts.{h.get('name')}: upstream_mode={mode!r} 非法，"
+                    f"只认 {'|'.join(HOST_UPSTREAM_MODES)}")
+            host.upstream_mode = mode
+            host.mem_limit = str(h.get("mem_limit") or "").strip() or None
+            host.cpu_limit = str(h.get("cpu_limit") or "").strip() or None
+            # 云轻量服务器（SWAS 等）EIP 不在网卡上：回源/绑定要用登记地址（§6.1.4）
+            host.direct_backend = str(h.get("direct_backend") or "").strip() or None
+            # 模型入口按主机覆盖：云上机器拨不到局域网网关（§2）
+            host.llm_base_url = str(h.get("llm_base_url") or "").strip() or None
             host.enabled = bool(h.get("enabled", True))
             host.note = str(h.get("note", ""))
             n_host += 1

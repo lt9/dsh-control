@@ -89,6 +89,10 @@ hosts              被管主机
   docker_context, kit_path,                 # dsh-family 仓库在被管机上的路径
   data_root,                                # 实例数据根目录（必须落在机械盘）
   frpc_client_id,                           # frp-panel 里的客户端 id，例 office-frpc@1
+  upstream_mode(frp|direct),                # 公网回源方式：frp=走隧道（默认）；direct=本机公网直连（§6.1.4）
+  mem_limit, cpu_limit,                     # 该机实例的资源配额（如 "1g"/"2"）；留空=kit 默认（4g/4核）。共享机必填，防 OOM 伤及同机服务
+  direct_backend,                           # direct 主机 NG 回源实际拨的地址；留空=ssh_host。云轻量服务器（SWAS 等）EIP 是云端 NAT 映射不在网卡上，入口机=本机时须登记网卡实址；兼作实例 HOST_BIND_IP 绑定址（§6.1.4）
+  llm_base_url,                             # 该机实例的模型入口覆盖；留空=站点 llm_base_url（局域网网关地址，云上机器拨不到）。只换地址不换密钥
   enabled bool, note, created_at, updated_at
 
 instances          DSH 实例（一个容器 = 一个人）
@@ -401,9 +405,9 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 | 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
 | 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就失败并提示用 `cli images ship` 传过来。本步骤**永不构建镜像** | 无副作用 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
-| 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用） | 删刚建的隧道 |
-| 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket） | 删刚建的站点/upstream |
-| 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS` | 保留现场，标 error |
+| 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用）；**direct 主机整步 skipped**（§6.1.4） | 删刚建的隧道 |
+| 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket）；upstream 后端：frp 主机=入口机 `ingress_ip:公网端口`，direct 主机=`hosts.direct_backend`（留空=`ssh_host`）`:公网端口`（§6.1.4） | 删刚建的站点/upstream |
+| 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS`；`hosts.mem_limit`/`cpu_limit` 有值时改写实例 `.env` 的 `MEM_LIMIT`/`CPU_LIMIT`（共享机的护栏，§2）；`direct_backend` 有值时改写 `HOST_BIND_IP`、`hosts.llm_base_url` 有值时改写 `LLM_BASE_URL`（§6.1.4） | 保留现场，标 error |
 | 65 | `config_backfill` | 从实例 `.env` 与 docker 端口映射读回**生效值**，覆盖第 10/20 步按猜测写的配置快照 | 读不到不失败，快照自标来源 |
 | 66 | `capabilities` | 铺生图技能与智能体团队（站点没配生图就跳过并记一行警告），并读回 DSH 生效配置 | 缺材料跳过，不挡住开通 |
 | 67 | `fonts` | **铺字体**：把站点字体库（`font_library`）里的文件 `cp -n` 进实例 DATA_DIR 的 `home/.fonts`（容器内 `/data/home/.fonts`，Word→PDF 两条转换路共同认的投递口），落地后文件 644、目录 755。只 cp 不挂载，同名不覆盖。库未配置或宿主上目录不存在 → 记 warning 并跳过，不失败工单 | 记 warning 跳过（铺字体失败才标 error） |
@@ -460,6 +464,32 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
   仍然不输入；实例行上记 `image_tag`，
   详情页显示"这个实例跑在哪个镜像上"。升级 = §6.1 的 running 续建（同实例原地重建，数据继承），
   目标默认站点当前 tag，deploy body 可用 `{image}` 指定。
+
+### 6.1.4 直连主机（upstream_mode=direct）：公网机不过 frp
+
+frp 的存在意义是 NAT 后面的机器；**本身有公网 IP 的主机不需要隧道**。hosts.upstream_mode=direct 时：
+
+- 第 40 步 skipped（不建隧道，`frp_proxy_id` 留空；`frp_remote_port` 仍写——它就是
+  实例在本机发布的公网端口，列名沿用不改）；
+- 公网端口分配仍走 `frp_port_start` 起的同一个池，但**占用探测改在目标机上做**
+  （`ss -ltn` 实探 + 库里在用端口），不再问 frp-panel；
+- 第 50 步 NG upstream 后端 = `hosts.direct_backend:公网端口`，未登记时 =
+  `hosts.ssh_host:公网端口`（NG 仍在入口机上，证书与 location 规则一字不变）；
+- **云轻量服务器（SWAS 这类）的 EIP 陷阱**：公网 IP 是云端 NAT 映射，机器网卡上
+  根本没有它——入口机恰好就是这台机时，NG 回源拨自家 EIP 会出网卡绕云端 NAT 发卡
+  拐（hairpin 黑洞，2026-10-22 dsh-05 现网实测：TCP 都不完成）。这类主机必须登记
+  `direct_backend`=网卡实址，第 60 步同时把它写进实例 `.env` 的 `HOST_BIND_IP`：
+  端口只绑网卡实址，公网路由不到，**云防火墙一行都不用放行**（比防火墙红线更小
+  的暴露面）。kit 的 `deploy.sh` 等端口要用 `HOST_BIND_IP` 而不是 127.0.0.1
+  （绑非回环地址时 docker-proxy 不应答 loopback，现网实测连 900s ssh 超时都是它）；
+- **防火墙红线**（未登记 `direct_backend` 的普通公网机）：实例端口只应对入口机
+  （`DSHC_INGRESS_IP`）放行，不对全世界开放。云防火墙/安全组不由本控制台管理，
+  第 50 步的 detail 会提醒这一条，运维在云上补；
+- 按主机的模型入口：站点 `llm_base_url` 是局域网网关，云上机器拨不到；登记
+  `hosts.llm_base_url` 后第 60 步用它改写实例 `.env` 的 `LLM_BASE_URL`（密钥不变，
+  同一网关的两个门）；
+- 资源红线：共享机（入口机兼跑实例这类场景）**必须**设 `hosts.mem_limit`/`cpu_limit`，
+  kit 的 4g 默认值在挤机上会把同机基础设施送进 OOM。
 
 ### 6.2 释放 `release`（二次确认后）
 
