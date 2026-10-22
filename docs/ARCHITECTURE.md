@@ -118,7 +118,7 @@ instance_snapshots 采集到的运行态
   id, instance_id, captured_at, docker_state, health, restart_count,
   cpu_pct, mem_usage_bytes, mem_limit_bytes, raw jsonb
 
-deploy_jobs        一次性任务：deploy / restart / release / purge
+deploy_jobs        一次性任务：deploy / restart / release / purge / publish
   id, instance_id, kind, state(pending|running|succeeded|failed),
   params jsonb,               # 工单附加参数：{"image": 升级目标tag} / {"purpose": create|upgrade|restore|source: auto|manual}
   error, started_at, finished_at
@@ -129,6 +129,11 @@ deploy_steps       点对点进度，前端按 seq 渲染
 
 events             审计与自动重启记录
   id, kind, instance_id NULL, job_id NULL, message, data jsonb, created_at
+
+image_artifacts    镜像制品库（§6.1.5）：一行一个 tag，行存在即文件已完整落库
+  id, tag UNIQUE, filename, size_bytes, sha256,
+  token UNIQUE,             # 公开链接的凭证（随机 26 字符，撤销=删行删文件）
+  origin_host, created_at   # origin_host: 从哪台机 save 的；空串=手工投放
 ```
 
 上面每个 `id` 类关联列都只建普通索引，不建外键；`instance_id`/`job_id`/`host_id`/`ssh_credential_id` 的取值合法性由仓储层在写入前校验。
@@ -161,7 +166,7 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 
 ## 4. HTTP API
 
-除 `/api/login` 与 `/api/healthz` 外全部要鉴权。写操作要求头 `X-Requested-With: 1`
+除 `/api/login`、`/api/healthz` 与公开下载前缀 `/dl/`（§6.1.5，token 即门票）外全部要鉴权。写操作要求头 `X-Requested-With: 1`
 （配合 `SameSite=Lax` cookie 做 CSRF 抑制）。
 
 鉴权：单个运维密钥。登录页粘贴 → `POST /api/login {key}` → 服务端常数时间比对
@@ -188,6 +193,12 @@ pending → deploying → running ⇄ unhealthy → restarting → running
 | GET | `/api/jobs/{id}/logs` | 增量日志：`?after=<id>` → `{items:[{id,seq,level,line,ts}], next}` |
 | GET | `/api/jobs/{id}/stream` | SSE，`step` / `log` / `done` 三种事件 |
 | GET | `/api/instances/{id}/events` | 事件时间线 |
+| GET | `/api/settings` | 面板运行设置（§6.1.5）：`{image_ship: {mode, base_url}}`；`base_url` 空串=吃 site 的 `public_base`，返回的是解析后的生效值 |
+| PUT | `/api/settings` | 局部更新（只认已知键）：`mode` 非 `ssh|download` → 422；写进 site 凭据 secret 的 `image_ship`，deploy 每轮现读，改完不重启生效 |
+| GET | `/api/images` | 制品列表：`{items:[{id,tag,size_bytes,sha256,token,url,origin_host,created_at}], store_free_bytes}`；`url` = 解析后的 base_url + `/dl/{token}/{filename}` |
+| POST | `/api/images` | `{tag, from_host_id}` → `{job_id}`（kind=publish，§6.1.5）。同 tag 重发=原子替换，旧链接立死 |
+| DELETE | `/api/images/{id}` | 下架：删行删文件，链接即刻失效 |
+| GET | `/dl/{token}/{filename}` | **公开免登录**流式下载（§6.1.5）；支持单区间 `Range` 续传；token 不认识 404；`filename` 只做展示名，认 token 不认它 |
 
 详情响应（前端所有展示字段都在这一个响应里，避免多轮请求）：
 
@@ -403,7 +414,7 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 | seq | key | 做什么 | 失败怎么办 |
 |---|---|---|---|
 | 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
-| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就失败并提示用 `cli images ship` 传过来。本步骤**永不构建镜像** | 无副作用 |
+| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就按设置的分发方式自动搬运（§6.1.5），搬运失败才拦。本步骤**永不构建镜像** | 镜像缺失时会在目标机 load 一份 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
 | 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用）；**direct 主机整步 skipped**（§6.1.4） | 删刚建的隧道 |
 | 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket）；upstream 后端：frp 主机=入口机 `ingress_ip:公网端口`，direct 主机=`hosts.direct_backend`（留空=`ssh_host`）`:公网端口`（§6.1.4） | 删刚建的站点/upstream |
@@ -491,6 +502,48 @@ frp 的存在意义是 NAT 后面的机器；**本身有公网 IP 的主机不�
 - 资源红线：共享机（入口机兼跑实例这类场景）**必须**设 `hosts.mem_limit`/`cpu_limit`，
   kit 的 4g 默认值在挤机上会把同机基础设施送进 OOM。
 
+### 6.1.5 镜像分发：SSH 直传 与 控制台制品下载
+
+镜像 GB 级、目标机横跨局域网和公网两头，搬运路径不许写死。设置页存
+`site.image_ship = {"mode": "ssh"|"download", "base_url": ""}`（进 site 凭据
+secret；`base_url` 空=用 `public_base`）。deploy 每轮现读，改完不重启生效——
+与 purge 保留期同一个模式。默认 `ssh`（现行为零改变）。
+
+**SSH 直传**（局域网首选）：源机 `docker save` 的 stdout 经面板内存管道灌目标机
+`docker load`（`images.py` 现成实现）。零落盘；两台之间不需要互信。跨公网慢且
+两头都吃面板带宽——公网机应切 download。
+
+**控制台制品下载**（公网机首选）：先把镜像发布成制品，目标机自己拉：
+
+```
+curl -fL --retry 3 '<url>' -o <文件> && echo '<sha256>  <文件>' | sha256sum -c - \
+  && docker load -i <文件> && rm -f <文件>
+```
+
+下载源就是面板自己的公网域名（`base_url`，本站即控制台公网域，设置页可改）。
+每个制品一条公开链接 `{base_url}/dl/{token}/{filename}`：
+
+- **免鉴权，token（随机 26 字符 urlsafe）就是门票**。镜像非机密（跑到公网还得过
+  实例自己的准入 token），泄链接=泄镜像，接受；撤销=设置页下架，链接立死。
+- 文件 `<tag 安全化>.tar.gz` 存 `DSHC_IMAGE_STORE` 目录；只用 gzip——gzip 全员
+  自带，不赌目标机装没装 zstd/xz。sha256 发布时算好，拉取时强制 `sha256sum -c`。
+
+发布（`POST /api/images` → 工单 `kind=publish`，两步）：
+`10 save`：源主机 `docker save <tag> | gzip -n` 流进制品库 `<file>.tmp`，按已落
+字节回显进度（GB 级超时给足 1800s）；
+`20 record`：算 sha256/size，改名去 `.tmp`，**文件落定才插行/换行**——表里的行
+永远指向完整文件。同 tag 重发：新行落库成功后才删旧行旧文件。
+
+deploy 第 20 步缺镜像分支（替代旧「报错让人跑 CLI」）：
+- `mode=download` 且该 tag 有制品 → 目标机跑上面 curl 三连；缓存放
+  `{data_root}/ship-cache/`，不赌 /tmp 是不是 tmpfs；哪步挂了 StepFailed 写清哪步。
+- `mode=ssh` → 在 enabled 主机里找有该镜像的（优先面板所在宿主机），流式直传后复查。
+- 没制品/没源机 → StepFailed：点名去设置页发布该 tag 的制品或切回 SSH 直传，
+  并附目标机现有 dsh 镜像列表。
+
+前置：目标机有 `curl`（kit 的 verify.sh 本来就依赖它）；`download` 模式还要
+`DSHC_IMAGE_STORE` 挂得出可写目录，发布/搬运遇不可写直接报错，不静默降级。
+
 ### 6.2 释放 `release`（二次确认后）
 
 顺序必须是先断外网入口再停容器：`probe_guard`（确认 slug 对得上）→ `ng_delete` →
@@ -539,6 +592,8 @@ purge 工单**只碰本控制台创建且登记在案的对象**，顺序与 rel
 
 - 连 PG：加入 PostgreSQL 所在的 Docker 网络，`DSHC_DATABASE_URL=postgresql+asyncpg://USER:…@DB_HOST:5432/dsh_control`
 - 出公网：`console.example.com` → NG → frps → `192.0.2.10:13300`
+- 制品库：挂一个目录 `DSHC_IMAGE_STORE`（如 `-v /srv/dsh-console/images:/var/lib/dsh-control/images`）。
+  不挂就没有 download 模式（发布直接报「制品库未挂载」），SSH 直传不受影响
 - 换宿主机：换一份 `.env`（PG 地址、监听端口、frpc 客户端、数据根目录）重起即可，
   代码里不允许出现任何写死的机器地址，全部走环境变量或 `hosts` 表。
 
@@ -561,6 +616,7 @@ DSHC_NG_URL / _USER / _PASS
 DSHC_ALIYUN_AK / _SK
 DSHC_SSH_KEY_PATH_NAS8 / _HOST109    init 时读进库，之后从库取
 DSHC_FONT_LIBRARY            站点字体库目录（实例宿主机上的绝对路径；留空 = 开通第 67 步铺字体跳过）
+DSHC_IMAGE_STORE             镜像制品库目录（§6.1.5），默认 /var/lib/dsh-control/images；未挂载/不可写=download 模式禁用
 DSHC_PURGE_AFTER_DAYS        released 保留天数，默认 15；到期 watcher 自动 purge（§6.4）。库里的值优先（seed 可改，watcher 每轮现读）
 DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 ```
@@ -572,7 +628,7 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
 ## 9. 前端
 
 `frontend/` React + Vite + TS，设计走 `/impeccable`，模式 **Operate**（运维者来完成动作，
-扫读效率优先，不做营销式花活）。四个界面：
+扫读效率优先，不做营销式花活）。五个界面：
 
 1. 登录页：一个密钥输入框 + 粘贴即可，不要求用户名。
 2. 列表页：搜索框（域名/用途都能搜）+ 新建按钮 + 表格：用途与 slug、状态、DSH 版本、
@@ -583,6 +639,10 @@ DSHC_DRY_RUN                 1 = 所有外部写操作只打印
    原文才能点，二次确认）；异常时给最近事件与错误。
 4. 新建向导：选主机 → 填用途标签 → 自动出域名前缀（可改）→ 确认 → 逐步进度条 + 实时日志
    → 完成后给出可复制的一键地址并高亮。
+5. 设置页：镜像分发方式单选（SSH 直传=局域网快路 / 控制台下载=公网机自取，各配一句
+   适用说明）+ 下载基址（留空=用站点公网域）+ 制品表（tag、大小、时间、sha256 短码、
+   公开链接一键复制、长按下架——下架是删文件，照 §9 长按确认）+「从主机发布」表单
+   （源主机下拉 × tag 输入），发布进度点进常规工单页。
 
 约定：中文界面；状态色语义固定（running 绿、unhealthy/restarting 琥珀、error 红、
 released 灰）；所有时间按 `Asia/Shanghai`；复制成功要有可见反馈；表格与日志里的
