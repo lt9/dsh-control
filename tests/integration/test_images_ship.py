@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import re
@@ -558,6 +559,9 @@ async def test_publish_github_asset_via_fake_api(ship_env, monkeypatch):
             return httpx.Response(204)
         if p == "/repos/someone/dsh-images/releases/9/assets" and request.method == "POST":
             assert request.headers["content-type"] == "application/octet-stream"
+            assert request.headers.get("content-length") == str(len(payload)), \
+                "uploads.github.com 不吃 chunked：必须带精确 Content-Length（E2E 400）"
+            assert "transfer-encoding" not in request.headers, "不许再走 chunked"
             assert request.content == payload, "asset 必须就是制品本体"
             return httpx.Response(201, json={"id": 10, "name": "dsh-test_v9.tar.gz"})
         raise AssertionError(f"假 API 不该收到 {request.method} {p}")
@@ -814,3 +818,82 @@ async def test_step20_all_channels_unreachable_names_each(ship_env, monkeypatch)
     probes = [c for c in ex.commands if "--max-time 8" in c]
     assert len(probes) == 3
     assert not any("docker load" in c for c in ex.commands), "一条都没通就不许 load"
+
+
+async def test_github_upload_over_real_h11_has_exact_content_length(tmp_path, monkeypatch):
+    """MockTransport 之外的一条：真 h11 框架——裸 socket 服务器上逐字节验
+    「头里 Content-Length==size、没有 chunked、实发字节数分毫不差」。
+    uploads.github.com 就是被 chunked 打过 400 的，这条测试是它的替身。"""
+    payload = b"z" * 300_000
+    f = tmp_path / "dsh-test_v9.tar.gz"
+    f.write_bytes(payload)
+    seen: dict[str, object] = {}
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while True:                                    # 一条连接串多请求（keep-alive）
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    writer.close()
+                    return
+                head += chunk
+            head_txt, _, rest = head.partition(b"\r\n\r\n")
+            lines = head_txt.decode("latin1").split("\r\n")
+            method, target, _ = lines[0].split(" ", 2)
+            hdrs = {}
+            for ln in lines[1:]:
+                k, _, v = ln.partition(":")
+                hdrs[k.strip().lower()] = v.strip()
+            body = rest
+            need = int(hdrs.get("content-length", 0))
+            while len(body) < need:
+                body += await reader.read(min(65536, need - len(body)))
+            if target.startswith("/upload") and method == "POST":
+                seen["cl"] = hdrs.get("content-length")
+                seen["te"] = hdrs.get("transfer-encoding")
+                seen["sent"] = len(body)
+                seen["body_ok"] = body == payload
+                reply = b'{"id": 10}'
+                code = "201 Created"
+            elif target.startswith("/repos/") and method == "POST":
+                reply = b'{"message": "tag_name already exists"}'   # 走复用分支
+                code = "422 Unprocessable Entity"
+            elif "/releases/tags/" in target:
+                reply = ('{"id": 9, "upload_url": "'
+                         + base_url + '/upload{?name,label}"}').encode()
+                code = "200 OK"
+            elif method == "PATCH":
+                reply = b'{"id": 9}'
+                code = "200 OK"
+            elif "/assets" in target and method == "GET":
+                reply = b"[]"
+                code = "200 OK"
+            else:
+                reply = b'{"message": "unexpected"}'
+                code = "500 Server Error"
+            resp = (f"HTTP/1.1 {code}\r\nContent-Type: application/json"
+                    f"\r\nContent-Length: {len(reply)}\r\n\r\n").encode() + reply
+            writer.write(resp)
+            await writer.drain()
+
+    async def starter():
+        nonlocal base_url
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        base_url = f"http://127.0.0.1:{port}"
+        return server
+
+    base_url = ""
+    server = await starter()
+    monkeypatch.setattr(mirror, "GITHUB_API", base_url)
+    async with server:
+        url, rel_tag = await mirror.github_push(
+            "tok", "someone/dsh-images", "dsh-test:v9", "dsh-test_v9.tar.gz",
+            f, hashlib.sha256(payload).hexdigest(), len(payload))
+    assert rel_tag == "image-dsh-test_v9"
+    assert url == ("https://github.com/someone/dsh-images/releases/download/"
+                   "image-dsh-test_v9/dsh-test_v9.tar.gz")
+    assert seen.get("cl") == str(len(payload)), f"真线上头里必须有 CL：{seen}"
+    assert seen.get("te") is None, "真线上不许有 Transfer-Encoding: chunked"
+    assert seen.get("sent") == len(payload) and seen.get("body_ok"), "实发字节分毫不差"

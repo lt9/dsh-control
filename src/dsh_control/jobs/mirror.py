@@ -115,18 +115,39 @@ async def github_push(token: str, repo: str, tag: str, filename: str,
                 await c.delete(f"{GITHUB_API}/repos/{repo}/releases/assets/{old['id']}",
                                headers=headers)
 
-        async def _astream():   # 流式读文件：GB 级整包不许进内存；读盘进线程
-            with path.open("rb") as f:
-                while True:
-                    b = await asyncio.to_thread(f.read, _UPLOAD_CHUNK)
-                    if not b:
-                        break
-                    yield b
+        # uploads.github.com 不吃 chunked——E2E 真机 400 Bad Content-Length（跑了
+        # 177s 才被拒）。流式 body 也必须带精确的 Content-Length：httpx 见手设的
+        # CL 就不再自动塞 Transfer-Encoding: chunked，h11 还会校验实发字节数与头
+        # 一致（对不上是传输层翻车，下面的计数守卫先一步给人话错误）。
+        file_size = await asyncio.to_thread(lambda: path.stat().st_size)
+
+        def _guarded_stream():
+            sent = 0
+
+            async def _astream():   # 流式读文件：GB 级整包不许进内存；读盘进线程
+                nonlocal sent
+                with path.open("rb") as f:
+                    while True:
+                        b = await asyncio.to_thread(f.read, _UPLOAD_CHUNK)
+                        if not b:
+                            break
+                        sent += len(b)
+                        if sent > file_size:
+                            raise MirrorError(
+                                f"实际文件比 {file_size} 字节大：制品行与盘上文件漂移，"
+                                "拒传——撒谎的 Content-Length 比 chunked 更糟")
+                        yield b
+                if sent != file_size:
+                    raise MirrorError(
+                        f"只发出 {sent}/{file_size} 字节，文件读到一半没了：拒传")
+
+            return _astream()
 
         up = await c.post(f"{upload_url}?name={quote(filename)}",
                           headers={**headers,
-                                   "Content-Type": "application/octet-stream"},
-                          content=_astream())
+                                   "Content-Type": "application/octet-stream",
+                                   "Content-Length": str(file_size)},
+                          content=_guarded_stream())
         if up.status_code in (401, 403):
             raise denied(up, "传 asset")
         if up.status_code not in (200, 201):
@@ -162,7 +183,13 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
                            "token 不能走 API？检查私人令牌有没有 projects 权限")
 
     async def attach(c, base: str, rel_id, file_path: Path) -> str:
-        """multipart 传单附件，字段名 file（官方口径），回 browser_download_url。"""
+        """multipart 传单附件，字段名 file（官方口径），回 browser_download_url。
+
+        自查结论（task-6）：httpx files= 会把整卷读进内存再发（multipart 没有
+        流式口径），所以**内存上限 = 一卷 ≈95MB**，不是制品全量——这正是分卷
+        切 95m 的另一层意义。手拼流式 multipart 要自己管 boundary 偏移和长度，
+        超出必要复杂度，不动。
+        """
         with file_path.open("rb") as fh:
             up = await c.post(f"{base}/releases/{rel_id}/attach_files", data=tok,
                               files={"file": (file_path.name, fh,
