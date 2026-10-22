@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ApiError, api, type ImageArtifact, type ShipMode } from "../api/client";
 import { SHIP_MODE_META, fmtBytes, fmtFull, fmtRel, maskMiddle } from "../lib/format";
 import { useAsync } from "../lib/hooks";
-import { ConsequenceCard, CopyButton, Icon, Toast, useToast } from "../components/ui";
+import { ConsequenceCard, CopyButton, HelpTip, Icon, Toast, useToast } from "../components/ui";
 
 const msgOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -41,6 +41,9 @@ export default function SettingsPage() {
   const items = store.data?.items ?? [];
   const free = store.data?.store_free_bytes ?? null;
   const hostList = (hosts.data ?? []).filter((h) => h.enabled !== false);
+  const baseHelp = "这是目标机去拉制品时用哪个公网地址，上面制品表里那些链接的域名就是它。"
+    + "留空 = 跟着站点的公网域走（站点以后换域名，链接自己跟着变）；填了就以填的为准。"
+    + (mode === "ssh" ? "现在是「SSH 直传」，这一条暂时用不上——切到「控制台下载」才轮到它。" : "");
 
   /** PUT 是局部更新，回来的就是新的生效值，直接拿回执渲染，不再多问一次。 */
   const applyPatch = async (patch: Parameters<typeof api.putSettings>[0], done: string) => {
@@ -105,8 +108,8 @@ export default function SettingsPage() {
   return (
     <main className="shell">
       <div className="list-head">
-        <h1>设置</h1>
-        <span className="mut small">这一页动的都是站点级的东西：改完立刻生效，下一轮开通就按新的走，不用重启控制台。</span>
+        <h1>设置<HelpTip label="这一页动的是什么"
+          text="这一页动的都是站点级的东西：改完立刻生效，下一轮开通就按新的走，不用重启控制台。" /></h1>
         <span className="spacer" />
         <button type="button" className="btn" onClick={() => { void cfg.reload(); void store.reload(); }} disabled={busy}>
           <Icon name="refresh" size={13} />刷新
@@ -122,32 +125,32 @@ export default function SettingsPage() {
       <div className="stack">
       {/* —— 1 & 2：分发方式 + 下载基址（同一份 site.image_ship，所以在同一张卡里）—— */}
       <section className="card" aria-label="镜像分发">
-        <div className="card-head"><h2>镜像分发</h2></div>
+        <div className="card-head">
+          <h2>镜像分发<HelpTip label="镜像分发"
+            text="开通实例时目标机上没有那个镜像，控制台就按这里选的路径把镜像搬过去。两边都不用你动手搬。" /></h2>
+        </div>
         <div className="card-body">
-          <p className="mut small" style={{ marginBottom: 12 }}>
-            开通实例时目标机上没有那个镜像，控制台就按这里选的路径把镜像搬过去。两边都不用你动手搬。
-          </p>
           <div className="mode-pick" role="radiogroup" aria-label="分发方式">
             {(Object.keys(SHIP_MODE_META) as ShipMode[]).map((m) => {
               const on = m === mode;
               return (
-                <button key={m} type="button" role="radio" aria-checked={on} disabled={busy}
-                  className={`mode-card${on ? " on" : ""}`} onClick={() => switchMode(m)}>
-                  <span className="mc-top">
+                <div key={m} className={`mode-card${on ? " on" : ""}`}>
+                  <button type="button" role="radio" aria-checked={on} disabled={busy}
+                    className="mc-pick" onClick={() => switchMode(m)}>
                     <span className="mc-dot" aria-hidden />
                     <b>{SHIP_MODE_META[m].zh}</b>
                     <span className="mc-use">{SHIP_MODE_META[m].use}</span>
-                    {on && <span className="mc-on-tag">当前</span>}
-                  </span>
-                  <span className="mc-note">{SHIP_MODE_META[m].note}</span>
-                </button>
+                  </button>
+                  <HelpTip label={`${SHIP_MODE_META[m].zh}是怎么搬的`} text={SHIP_MODE_META[m].note} />
+                  {on && <span className="mc-on-tag">当前</span>}
+                </div>
               );
             })}
           </div>
 
           <div className="base-row">
             <label className="base-field" htmlFor="base-url">
-              <span className="field-cap">下载基址</span>
+              <span className="field-cap">下载基址<HelpTip label="下载基址" text={baseHelp} /></span>
               <input id="base-url" className="input mono" type="text" value={base}
                 placeholder="留空 = 用站点公网域" disabled={busy}
                 onChange={(e) => setBaseDraft(e.target.value)}
@@ -160,11 +163,6 @@ export default function SettingsPage() {
               交回站点公网域
             </button>
           </div>
-          <p className="mut small" style={{ marginTop: 10 }}>
-            这是目标机去拉制品时用哪个公网地址，上面制品表里那些链接的域名就是它。
-            留空 = 跟着站点的公网域走（站点以后换域名，链接自己跟着变）；填了就以填的为准。
-            {mode === "ssh" && <span> 现在是「SSH 直传」，这一条暂时用不上——切到「控制台下载」才轮到它。</span>}
-          </p>
         </div>
       </section>
 
@@ -210,7 +208,9 @@ export default function SettingsPage() {
                 <thead>
                   <tr>
                     <th className="col-tag">镜像标签</th><th className="col-size">大小</th><th className="col-when">发布时间</th>
-                    <th>校验码 sha256</th><th>公开链接（免登录）</th><th><span className="sr-only">操作</span></th>
+                    <th>校验码 sha256</th>
+                    <th>公开链接（免登录）<HelpTip label="公开链接"
+                      text="链接里的 token 就是门票：泄链接=泄镜像。要撤销就下架，链接当场失效。" /></th><th><span className="sr-only">操作</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -268,7 +268,10 @@ export default function SettingsPage() {
 
       {/* —— 4：从主机发布 —— */}
       <section className="card" aria-label="从主机发布">
-        <div className="card-head"><h2>从主机发布</h2></div>
+        <div className="card-head">
+          <h2>从主机发布<HelpTip label="从主机发布"
+            text="在源机上把镜像 docker save | gzip 流进制品库，算好 sha256 再登记，GB 级要等几分钟——点完就跳工单页看进度，这一页不用等。同一个标签重发是原子替换：新的落库成功才删旧的，旧链接当场作废。" /></h2>
+        </div>
         <div className="card-body">
           <div className="pub-form">
             <label className="pub-field" htmlFor="pub-host">
@@ -292,11 +295,6 @@ export default function SettingsPage() {
             </button>
           </div>
           <datalist id="known-tags">{items.map((a) => <option key={a.id} value={a.tag} />)}</datalist>
-          <p className="mut small" style={{ marginTop: 12 }}>
-            在源机上把镜像 <span className="mono">docker save | gzip</span> 流进制品库，算好 sha256 再登记，
-            GB 级要等几分钟——点完就跳工单页看进度，这一页不用等。
-            <b>同一个标签重发是原子替换</b>：新的落库成功才删旧的，旧链接当场作废。
-          </p>
         </div>
       </section>
 
