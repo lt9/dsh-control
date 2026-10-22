@@ -243,7 +243,11 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
         else:
             r = await c.post(f"{base}/releases",
                              data={**tok, "tag_name": tag_name,
-                                   "title": f"image {tag}",
+                                   # gitee 建版 name 与 target_commitish 皆必填
+                                   # （400 实测，官方文档口径一致）；快照链恒推
+                                   # main，tag 就从它起
+                                   "name": f"image {tag}",
+                                   "target_commitish": "main",
                                    "body": _release_body(tag, sha, size)})
             if r.status_code in (401, 403):
                 raise denied("建 release", r.status_code)

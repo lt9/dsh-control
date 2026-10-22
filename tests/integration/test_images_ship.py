@@ -643,6 +643,9 @@ async def test_publish_gitee_splits_manifest_and_prunes_old(ship_env, monkeypatc
         if p == f"{base}/releases" and request.method == "POST":
             assert "access_token=gt_x" in str(request.url) or \
                    b"access_token" in request.content
+            # gitee 建版：name 与 target_commitish 皆必填（缺任一回 400）
+            assert b"name=" in request.content, "建版缺 name"
+            assert b"target_commitish=main" in request.content, "建版缺 target_commitish"
             return httpx.Response(201, json={"id": 5})
         if p == f"{base}/releases/5/attach_files" and request.method == "POST":
             files = _multipart_files(request.content)
