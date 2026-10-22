@@ -10,9 +10,27 @@ const purgeAfterOf = (i) => (i.state === "released" && i.released_at
 let SEQ = 10, tok = {}, jobs = {};
 // 站点设置（§6.1.5）：base_url 存空串=吃站点的公网域；GET 出去的是解析后的生效值（§4）
 const SITE_BASE = "https://console.example.com";
-let settings = { image_ship: { mode: "ssh", base_url: "" } };
+let settings = { image_ship: { mode: "ssh", base_url: "", mirror_order: ["gitee", "github", "console"], auto_mirror: true } };
 const baseOf = () => settings.image_ship.base_url || SITE_BASE;
-const settingsView = () => ({ image_ship: { mode: settings.image_ship.mode, base_url: baseOf() } });
+// 外部渠道（§6.1.6）：token 只写不回显——这里连值都不留，只留"配过"这个事实。
+// 假数据故意一条 ok 一条 failed，好让界面上三种状态一次看全（未推送看 gitee 之外的新 tag）。
+let channels = {
+  github: { repo: "lt9/dsh-control", token_set: !process.env.MOCK_NO_TOKENS, latest_state: "ok",
+    url: "https://github.example.invalid/lt9/dsh-control/releases/download/image-dsh-family_1_14_2/dsh-family_1.14.2.tar.gz",
+    error: null, updated_at: iso(-86400 * 9) },
+  gitee: { repo: "lt9/dsh-control", token_set: !process.env.MOCK_NO_TOKENS, latest_state: "failed", url: null,
+    error: "第 9 卷传到一半被掐：gitee 回 403（附件总量要超 1G，旧版 release 没删干净）。",
+    updated_at: iso(-3600 * 5) } };
+// MOCK_NO_TOKENS=1 → 演练"没配令牌"那一档：没令牌就没人推过，状态一律清零
+const stateOf = (ch) => (channels[ch].token_set ? channels[ch].latest_state : null);
+// 状态键两个名字都发：后端 _settings_payload 现在给的是 state，任务书里叫 latest_state，
+// 前端两个都认——这里两个都给，两边落地哪个都不会把界面读空。
+const chanView = (ch) => ({ repo: channels[ch].repo, token_set: channels[ch].token_set,
+  state: stateOf(ch), latest_state: stateOf(ch),
+  url: stateOf(ch) === "ok" ? channels[ch].url : null,
+  error: stateOf(ch) === "failed" ? channels[ch].error : null, updated_at: channels[ch].updated_at });
+const settingsView = () => ({ image_ship: { ...settings.image_ship, base_url: baseOf() },
+  mirrors: { github: chanView("github"), gitee: chanView("gitee") } });
 // 制品库（§6.1.5）：一行一个 tag，行存在即文件已完整落盘。MOCK_NO_IMAGES=1 → 演练空态
 const STORE_SIZE = 480e9;
 const artTok = () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".split("").sort(() => Math.random() - .5).slice(0, 26).join("");
@@ -72,7 +90,11 @@ function jobView(id) { const j = jobs[id]; if (!j) return null; const st = j.ste
   if (!j.done && st.every((s) => s === "succeeded")) { j.done = true; const I = insts.find((x) => x.id === j.inst); if (I) { I.updated_at = iso(); if (j.kind === "deploy") { I.state = "running"; I.released_at = null; } if (j.kind === "restart") tok[I.id] = Math.floor(Math.random() * 1e6); if (j.kind === "release") { I.state = "released"; I.released_at = iso(); } if (j.kind === "purge") { I.state = "purged"; I.purged_at = iso(); I.freed = true; } }
     // 发布工单不带实例（制品是站点级的），所以这段必须在 if (I) 外面：
     // 20 record 过了才插行；同标签是原子替换——新行落库成功后才把旧行丢掉。
-    if (j.kind === "publish" && j.publish) { const { tag, origin, size, sha } = j.publish; arts = [{ id: ++artSeq, tag, size_bytes: size, sha256: sha, token: artTok(), origin, created_at: iso() }, ...arts.filter((x) => x.tag !== tag)]; } }
+    if (j.kind === "publish" && j.publish) { const { tag, origin, size, sha } = j.publish; arts = [{ id: ++artSeq, tag, size_bytes: size, sha256: sha, token: artTok(), origin, created_at: iso() }, ...arts.filter((x) => x.tag !== tag)];
+      // auto_mirror 开着且配了令牌才推（§6.1.6：mirror_* 步未配就跳过）
+      if (settings.image_ship.auto_mirror && channels.github.token_set && channels.github.repo) {
+        channels.github.latest_state = "ok"; channels.github.error = null; channels.github.updated_at = iso();
+        channels.github.url = "https://github.example.invalid/" + channels.github.repo + "/releases/download/image-" + artFile(tag).replace(/\.tar\.gz$/, "").replace(/[^\w.-]+/g, "_") + "/" + artFile(tag); } } }
   return { kind: j.kind, state: j.done ? "succeeded" : "running", instance_id: j.inst, purpose: j.kind === "deploy" ? j.purpose ?? null : null, steps: j.steps.map(([s, t], i) => ({ seq: s, key: "k" + s, title: t, state: st[i], detail: st[i] === "succeeded" ? `通过 · 用时 ${(0.6 + i * 0.7).toFixed(1)} s` : st[i] === "running" ? "执行中…" : null })) }; }
 function logsFor(id, after) { const j = jobs[id]; if (!j) return { items: [], next: after }; const out = [];
   if (j.kind === "publish" && j.publish) { const { tag, origin, size, sha } = j.publish, f = artFile(tag), gb = (n) => (n / 1e9).toFixed(2) + " GB";
@@ -123,9 +145,36 @@ http.createServer(async (req, res) => {
   if (p === "/api/settings" && req.method === "GET") return send(200, settingsView());
   if (p === "/api/settings" && req.method === "PUT") { const s2 = b.image_ship || {};
     if (s2.mode !== undefined && s2.mode !== "ssh" && s2.mode !== "download") return send(422, { detail: { ok: false, error: "invalid_mode", message: "分发方式只有 ssh 与 download 两种" } });
+    if (s2.mirror_order !== undefined) {
+      const want = ["gitee", "github", "console"];
+      // 后端口径（routes.py）：去重的非空子集就行，不要求三个都在
+      const bad = !Array.isArray(s2.mirror_order) || !s2.mirror_order.length
+        || new Set(s2.mirror_order).size !== s2.mirror_order.length
+        || s2.mirror_order.some((c) => !want.includes(c));
+      if (bad) return send(422, { detail: { ok: false, error: "invalid_mirror_order", message: "探测优先序得是 gitee、github、console 里挑几个、且不重复的非空排列" } });
+      settings.image_ship.mirror_order = s2.mirror_order; }
+    if (s2.auto_mirror !== undefined) {
+      if (typeof s2.auto_mirror !== "boolean") return send(422, { detail: { ok: false, error: "invalid_auto_mirror", message: "auto_mirror 只有真与假" } });
+      settings.image_ship.auto_mirror = s2.auto_mirror; }
+    // 仓库名：顶层 mirrors.{ch}.repo 与 image_ship.mirrors.{ch}.repo 两种摆法都收（§4 那行读得出两种）
+    const repos = { ...(b.mirrors || {}), ...(s2.mirrors || {}) };
+    for (const ch of Object.keys(repos)) {
+      if (ch !== "github" && ch !== "gitee") return send(422, { detail: { ok: false, error: "invalid_channel", message: "外部渠道只有 github 与 gitee 两个" } });
+      const r = String(repos[ch]?.repo ?? "").trim();
+      // 空串=不推这个渠道；非空必须是 owner/repo
+      if (r && !/^[\w.-]+\/[\w.-]+$/.test(r)) return send(422, { detail: { ok: false, error: "invalid_repo", message: `${ch} 的仓库名要写成 owner/repo，例如 lt9/dsh-control` } });
+      channels[ch].repo = r; }
     if (s2.mode !== undefined) settings.image_ship.mode = s2.mode;
     if (s2.base_url !== undefined) settings.image_ship.base_url = String(s2.base_url).trim();
     return send(200, settingsView()); }   // PUT 也回全量生效值，前端拿回执直接渲染
+  // 令牌即焚（§6.1.6）：只写不回显，响应里除了 token_set 什么都没有
+  const mt = m(/^\/api\/mirror-tokens\/(\w+)$/);
+  if (mt && req.method === "PUT") { const ch = mt[1];
+    if (ch !== "github" && ch !== "gitee") return send(422, { detail: { ok: false, error: "invalid_channel", message: "外部渠道只有 github 与 gitee 两个" } });
+    const t = String(b.token ?? "");
+    if (!t.trim()) return send(422, { detail: { ok: false, error: "invalid_token", message: "令牌是空的——要配就粘一个访问令牌进来" } });
+    channels[ch].token_set = true;   // 值不留， mock 也不练存秘密
+    return send(200, { ok: true, token_set: true }); }
   if (p === "/api/images" && req.method === "GET") return send(200, { items: arts.map(artView), store_free_bytes: storeFree() });
   if (p === "/api/images" && req.method === "POST") { const tag = String(b.tag ?? "").trim(), H = hosts.find((h) => h.id === Number(b.from_host_id));
     if (!tag) return send(422, { detail: { ok: false, error: "tag_required", message: "要先写上镜像标签，比如 dsh-family:1.14.2" } });

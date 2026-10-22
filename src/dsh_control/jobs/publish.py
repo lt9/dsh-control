@@ -164,9 +164,92 @@ async def run_publish(ctx) -> None:
         if prev_filename and prev_filename != filename:
             # 老登记的指向别的文件（例如旧的命名口径）：换行成功后才清旧文件
             _cleanup(store / prev_filename)
+        if prev is not None:
+            # 同 tag 重发=制品换了：外部渠道那份是旧货，打回 pending 等 30/40
+            # 重推恢复 ok——不然第 20 步会兴冲冲去拉上一个版本。
+            n = await repo.demote_channels(ctx.s, prev.id,
+                                           "制品同 tag 重发，旧渠道副本作废，等重推")
+            if n:
+                await ctx.log("info", f"{n} 条渠道登记打回 pending（旧副本作废，30/40 重推）")
         st.detail = (f"{filename}：{size} 字节，sha256={sha[:16]}…，"
                      f"来源 {host.name}；公开链接门票已换新"
                      + ("（同 tag 重发，旧链接立死）" if prev is not None else ""))
         await ctx.event("image_published", f"镜像制品已发布：{tag}",
                         {"tag": tag, "filename": filename, "size_bytes": size,
                          "sha256": sha, "origin_host": host.name})
+
+    # ---- 30 / 40：推外部渠道（§6.1.6）。前置不齐 skipped，推不动才红。
+    await _mirror_step(ctx, 30, "github", tag, filename, store)
+    await _mirror_step(ctx, 40, "gitee", tag, filename, store)
+
+
+# ------------------------------------------------ 渠道推送（契约 §6.1.6，30/40 步）
+
+async def _mirror_step(ctx, seq: int, channel: str, tag: str, filename: str,
+                       store: Path) -> None:
+    """单渠道推送一步：前置不齐就 skipped（不算失败），推不动才红。
+
+    渠道行永远跟着最新制品行走（20 record 之后 artifact_id 已定）；成功落
+    ok+url，失败落 failed+error 并 StepFailed——工单红着重跑，幂等。
+    """
+    title = "推送 GitHub Releases" if channel == "github" else "推送 Gitee Releases（分卷）"
+    async with ctx.step(seq, f"mirror_{channel}", title) as st:
+        ship = await repo.current_image_ship(ctx.s, default_base=ctx.settings.public_base)
+        art = await repo.get_artifact_by_tag(ctx.s, tag)
+        assert art is not None and art.filename == filename
+        if not ship["auto_mirror"]:
+            st.state = "skipped"
+            st.detail = "auto_mirror=false：本次不推外部渠道（设置页可开）"
+            return
+        token = await repo.mirror_token(ctx.s, channel)
+        repos = await repo.mirror_repos(ctx.s)
+        repo_name = repos.get(channel, "")
+        if not token:
+            st.state = "skipped"
+            st.detail = (f"{channel} 的 mirror_token 未配置（设置页写 token），"
+                         "本步跳过——console 渠道不受影响")
+            return
+        if not repo_name:
+            st.state = "skipped"
+            st.detail = (f"{channel} 的仓库名未配置（mirrors.{channel}.repo，"
+                         "形如 owner/name），本步跳过")
+            return
+        path = store / art.filename
+        from . import mirror  # 局部 import：httpx 只在真要推送时进调用栈
+        try:
+            if channel == "github":
+                url, rel_tag = await mirror.github_push(
+                    token, repo_name, tag, art.filename, path, art.sha256,
+                    art.size_bytes)
+            else:
+                url, rel_tag = await mirror.gitee_push(
+                    token, repo_name, tag, art.filename, path, art.sha256,
+                    art.size_bytes, log=lambda m: ctx.log("info", m))
+        except mirror.MirrorError as exc:
+            await repo.upsert_channel(ctx.s, artifact_id=art.id, channel=channel,
+                                      state="failed", error=str(exc)[:1000])
+            raise StepFailed(str(exc)) from exc
+        row = await repo.upsert_channel(ctx.s, artifact_id=art.id, channel=channel,
+                                        state="ok", url=url, release_tag=rel_tag,
+                                        error="")
+        st.detail = f"{url}（release {rel_tag}）"
+        await ctx.event("image_channel_ok", f"制品 {tag} 已推上 {channel}",
+                        {"tag": tag, "channel": channel, "url": url,
+                         "release_tag": rel_tag})
+        if channel == "gitee":
+            # 仓库永远只留最新一版（1G 配额）：新版成了才删旧版，
+            # 删不动只 warn——那是软约束，不许卡已经成功的发布。
+            for old in await repo.other_ok_rows(ctx.s, "gitee", row.id):
+                if not old.release_tag or old.release_tag == rel_tag:
+                    continue
+                try:
+                    await mirror.gitee_delete_release(token, repo_name,
+                                                      old.release_tag)
+                except mirror.MirrorError as exc:
+                    await ctx.log("warn", f"删旧 gitee release {old.release_tag} "
+                                          f"失败（配额软约束，不拦）: {exc}")
+                    continue
+                old.state = "failed"
+                old.error = "被更新版本替换，release 已删"
+                await ctx.s.commit()
+                await ctx.log("info", f"旧 gitee release 已删：{old.release_tag}")

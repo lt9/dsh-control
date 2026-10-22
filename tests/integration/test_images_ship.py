@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 from pathlib import Path
 
 from dsh_control import images
@@ -17,18 +18,29 @@ IMG = "dsh-test:v9"     # = make_settings 的 dsh_image（第 20 步查的就是
 
 
 def install_fake_save(monkeypatch, holder: dict) -> None:
-    """docker save 的流替身（照 test_images 的 FakeProc 套路）：stdout 出载荷。"""
+    """docker save 的流替身（照 test_images 的 FakeProc 套路）：stdout 出载荷。
+
+    只截 `docker save` 的命令——Popen 是全局模块属性，mirror 的分卷 split 也走
+    它，别的 argv 一律放行真 Popen，不然替身会把邻居误伤成假进程。
+    """
+    real_popen = images.subprocess.Popen
 
     class FakeProc:
         def __init__(self, argv, **kw):
-            assert "docker save" in argv[-1] and "gzip -n" in argv[-1], argv[-1]
             self.stdout = io.BytesIO(holder["payload"])
             self.stderr = io.BytesIO(b"")
 
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr(images.subprocess, "Popen", FakeProc)
+    def popen(argv, **kw):
+        last = argv[-1] if isinstance(argv[-1], str) else ""
+        if "docker save" in last:
+            assert "gzip -n" in last, last
+            return FakeProc(argv, **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(images.subprocess, "Popen", popen)
 
 
 async def _job(env, job_id: int) -> dict:
@@ -156,7 +168,14 @@ async def test_publish_rejects_bad_tag_and_host(ship_env):
 
 async def test_settings_get_put_semantics(env):
     cur = (await env.client.get("/api/settings")).json()
-    assert cur == {"image_ship": {"mode": "ssh", "base_url": "https://console.example.test"}}
+    assert cur == {
+        "image_ship": {"mode": "ssh", "base_url": "https://console.example.test",
+                       "mirror_order": ["gitee", "github", "console"],
+                       "auto_mirror": True},
+        "mirrors": {"github": {"repo": "", "token_set": False, "state": None,
+                               "url": "", "error": "", "updated_at": None},
+                    "gitee": {"repo": "", "token_set": False, "state": None,
+                              "url": "", "error": "", "updated_at": None}}}
 
     # 只认已知键：不认识的键不写库也不报错
     r = await env.client.put("/api/settings", json={"whatever": 1}, headers=XRW)
@@ -176,8 +195,9 @@ async def test_settings_get_put_semantics(env):
         json={"image_ship": {"mode": "download", "base_url": "https://dl.example.test/"}},
         headers=XRW)
     assert r.status_code == 200
-    assert r.json() == {"image_ship": {"mode": "download",
-                                       "base_url": "https://dl.example.test"}}
+    assert r.json()["image_ship"] == {
+        "mode": "download", "base_url": "https://dl.example.test",
+        "mirror_order": ["gitee", "github", "console"], "auto_mirror": True}
     async with env.db.session() as s:
         cred = await repo.get_credential_by_kind(s, "site")
         assert cred.secret["image_ship"] == {"mode": "download",
@@ -187,8 +207,8 @@ async def test_settings_get_put_semantics(env):
     # base_url 空串=回落站点 public_base；局部更新没给的键不动
     r = await env.client.put("/api/settings", json={"image_ship": {"base_url": ""}},
                              headers=XRW)
-    assert r.json() == {"image_ship": {"mode": "download",
-                                       "base_url": "https://site.example.test"}}
+    got = r.json()["image_ship"]
+    assert got["mode"] == "download" and got["base_url"] == "https://site.example.test"
     r = await env.client.put("/api/settings", json={"image_ship": {"mode": "ssh"}})
     assert r.status_code == 403, "PUT 是写操作"
 
@@ -205,6 +225,9 @@ async def test_setting_takes_effect_without_restart(ship_env, monkeypatch):
     loaded = {"done": False}
 
     async def run(*, command, **kw):
+        if "--max-time 8" in command:      # 探测命令：一律答可达（选路逻辑单测专测）
+            ex.commands.append(command)
+            return ExecResult(0, "OK\n", "")
         if "docker image inspect" in command and "HostConfig" not in command:
             return (ExecResult(0, "[image] PRESENT\n", "") if loaded["done"]
                     else ExecResult(0, "[image] MISSING\n", ""))
@@ -290,6 +313,9 @@ async def test_step20_download_pulls_artifact_with_sha_check(ship_env, monkeypat
     loaded = {"done": False}
 
     async def run(*, command, **kw):
+        if "--max-time 8" in command:      # 探测命令：一律答可达（选路逻辑单测专测）
+            ex.commands.append(command)
+            return ExecResult(0, "OK\n", "")
         if "docker image inspect" in command and "HostConfig" not in command:
             return (ExecResult(0, "[image] PRESENT\n", "") if loaded["done"]
                     else ExecResult(0, "[image] MISSING\ndsh-old:v0 1GB\n", ""))
@@ -310,8 +336,10 @@ async def test_step20_download_pulls_artifact_with_sha_check(ship_env, monkeypat
         "缓存放数据盘，不赌 /tmp 是不是 tmpfs"
     evs = (await ship_env.client.get(
         f"/api/instances/{body['instance_id']}/events")).json()["items"]
-    assert any(e["kind"] == "image_shipped" and e["data"].get("via") == "download"
+    assert any(e["kind"] == "image_shipped" and e["data"].get("via") == "console"
                for e in evs)
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert probes and f"/dl/{tok}/" in probes[0], "探测必须在目标机上跑（红线）"
     # 拉完的镜像过了 load 才算就位：整个 deploy 一路走完
     d = (await ship_env.client.get(f"/api/instances/{body['instance_id']}")).json()
     assert d["state"] == "running", d["last_error"]
@@ -398,6 +426,9 @@ async def test_host_image_base_url_wins_over_ship_base(ship_env, monkeypatch):
     loaded = {"done": False}
 
     async def run(*, command, **kw):
+        if "--max-time 8" in command:      # 探测命令：一律答可达（选路逻辑单测专测）
+            ex.commands.append(command)
+            return ExecResult(0, "OK\n", "")
         if "docker image inspect" in command and "HostConfig" not in command:
             return (ExecResult(0, "[image] PRESENT\n", "") if loaded["done"]
                     else ExecResult(0, "[image] MISSING\n", ""))
@@ -413,3 +444,373 @@ async def test_host_image_base_url_wins_over_ship_base(ship_env, monkeypatch):
     pull = next(c for c in ex.commands if "curl -fL" in c)
     assert f"http://198.51.100.77:4893/dl/{tok}/" in pull, "主机登记值必须顶掉站点值"
     assert "console.example.test" not in pull
+
+
+# ------------------------------------------------ 渠道推送（§6.1.6：30/40 步）
+
+import httpx
+
+from dsh_control.jobs import mirror
+
+
+def _fake_api(monkeypatch, handler, calls: list) -> None:
+    """把 mirror._client 换成挂了 MockTransport 的 AsyncClient：全进 calls。"""
+
+    def factory():
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, str(request.url)))
+            return handler(request)
+        return httpx.AsyncClient(transport=httpx.MockTransport(wrapped))
+    monkeypatch.setattr(mirror, "_client", factory)
+
+
+def _multipart_files(body: bytes) -> dict[str, bytes]:
+    """multipart 体拆成 {filename: 内容}——断言传上去的到底是什么。"""
+    head, _, rest = body.partition(b"\r\n")   # 首行就是 --boundary
+    out: dict[str, bytes] = {}
+    for part in rest.split(head):
+        m = re.search(rb'filename="([^"]+)"', part)
+        if m:
+            out[m.group(1).decode()] = part.split(b"\r\n\r\n", 1)[1].rstrip(b"\r\n")
+    return out
+
+
+async def _seed_channel(env, tag: str, channel: str, *, state: str = "ok",
+                        url: str = "https://placeholder/", release_tag: str = ""):
+    async with env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, tag)
+        assert art is not None
+        return await repo.upsert_channel(s, artifact_id=art.id, channel=channel,
+                                         state=state, url=url,
+                                         release_tag=release_tag)
+
+
+async def _set_mirror_cfg(env, *, github_repo="someone/dsh-images",
+                          gitee_repo="someone/dsh-images") -> None:
+    r = await env.client.put("/api/settings", json={"mirrors": {
+        "github": {"repo": github_repo}, "gitee": {"repo": gitee_repo}}},
+        headers=XRW)
+    assert r.status_code == 200
+
+
+async def test_settings_mirror_validation_and_token_never_echoes(env):
+    for bad in ([], ["ftp"], ["gitee", "gitee"]):
+        r = await env.client.put("/api/settings",
+                                 json={"image_ship": {"mirror_order": bad}}, headers=XRW)
+        assert r.status_code == 422 and r.json()["detail"]["error"] == "invalid_mirror_order"
+    r = await env.client.put("/api/settings",
+                             json={"image_ship": {"mirror_order": ["github", "console"]}},
+                             headers=XRW)
+    assert r.status_code == 200
+    assert r.json()["image_ship"]["mirror_order"] == ["github", "console"]
+
+    r = await env.client.put("/api/settings",
+                             json={"mirrors": {"gitee": {"repo": "不是这个形"}}},
+                             headers=XRW)
+    assert r.status_code == 422 and r.json()["detail"]["error"] == "invalid_repo"
+    r = await env.client.put("/api/settings", json={"mirrors": {
+        "github": {"repo": "someone/dsh-images"},
+        "gitee": {"repo": "someone/dsh-images"},
+        "weibo": {"repo": "who/ever"}}}, headers=XRW)
+    assert r.status_code == 200
+    got = r.json()["mirrors"]
+    assert got["github"]["repo"] == "someone/dsh-images" and "weibo" not in got
+
+    r = await env.client.put("/api/mirror-tokens/ftp", json={"token": "x"}, headers=XRW)
+    assert r.status_code == 422 and r.json()["detail"]["error"] == "invalid_channel"
+    r = await env.client.put("/api/mirror-tokens/github", json={"token": "  "}, headers=XRW)
+    assert r.status_code == 422, "空白 token 不收"
+    assert (await env.client.put("/api/mirror-tokens/gitee",
+                                 json={"token": "abc"})).status_code == 403, "写操作吃 XRW"
+    r = await env.client.put("/api/mirror-tokens/github",
+                             json={"token": "ghp_super_secret"}, headers=XRW)
+    assert r.status_code == 200 and r.json() == {"ok": True, "token_set": True}
+    body = (await env.client.get("/api/settings")).json()
+    assert "ghp_super_secret" not in str(body), "token 永不出网（§6.1.6）"
+    got_gh = body["mirrors"]["github"]
+    assert got_gh["repo"] == "someone/dsh-images" and got_gh["token_set"] is True
+    assert got_gh["state"] is None and got_gh["url"] == "" and got_gh["error"] == ""
+    assert got_gh["updated_at"] is None
+    assert body["mirrors"]["gitee"]["token_set"] is False
+
+
+async def test_publish_github_asset_via_fake_api(ship_env, monkeypatch):
+    payload = b"g" * 4096
+    install_fake_save(monkeypatch, {"payload": payload})
+    await _set_mirror_cfg(ship_env)
+    r = await ship_env.client.put("/api/mirror-tokens/github",
+                                  json={"token": "ghp_x"}, headers=XRW)
+    assert r.status_code == 200
+    upload_url = ("https://uploads.github.com/repos/someone/dsh-images"
+                  "/releases/9/assets{?name,label}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/repos/someone/dsh-images/releases" and request.method == "POST":
+            return httpx.Response(422, json={"message": "tag_name already exists"})
+        if p == "/repos/someone/dsh-images/releases/tags/image-dsh-test_v9":
+            return httpx.Response(200, json={"id": 9, "upload_url": upload_url})
+        if p == "/repos/someone/dsh-images/releases/9" and request.method == "PATCH":
+            return httpx.Response(200, json={"id": 9, "upload_url": upload_url})
+        if p == "/repos/someone/dsh-images/releases/9/assets" and request.method == "GET":
+            return httpx.Response(200, json=[{"id": 3, "name": "dsh-test_v9.tar.gz"}])
+        if p == "/repos/someone/dsh-images/releases/assets/3" and request.method == "DELETE":
+            return httpx.Response(204)
+        if p == "/repos/someone/dsh-images/releases/9/assets" and request.method == "POST":
+            assert request.headers["content-type"] == "application/octet-stream"
+            assert request.content == payload, "asset 必须就是制品本体"
+            return httpx.Response(201, json={"id": 10, "name": "dsh-test_v9.tar.gz"})
+        raise AssertionError(f"假 API 不该收到 {request.method} {p}")
+
+    calls: list = []
+    _fake_api(monkeypatch, handler, calls)
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    steps = {st["key"]: st for st in job["steps"]}
+    assert steps["mirror_github"]["state"] == "succeeded"
+    assert "https://github.com/someone/dsh-images/releases/download/" \
+           "image-dsh-test_v9/dsh-test_v9.tar.gz" in steps["mirror_github"]["detail"]
+    assert steps["mirror_gitee"]["state"] == "skipped", "没配 gitee token：跳过不算失败"
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        row = await repo.get_channel(s, art.id, "github")
+        assert row.state == "ok" and row.release_tag == "image-dsh-test_v9"
+        assert row.url.endswith("/releases/download/image-dsh-test_v9/dsh-test_v9.tar.gz")
+    got = (await ship_env.client.get("/api/settings")).json()["mirrors"]
+    assert got["github"]["state"] == "ok"
+    assert got["github"]["url"] == (
+        "https://github.com/someone/dsh-images/releases/download/"
+        "image-dsh-test_v9/dsh-test_v9.tar.gz"), "前端 ok=直链复制吃 url 列"
+    assert got["github"]["error"] == "" and got["github"]["updated_at"]
+    assert got["gitee"]["state"] is None and got["gitee"]["url"] == ""
+    assert not any("gitee.com" in u for _, u in calls), "gitee 未配置就不许碰它"
+
+
+async def test_publish_github_bad_token_fails_loudly(ship_env, monkeypatch):
+    install_fake_save(monkeypatch, {"payload": b"g" * 64})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/github", json={"token": "nope"},
+                              headers=XRW)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "Bad credentials"})
+
+    _fake_api(monkeypatch, handler, [])
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "failed"
+    assert "token 不能走 API？" in (job["error"] or "")
+    assert "mirror_gitee" not in {st["key"] for st in job["steps"]}, "红工单就地停"
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        row = await repo.get_channel(s, art.id, "github")
+        assert row.state == "failed" and "401" in row.error
+    got_gh = (await ship_env.client.get("/api/settings")).json()["mirrors"]["github"]
+    assert got_gh["state"] == "failed" and "401" in got_gh["error"], "前端失败气泡吃 error 列"
+    # 制品本体没受伤：console 链接照旧好使
+    lst = (await ship_env.client.get("/api/images")).json()
+    assert any(i["tag"] == IMG for i in lst["items"])
+
+
+async def test_publish_gitee_splits_manifest_and_prunes_old(ship_env, monkeypatch):
+    payload = b"p" * 1_500_000          # split -b 1m → aa+ab 两卷，快
+    install_fake_save(monkeypatch, {"payload": payload})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt_x"},
+                              headers=XRW)
+    monkeypatch.setattr(mirror, "GITEE_PART_SIZE", "1m")
+    # 上一版：别的 tag 还占着 gitee 仓库（1G 配额只留最新一版）
+    await _seed_artifact(ship_env, b"old", tag="dsh-old:v0")
+    await _seed_channel(ship_env, "dsh-old:v0", "gitee",
+                        url="https://gitee.example/attach/old.manifest.json",
+                        release_tag="image-dsh-old_v0")
+    uploaded: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        base = "/api/v5/repos/someone/dsh-images"
+        if p == f"{base}/releases/tags/image-dsh-test_v9":
+            return httpx.Response(404, json={})
+        if p == f"{base}/releases" and request.method == "POST":
+            assert "access_token=gt_x" in str(request.url) or \
+                   b"access_token" in request.content
+            return httpx.Response(201, json={"id": 5})
+        if p == f"{base}/releases/5/attach_files" and request.method == "POST":
+            files = _multipart_files(request.content)
+            assert list(files), "multipart 里必须有 file 字段"
+            uploaded.update(files)
+            name = next(iter(files))
+            return httpx.Response(201, json={
+                "id": 1, "name": name,
+                "browser_download_url": f"https://gitee.example/attach/{name}"})
+        if p == f"{base}/releases/tags/image-dsh-old_v0":
+            return httpx.Response(200, json={"id": 77})
+        if p == f"{base}/releases/77" and request.method == "DELETE":
+            return httpx.Response(204)
+        raise AssertionError(f"假 API 不该收到 {request.method} {p}")
+
+    calls: list = []
+    _fake_api(monkeypatch, handler, calls)
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    assert any(m == "DELETE" and u.split("?")[0].endswith("/releases/77")
+               for m, u in calls), "新版落地后必须删旧 release（1G 配额）"
+    parts = sorted(k for k in uploaded if k.endswith((".part-aa", ".part-ab")))
+    assert parts == ["dsh-test_v9.tar.gz.part-aa", "dsh-test_v9.tar.gz.part-ab"]
+    assert uploaded[parts[0]] == payload[:1048576] and uploaded[parts[1]] == payload[1048576:]
+    import json as _json
+    mani = _json.loads(uploaded["dsh-test_v9.tar.gz.manifest.json"].decode())
+    sha = hashlib.sha256(payload).hexdigest()
+    assert mani["file"] == "dsh-test_v9.tar.gz" and mani["sha256"] == sha
+    assert mani["size"] == len(payload)
+    assert [pp["name"] for pp in mani["parts"]] == parts
+    assert all(hashlib.sha256(uploaded[n]).hexdigest() == pp["sha256"]
+               for n, pp in zip(parts, mani["parts"], strict=True)), \
+        "每卷的 sha 必须是真的——拼回全靠它点名"
+    assert mani["parts"][0]["url"] == "https://gitee.example/attach/" + parts[0]
+    # manifest 单行、无空格：目标机 grep -o 抽直链的口径依赖这一点
+    raw = uploaded["dsh-test_v9.tar.gz.manifest.json"]
+    assert raw.count(b"\n") == 0 and b'"url":"' in raw and b'"url": "' not in raw
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        row = await repo.get_channel(s, art.id, "gitee")
+        assert row.state == "ok"
+        assert row.url == "https://gitee.example/attach/dsh-test_v9.tar.gz.manifest.json"
+        old = await repo.get_artifact_by_tag(s, "dsh-old:v0")
+        oldrow = await repo.get_channel(s, old.id, "gitee")
+        assert oldrow.state == "failed" and "替换" in oldrow.error
+
+
+async def test_publish_mirror_skipped_when_off(ship_env, monkeypatch):
+    install_fake_save(monkeypatch, {"payload": b"g" * 64})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt"},
+                              headers=XRW)
+    await ship_env.client.put("/api/mirror-tokens/github", json={"token": "gh"},
+                              headers=XRW)
+    r = await ship_env.client.put("/api/settings",
+                                  json={"image_ship": {"auto_mirror": False}}, headers=XRW)
+    assert r.status_code == 200
+
+    def no_client():
+        raise AssertionError("auto_mirror=false 一个 HTTP 都不许发")
+    monkeypatch.setattr(mirror, "_client", no_client)
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    steps = {st["key"]: st for st in job["steps"]}
+    assert steps["mirror_github"]["state"] == "skipped"
+    assert steps["mirror_gitee"]["state"] == "skipped"
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        assert await repo.get_channel(s, art.id, "github") is None
+
+
+# ------------------------------------------- 第 20 步探测选路与 gitee 拼回（§6.1.6）
+
+def _probe_runner(ex, real, loaded: dict, *, fail_url: str = ""):
+    """目标机侧的探测/取货替身：--max-time 8 的是探测；fail_url 命中的答不可达。"""
+
+    async def run(*, command, **kw):
+        if "--max-time 8" in command:
+            ex.commands.append(command)
+            if fail_url and fail_url in command:
+                return ExecResult(22, "", "curl: (22) The requested URL returned error: 503")
+            return ExecResult(0, "OK\n", "")
+        if "docker image inspect" in command and "HostConfig" not in command:
+            return (ExecResult(0, "[image] PRESENT\n", "") if loaded["done"]
+                    else ExecResult(0, "[image] MISSING\n", ""))
+        if "docker load" in command:
+            loaded["done"] = True
+        return await real(command=command, **kw)
+    return run
+
+
+async def _prep_download_mode(env, tok_tag: str) -> None:
+    r = await env.client.put("/api/settings",
+                             json={"image_ship": {"mode": "download"}}, headers=XRW)
+    assert r.status_code == 200
+
+
+async def test_step20_skips_unreachable_channel_in_order(ship_env, monkeypatch):
+    await _seed_artifact(ship_env, b"tarstream", tag=IMG)
+    await _prep_download_mode(ship_env, IMG)
+    await _seed_channel(ship_env, IMG, "gitee",
+                        url="https://gitee.example/dsh-test_v9.tar.gz.manifest.json")
+    await _seed_channel(ship_env, IMG, "github",
+                        url="https://gt.example/download/image-dsh-test_v9/dsh-test_v9.tar.gz")
+
+    ex = ship_env.providers.executor
+    loaded = {"done": False}
+    monkeypatch.setattr(ex, "run", _probe_runner(ex, ex.run, loaded,
+                                                 fail_url="gitee.example"))
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert "gitee.example" in probes[0] and "gt.example" in probes[1], \
+        "探测顺序 = mirror_order（默认 gitee 先），不通就滑下一条"
+    assert len(probes) == 2, "github 赢了就不许再探 console"
+    pull = next(c for c in ex.commands if "curl -fL" in c)
+    assert "gt.example" in pull and "sha256sum -c" in pull and "docker load -i" in pull
+    evs = (await ship_env.client.get(
+        f"/api/instances/{body['instance_id']}/events")).json()["items"]
+    assert any(e["kind"] == "image_shipped" and e["data"].get("via") == "github"
+               for e in evs), "事件里点名选了哪条渠道"
+
+
+async def test_step20_gitee_reassembles_with_full_sha_check(ship_env, monkeypatch):
+    await _seed_artifact(ship_env, b"tarstream", tag=IMG)
+    await _prep_download_mode(ship_env, IMG)
+    await _seed_channel(ship_env, IMG, "gitee",
+                        url="https://gitee.example/dsh-test_v9.tar.gz.manifest.json")
+
+    ex = ship_env.providers.executor
+    loaded = {"done": False}
+    monkeypatch.setattr(ex, "run", _probe_runner(ex, ex.run, loaded))
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    pull = next(c for c in ex.commands if "curl -fL" in c)
+    sha = hashlib.sha256(b"tarstream").hexdigest()
+    assert "https://gitee.example/dsh-test_v9.tar.gz.manifest.json" in pull
+    assert """grep -o '"url":"http""" in pull, "POSIX 抽直链：不赌目标机有 jq/python3"
+    assert ">> " in pull, "分卷必须 >> 拼进同一文件"
+    assert f"echo '{sha}  " in pull and "sha256sum -c" in pull, "整包 sha 强校验必做"
+    assert "docker load -i" in pull and "rm -rf" in pull
+    assert "/hdd1/dsh-data/ship-cache" in pull
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert len(probes) == 1 and "gitee.example" in probes[0]
+
+
+async def test_step20_all_channels_unreachable_names_each(ship_env, monkeypatch):
+    await _seed_artifact(ship_env, b"tarstream", tag=IMG)
+    await _prep_download_mode(ship_env, IMG)
+    await _seed_channel(ship_env, IMG, "gitee", url="https://gitee.example/m.json")
+    await _seed_channel(ship_env, IMG, "github", url="https://gt.example/a.tar.gz")
+
+    ex = ship_env.providers.executor
+    loaded = {"done": False}
+    monkeypatch.setattr(ex, "run", _probe_runner(ex, ex.run, loaded, fail_url="https://"))
+    body = (await create_instance(ship_env.client,
+                                  extra={"host_id": ship_env.host_nas})).json()
+    job = await _job(ship_env, body["job_id"])
+    assert job["state"] == "failed"
+    err = job["error"] or ""
+    for want in ("gitee: 不可达", "github: 不可达", "console: 不可达"):
+        assert want in err, f"全败必须逐渠道点名：{err}"
+    probes = [c for c in ex.commands if "--max-time 8" in c]
+    assert len(probes) == 3
+    assert not any("docker load" in c for c in ex.commands), "一条都没通就不许 load"

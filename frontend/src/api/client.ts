@@ -112,13 +112,41 @@ export interface EventItem { id: number; kind: string; message: string; created_
 
 /** §6.1.5 镜像分发方式：ssh=面板管道直传（局域网快路）；download=目标机自己从面板公网域拉制品。 */
 export type ShipMode = "ssh" | "download";
-/** GET /settings 返回的生效值：base_url 空串=吃站点的公网域，接口给的是**解析后**的那一个。 */
-export interface Settings {
-  image_ship: { mode: ShipMode; base_url: string };
+/** §6.1.6 分发渠道：console=§6.1.5 的 /dl/{token}/（永远兜底）；github/gitee=公共 Releases 直链。 */
+export type ShipChannel = "console" | "github" | "gitee";
+/** 能配令牌、能往外推的那两个渠道（console 是内置的，没有令牌概念）。 */
+export type MirrorName = "github" | "gitee";
+/** 最新制品在某渠道的推送状态；image_channels 里没那一行=从没推过 → null。 */
+export type ChannelState = "ok" | "failed" | "pending" | null;
+
+/** §6.1.6 渠道行。注意：**令牌永不出网**，这里只有 token_set 这个布尔。 */
+export interface MirrorChannel {
+  /** 形如 lt9/dsh-control；没配 = 空串。 */
+  repo: string;
+  token_set: boolean;
+  latest_state: ChannelState;
+  /** 目标机可直连的入口：github=asset 直链，gitee=manifest 直链。公共 CDN，无秘密。 */
+  url: string | null;
+  error: string | null;
+  updated_at: string | null;
 }
-/** PUT 是局部更新（只认已知键），所以这里两个字段都可选。 */
+/** GET /settings：base_url 给的是**解析后的生效值**（留空时=站点公网域）。 */
+export interface Settings {
+  image_ship: {
+    mode: ShipMode;
+    base_url: string;
+    /** 探测优先序（§6.1.6），默认 gitee→github→console。 */
+    mirror_order: ShipChannel[];
+    /** 发布时是否顺道推外部渠道，默认 true。 */
+    auto_mirror: boolean;
+  };
+  mirrors: Record<MirrorName, MirrorChannel>;
+}
+/** PUT 是局部更新（只认已知键），所以全都可选。 */
 export interface SettingsPatch {
-  image_ship?: { mode?: ShipMode; base_url?: string };
+  image_ship?: { mode?: ShipMode; base_url?: string; mirror_order?: ShipChannel[]; auto_mirror?: boolean };
+  /** 仓库名在 PUT 白名单里（§4）；令牌不在这儿——走 PUT /api/mirror-tokens/{channel}。 */
+  mirrors?: { github?: { repo: string }; gitee?: { repo: string } };
 }
 /** §4 制品行：token 就是门票（公开免鉴权下载），url 是解析后的完整链接。 */
 export interface ImageArtifact {
@@ -242,6 +270,44 @@ function toList(raw: unknown): Record<string, unknown>[] {
   return (o?.items ?? o?.instances ?? []) as Record<string, unknown>[];
 }
 
+const DEFAULT_MIRROR_ORDER: ShipChannel[] = ["gitee", "github", "console"];
+
+/** §4 那行把这一段的字段写成 `{repo, token_set, state?}`，任务书里叫 latest_state——
+ *  两个名字都认，别因为后端先落地哪一个而把界面做成空的。 */
+function toChannel(v: unknown): MirrorChannel {
+  const o = (v ?? {}) as Record<string, unknown>;
+  const st = (o.latest_state ?? o.state ?? null) as unknown;
+  return {
+    repo: typeof o.repo === "string" ? o.repo : "",
+    token_set: o.token_set === true,
+    latest_state: st === "ok" || st === "failed" || st === "pending" ? st : null,
+    url: typeof o.url === "string" ? o.url : null,
+    error: typeof o.error === "string" ? o.error : null,
+    updated_at: typeof o.updated_at === "string" ? o.updated_at : null,
+  };
+}
+
+/** 这一段是这一期新加的，后端可能还在路上：缺的键一律落回"没配"，
+ *  让界面显示成空态而不是崩成一片 undefined。优先序缺谁补谁——
+ *  探测少一条路是真会坏事的。 */
+function toSettings(raw: unknown): Settings {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const s = (o.image_ship ?? {}) as Record<string, unknown>;
+  const m = (o.mirrors ?? {}) as Record<string, unknown>;
+  const given = Array.isArray(s.mirror_order)
+    ? s.mirror_order.filter((c): c is ShipChannel => c === "console" || c === "github" || c === "gitee")
+    : [];
+  return {
+    image_ship: {
+      mode: s.mode === "download" ? "download" : "ssh",
+      base_url: typeof s.base_url === "string" ? s.base_url : "",
+      mirror_order: [...new Set([...given, ...DEFAULT_MIRROR_ORDER])],
+      auto_mirror: s.auto_mirror !== false,
+    },
+    mirrors: { github: toChannel(m.github), gitee: toChannel(m.gitee) },
+  };
+}
+
 export const api = {
   login: (key: string) =>
     http<Session>("/login", { method: "POST", json: { key } }),
@@ -299,10 +365,14 @@ export const api = {
 
   // —— 设置页（§6.1.5 镜像分发）——
   /** GET /settings：base_url 给的是**解析后的生效值**（留空时=站点公网域）。 */
-  settings: () => http<Settings>("/settings"),
+  settings: async (): Promise<Settings> => toSettings(await http<unknown>("/settings")),
   /** PUT 是局部更新（§4：只认已知键），改完不重启生效，所以切完直接拿回执渲染。 */
-  putSettings: (patch: SettingsPatch) =>
-    http<Settings>("/settings", { method: "PUT", json: patch }),
+  putSettings: async (patch: SettingsPatch): Promise<Settings> =>
+    toSettings(await http<unknown>("/settings", { method: "PUT", json: patch })),
+  /** 令牌即焚（§6.1.6）：PUT 上去只回 token_set，值不回前端，也没有任何 GET 拿得到它。 */
+  putMirrorToken: (channel: MirrorName, token: string) =>
+    http<{ ok: boolean; token_set: boolean }>(`/mirror-tokens/${channel}`,
+      { method: "PUT", json: { token } }),
   images: async (): Promise<ImageList> => {
     const raw = await http<unknown>("/images");
     const o = (Array.isArray(raw) ? { items: raw } : raw) as

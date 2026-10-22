@@ -1,7 +1,10 @@
 import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ApiError, api, type ImageArtifact, type ShipMode } from "../api/client";
-import { SHIP_MODE_META, fmtBytes, fmtFull, fmtRel, maskMiddle } from "../lib/format";
+import {
+  ApiError, api, type ImageArtifact, type MirrorName, type Settings,
+  type SettingsPatch, type ShipChannel, type ShipMode,
+} from "../api/client";
+import { CHANNEL_META, CHANNEL_STATE_META, SHIP_MODE_META, fmtBytes, fmtFull, fmtRel, maskMiddle } from "../lib/format";
 import { useAsync } from "../lib/hooks";
 import { ConsequenceCard, CopyButton, HelpTip, Icon, Toast, useToast } from "../components/ui";
 
@@ -266,7 +269,13 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* —— 4：从主机发布 —— */}
+      {/* —— 4：外部渠道（§6.1.6）—— */}
+      {cfg.data && (
+        <ChannelsCard s={cfg.data} busy={busy} patch={applyPatch} say={say} fail={setErr}
+          reload={() => void cfg.reload()} />
+      )}
+
+      {/* —— 5：从主机发布 —— */}
       <section className="card" aria-label="从主机发布">
         <div className="card-head">
           <h2>从主机发布<HelpTip label="从主机发布"
@@ -302,5 +311,216 @@ export default function SettingsPage() {
 
       {toast && <Toast text={toast} />}
     </main>
+  );
+}
+
+const ORDER_TIP = "开通实例缺镜像时，在目标机上按这个顺序逐条探测（8 秒超时），第一条通的胜出并负责取货：国内机器 gitee 先亮，国外机器 gitee 探不通自然滑到 GitHub，控制台永远兜底。探测用的是目标机自己的网络。";
+const GITEE_TIP = "Gitee 单附件限 100M、仓库附件总量限 1G，所以走 95M 分卷：目标机拉齐所有卷拼回后按整包 sha256 强校验。只保留最新一版，旧版自动删。";
+const REPO_TIP = "写成 owner/repo 那样，失焦或按回车就存；格式不对会被挡回来。令牌只管推，下载是匿名的，不要 token。";
+
+/**
+ * §6.1.6 外部渠道区。行序就是探测优先序（箭头看着像在搬这一行，首行禁上、末行禁下）；
+ * 令牌写完即焚——保存后输入框立刻清空，页面任何地方都不会再出现它（§6.1.6：只写不回显）。
+ */
+function ChannelsCard({ s, busy, patch, say, fail, reload }: {
+  s: Settings; busy: boolean;
+  patch: (p: SettingsPatch, done: string) => void;
+  say: (m: string) => void; fail: (m: string) => void; reload: () => void;
+}) {
+  const [tokFor, setTokFor] = useState<MirrorName | null>(null);
+  const [tokVal, setTokVal] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [repo, setRepo] = useState<Partial<Record<MirrorName, string>>>({});
+  const order = s.image_ship.mirror_order;
+  const auto = s.image_ship.auto_mirror;
+
+  const move = (ch: ShipChannel, dir: -1 | 1) => {
+    const i = order.indexOf(ch), j = i + dir;
+    if (j < 0 || j >= order.length) return;
+    const next = [...order];
+    [next[i], next[j]] = [next[j], next[i]];
+    patch({ image_ship: { mirror_order: next } },
+      `探测顺序改成 ${next.map((c) => CHANNEL_META[c].zh).join(" → ")}`);
+  };
+
+  const saveRepo = (name: MirrorName) => {
+    const v = (repo[name] ?? "").trim();
+    setRepo((r) => ({ ...r, [name]: undefined }));
+    if (v === s.mirrors[name].repo) return;
+    patch({ mirrors: { [name]: { repo: v } } },
+      v ? `${CHANNEL_META[name].zh} 的仓库存成了 ${v}` : `${CHANNEL_META[name].zh} 的仓库清空了，下次发布不推它`);
+  };
+
+  const saveToken = async (name: MirrorName) => {
+    const t = tokVal.trim();
+    if (!t) { fail("令牌那一栏还空着——先把访问令牌粘进来"); return; }
+    setSaving(true);
+    try {
+      await api.putMirrorToken(name, t);
+      reload();          // 灯要当场从「未配置」翻成「已配置」，接口只回 token_set 这一个布尔
+      say(`${CHANNEL_META[name].zh} 的令牌已存下——写完就焚，这一页往后不会再显它`);
+    } catch (e) {
+      fail(msgOf(e));
+    } finally {
+      // 不管成没成都清空：一长串密钥不该躺在输入框里等人回头去复制
+      setTokVal(""); setTokFor(null); setSaving(false);
+    }
+  };
+
+  const chanCell = (name: MirrorName | null) => {
+    if (name === null) return <span className="mut small">在制品表里，每条都有链接</span>;
+    const m = s.mirrors[name];
+    if (!m.token_set) return <span className="chan-off small">配好令牌后，下次发布自动推</span>;
+    if (!auto) {
+      return (
+        <>
+          <span className="chan-off">手动暂停</span>
+          {m.latest_state === "ok" && m.url && (
+            <div className="chan-link">
+              <span className="mono url-mask">{m.url}</span>
+              <CopyButton text={m.url} label="复制" title="公共直链，谁拿到谁能下" />
+            </div>
+          )}
+        </>
+      );
+    }
+    if (m.latest_state === "ok" && m.url) {
+      return (
+        <>
+          <span className="chan-st"><i className="dot ok" aria-hidden />{CHANNEL_STATE_META.ok.zh}</span>
+          <div className="chan-link">
+            <span className="mono url-mask">{m.url}</span>
+            <CopyButton text={m.url} label="复制" title="公共直链，无秘密，谁拿到谁能下" />
+          </div>
+        </>
+      );
+    }
+    if (m.latest_state === "ok") {
+      return <span className="chan-st"><i className="dot ok" aria-hidden />{CHANNEL_STATE_META.ok.zh}</span>;
+    }
+    if (m.latest_state === "pending") {
+      return <span className="chan-st"><i className="dot warn" aria-hidden />{CHANNEL_STATE_META.pending.zh}</span>;
+    }
+    if (m.latest_state === "failed") {
+      return (
+        <span className="chan-st">
+          <i className="dot err" aria-hidden />{CHANNEL_STATE_META.failed.zh}
+          <HelpTip label="这次推送为什么失败" text={m.error ?? "后端没给原因，去看这一轮发布工单的日志。"} />
+        </span>
+      );
+    }
+    return (
+      <>
+        <span className="chan-off">未推送</span>
+        <div className="row-sub">下次发布自动推</div>
+      </>
+    );
+  };
+
+  return (
+    <section className="card" aria-label="外部渠道">
+      <div className="card-head"><h2>外部渠道</h2></div>
+      <div className="card-body">
+        <div className="tbl-wrap">
+          <table className="tbl chan-tbl">
+            <thead>
+              <tr>
+                <th className="col-ord">探测优先序<HelpTip label="探测优先序" text={ORDER_TIP} /></th>
+                <th>渠道</th>
+                <th>仓库 / 入口<HelpTip label="仓库怎么填" text={REPO_TIP} /></th>
+                <th>令牌</th>
+                <th>最新制品</th>
+              </tr>
+            </thead>
+            <tbody>
+              {order.map((ch, i) => {
+                // 行序就是探测优先序：箭头搬的就是这一行
+                const ord = (
+                  <td className="col-ord">
+                    <span className="ord">
+                      <span className="n num">{i + 1}</span>
+                      <button type="button" className="btn btn-icon ord-btn up" disabled={busy || i === 0}
+                        aria-label={`把${CHANNEL_META[ch].zh}往前挪一位`} onClick={() => move(ch, -1)}>
+                        <Icon name="chevron" size={12} />
+                      </button>
+                      <button type="button" className="btn btn-icon ord-btn down" disabled={busy || i === order.length - 1}
+                        aria-label={`把${CHANNEL_META[ch].zh}往后挪一位`} onClick={() => move(ch, 1)}>
+                        <Icon name="chevron" size={12} />
+                      </button>
+                    </span>
+                  </td>
+                );
+                if (ch === "console") {
+                  return (
+                    <tr key={ch}>
+                      {ord}
+                      <td><span className="row-title">{CHANNEL_META.console.zh}</span></td>
+                      <td>
+                        <span className="mono url-mask" title="这条在下面那张表的表头里改">{s.image_ship.base_url || "站点公网域"}</span>
+                        <div className="row-sub">就是上面那条「下载基址」</div>
+                      </td>
+                      <td><span className="chip tone-off">内置</span></td>
+                      <td>{chanCell(null)}</td>
+                    </tr>
+                  );
+                }
+                const m = s.mirrors[ch];
+                return (
+                  <tr key={ch} className={m.token_set ? undefined : "chan-dim"}>
+                    {ord}
+                    <td>
+                      <span className="row-title">{CHANNEL_META[ch].zh}</span>
+                      {ch === "gitee" && <HelpTip label="Gitee 为什么要分卷" text={GITEE_TIP} />}
+                    </td>
+                    <td>
+                      <input className="input mono chan-repo" type="text"
+                        value={repo[ch] ?? m.repo} placeholder="lt9/dsh-control" disabled={busy}
+                        aria-label={`${CHANNEL_META[ch].zh} 仓库`}
+                        onChange={(e) => setRepo((r) => ({ ...r, [ch]: e.target.value }))}
+                        onBlur={() => saveRepo(ch)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveRepo(ch); } }} />
+                    </td>
+                    <td>
+                      <span className={m.token_set ? "tok ok" : "tok off"}>
+                        <i className={`dot${m.token_set ? " ok" : " off"}`} aria-hidden />
+                        {m.token_set ? "已配置" : "未配置"}
+                      </span>
+                      {tokFor === ch ? (
+                        <div className="tok-in">
+                          <input className="input mono" type="password" autoComplete="new-password"
+                            spellCheck={false} placeholder="粘贴访问令牌" disabled={saving}
+                            aria-label={`${CHANNEL_META[ch].zh} 访问令牌`} value={tokVal}
+                            onChange={(e) => setTokVal(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") void saveToken(ch); }} />
+                          <button type="button" className="btn btn-primary btn-sm" disabled={saving}
+                            onClick={() => void saveToken(ch)}>{saving ? "存入…" : "保存"}</button>
+                          <button type="button" className="btn btn-sm" disabled={saving}
+                            onClick={() => { setTokVal(""); setTokFor(null); }}>算了</button>
+                        </div>
+                      ) : (
+                        <button type="button" className="btn btn-sm" disabled={busy}
+                          onClick={() => { setTokFor(ch); setTokVal(""); }}>{m.token_set ? "更换" : "配置"}</button>
+                      )}
+                      {tokFor === ch && <div className="row-sub">保存后这栏立刻清空，永不回填</div>}
+                    </td>
+                    <td>{chanCell(ch)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="auto-row">
+          <button type="button" className="switch" role="switch" aria-checked={auto} disabled={busy}
+            onClick={() => patch({ image_ship: { auto_mirror: !auto } },
+              auto ? "已关掉顺道推送：新制品只进本地制品库" : "已打开顺道推送：发布时一起推外部渠道")}>
+            <i aria-hidden />
+            <span>发布时顺道推送外部渠道</span>
+          </button>
+          <HelpTip label="顺道推送" text="关掉后新制品只进本地制品库，外网机器开通会全部探测失败——除非你手动补推" />
+        </div>
+      </div>
+    </section>
   );
 }
