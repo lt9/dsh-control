@@ -34,6 +34,26 @@ class MirrorError(RuntimeError):
     """渠道推送失败：message 直接进渠道行 error 与工单，先过调用方的 redact。"""
 
 
+def _js(resp) -> dict:
+    """响应体一律过成 dict 再 .get——gitee 真机实证：查不存在的 release 回
+    **HTTP 200 + 正文 null**（不是 404），`json().get` 当场 NoneType 崩（task-7）。
+    空 body / 非 JSON 同样按「没这个键」处理，不许在解析层炸。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ja(resp) -> list:
+    """列表版：200 + null / 空 body / 非列表一律当空。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
 def _client() -> httpx.AsyncClient:
     """唯一出口：测试 monkeypatch 本函数注入 MockTransport handler。"""
     return httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0),
@@ -199,7 +219,7 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
         if up.status_code not in (200, 201):
             raise MirrorError(f"Gitee 传 {file_path.name} 失败 HTTP "
                               f"{up.status_code}: {up.text[:200]}")
-        url = str(up.json().get("browser_download_url") or "")
+        url = str(_js(up).get("browser_download_url") or "")
         if not url:
             raise MirrorError(f"{file_path.name} 传上去但响应里没有 "
                               "browser_download_url——直链口径变了，得核对 API")
@@ -211,11 +231,12 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
         g = await c.get(f"{base}/releases/tags/{tag_name}", params=tok)
         if g.status_code in (401, 403):
             raise denied("查 release", g.status_code)
-        if g.status_code == 200 and g.json().get("id"):
-            rel_id = g.json()["id"]
+        gj = _js(g)          # 200 + null（不存在）是 gitee 的正常回法，全线先过守卫
+        if g.status_code == 200 and gj.get("id"):
+            rel_id = gj["id"]
             # 同 tag 复用：旧附件清空重传（幂等重跑不许攒重复卷）
             assets = await c.get(f"{base}/releases/{rel_id}/assets", params=tok)
-            for old in (assets.json() if assets.status_code == 200 else []):
+            for old in (_ja(assets) if assets.status_code == 200 else []):
                 if old.get("id"):
                     await c.delete(f"{base}/releases/{rel_id}/assets/{old['id']}",
                                    params=tok)
@@ -226,10 +247,11 @@ async def gitee_push(token: str, repo: str, tag: str, filename: str,
                                    "body": _release_body(tag, sha, size)})
             if r.status_code in (401, 403):
                 raise denied("建 release", r.status_code)
-            if r.status_code not in (200, 201) or not r.json().get("id"):
+            rj = _js(r)
+            if r.status_code not in (200, 201) or not rj.get("id"):
                 raise MirrorError(f"Gitee 建 release 失败 HTTP {r.status_code}: "
                                   f"{r.text[:200]}")
-            rel_id = r.json()["id"]
+            rel_id = rj["id"]
 
         tmp = Path(tempfile.mkdtemp(prefix="dshctl-mirror-"))
         try:
@@ -269,9 +291,10 @@ async def gitee_delete_release(token: str, repo: str, tag_name: str) -> None:
         if g.status_code in (401, 403):
             raise MirrorError(f"删旧 release 前查 {tag_name} 就被拒"
                               f"（HTTP {g.status_code}）")
-        if g.status_code != 200 or not g.json().get("id"):
+        gj = _js(g)          # 同样防 200 + null
+        if g.status_code != 200 or not gj.get("id"):
             return   # 查不回来：当它已经不在了，别猜
-        d = await c.delete(f"{base}/releases/{g.json()['id']}", params=tok)
+        d = await c.delete(f"{base}/releases/{gj['id']}", params=tok)
         if d.status_code not in (200, 202, 204):
             raise MirrorError(f"删 Gitee release {tag_name} 失败 HTTP "
                               f"{d.status_code}: {d.text[:200]}")

@@ -897,3 +897,101 @@ async def test_github_upload_over_real_h11_has_exact_content_length(tmp_path, mo
     assert seen.get("cl") == str(len(payload)), f"真线上头里必须有 CL：{seen}"
     assert seen.get("te") is None, "真线上不许有 Transfer-Encoding: chunked"
     assert seen.get("sent") == len(payload) and seen.get("body_ok"), "实发字节分毫不差"
+
+
+# ------------------------------------------------ 真机两轮踩的坑（task-7 钉桩）
+
+async def test_gitee_200_null_body_treated_as_missing_release(ship_env, monkeypatch):
+    """gitee 真机实证：查不存在的 release 回 **200 + 正文 null**（不是 404）。
+    曾经 40 步 0.3s 崩在 NoneType.get——这条把它钉死：null 当「不存在」走建版分支。"""
+    install_fake_save(monkeypatch, {"payload": b"g" * 512})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt_x"},
+                              headers=XRW)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        base = "/api/v5/repos/someone/dsh-images"
+        if p == f"{base}/releases/tags/image-dsh-test_v9":
+            return httpx.Response(200, json=None)        # ← 真机就长这样
+        if p == f"{base}/releases" and request.method == "POST":
+            return httpx.Response(201, json={"id": 5})
+        if p == f"{base}/releases/5/attach_files":
+            name = next(iter(_multipart_files(request.content)))
+            return httpx.Response(201, json={
+                "id": 1, "name": name,
+                "browser_download_url": f"https://gitee.example/attach/{name}"})
+        raise AssertionError(f"假 API 不该收到 {request.method} {p}")
+
+    calls: list = []
+    _fake_api(monkeypatch, handler, calls)
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    assert any(m == "POST" and u.endswith("/releases") for m, u in calls), \
+        "null 必须走「不存在→建版」分支，而不是复用一条不存在的 release"
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        row = await repo.get_channel(s, art.id, "gitee")
+        assert row.state == "ok"
+
+
+async def test_mirror_failure_does_not_rollback_committed_artifact(ship_env, monkeypatch):
+    """43 号工单教训的钉桩：20 record 提交后，40 步失败只许伤渠道行——
+    制品文件必须在、行必须有效、console 链接必须还活着、github ok 行不许动。"""
+    payload = b"g" * 4096
+    install_fake_save(monkeypatch, {"payload": payload})
+    await _set_mirror_cfg(ship_env)
+    await ship_env.client.put("/api/mirror-tokens/github", json={"token": "gh"},
+                              headers=XRW)
+    await ship_env.client.put("/api/mirror-tokens/gitee", json={"token": "gt"},
+                              headers=XRW)
+    upload_url = ("https://uploads.github.com/repos/someone/dsh-images"
+                  "/releases/9/assets{?name,label}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/repos/someone/dsh-images/releases" and request.method == "POST":
+            return httpx.Response(201, json={"id": 9, "upload_url": upload_url})
+        if p == "/repos/someone/dsh-images/releases/9/assets":
+            if request.method == "GET":
+                return httpx.Response(200, json=[])
+            return httpx.Response(201, json={"id": 10, "name": "dsh-test_v9.tar.gz"})
+        # ——以下是 gitee：建版必炸（真机第二轮的位置），且先回一个 200+null 探路
+        base = "/api/v5/repos/someone/dsh-images"
+        if p == f"{base}/releases/tags/image-dsh-test_v9":
+            return httpx.Response(200, json=None)
+        if p == f"{base}/releases" and request.method == "POST":
+            return httpx.Response(500, json={"message": "boom"})
+        raise AssertionError(f"炸点之后 gitee 不许再发 {request.method} {p}")
+
+    _fake_api(monkeypatch, handler, [])
+    r = await ship_env.client.post("/api/images",
+                                   json={"tag": IMG, "from_host_id": ship_env.host_nas},
+                                   headers=XRW)
+    job = await _job(ship_env, r.json()["job_id"])
+    assert job["state"] == "failed"
+    steps = {st["key"]: st for st in job["steps"]}
+    assert steps["image_record"]["state"] == "succeeded"
+    assert steps["mirror_github"]["state"] == "succeeded"
+    assert steps["mirror_gitee"]["state"] == "failed"
+    logs = (await ship_env.client.get(f"/api/jobs/{job['id']}/logs")).json()["items"]
+    assert not any(ln["line"].startswith("回滚") for ln in logs), \
+        "提交点之后不许有任何回滚动作（越界回滚=砸穿「行存在即文件完整」）"
+    # 制品本体毫发无损：文件在、字节对、行有效
+    f = Path(ship_env.settings.image_store) / "dsh-test_v9.tar.gz"
+    assert f.exists() and f.read_bytes() == payload
+    async with ship_env.db.session() as s:
+        art = await repo.get_artifact_by_tag(s, IMG)
+        assert art is not None and art.size_bytes == len(payload)
+        assert (await repo.get_channel(s, art.id, "github")).state == "ok"
+        g = await repo.get_channel(s, art.id, "gitee")
+        assert g.state == "failed" and "500" in g.error
+    # console 链接没变成谎言：免 cookie 下载 200
+    item = next(i for i in (await ship_env.client.get("/api/images")).json()["items"]
+                if i["tag"] == IMG)
+    ship_env.client.cookies.clear()
+    r = await ship_env.client.get(f"/dl/{item['token']}/{item['url'].rsplit('/', 1)[-1]}")
+    assert r.status_code == 200 and r.content == payload
