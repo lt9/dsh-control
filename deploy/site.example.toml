@@ -50,3 +50,20 @@ kit_path = "/srv/dsh-family"
 data_root = "/srv/dsh-data"
 frpc_client_id = "ops.c.nas1@1"
 credential_name = "console-ed25519"
+
+# 直连主机（§6.1.4）：本身有公网 IP 的机器不过 frp——开通不建隧道，
+# 反代直接回源这台机的 ssh_host:公网端口；不需要 frpc_client_id。
+# 云防火墙请把实例端口段只对入口机（DSHC_INGRESS_IP）放行。
+# 挤机/共享机（入口机兼跑实例这类）必须设 mem_limit/cpu_limit：
+# kit 默认 4g/4 核会把同机基础设施送进 OOM。
+[[hosts]]
+name = "vps-1"
+ssh_host = "203.0.113.20"
+ssh_port = 22
+ssh_user = "ops"
+kit_path = "/srv/dsh-family"
+data_root = "/srv/dsh-data"
+upstream_mode = "direct"           # frp=走隧道（默认） | direct=本机公网直连
+mem_limit = "1g"                   # 写进实例 .env 的 MEM_LIMIT；留空=kit 默认 4g
+cpu_limit = "2"                    # 写进实例 .env 的 CPU_LIMIT；留空=kit 默认 4 核
+credential_name = "console-ed25519"

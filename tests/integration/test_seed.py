@@ -44,6 +44,11 @@ async def test_seed_into_populates_site_creds_hosts(env):
             {"name": "nas-x", "ssh_host": "198.51.100.8", "ssh_port": 2333,
              "ssh_user": "u1", "kit_path": "/srv/kit", "data_root": "/mnt/hdd/dsh",
              "frpc_client_id": "u1.c.nasx@1", "credential_name": "console-ed25519"},
+            {"name": "vps-y", "ssh_host": "203.0.113.40", "ssh_user": "u2",
+             "kit_path": "/srv/kit", "data_root": "/srv/dsh",
+             "upstream_mode": "direct", "mem_limit": "1g", "cpu_limit": "2",
+             "direct_backend": "198.51.100.77", "llm_base_url": "http://198.51.100.77:7777/v1",
+             "credential_name": "console-ed25519"},
         ],
     }
     import os
@@ -53,7 +58,7 @@ async def test_seed_into_populates_site_creds_hosts(env):
         n_host, n_cred = await seed_into(env.db, site)
     finally:
         del os.environ["SEED_TEST_PEM"]
-    assert (n_host, n_cred) == (1, 1)
+    assert (n_host, n_cred) == (2, 1)
 
     async with env.db.session() as s:
         site_row = next((c for c in (await s.scalars(
@@ -71,6 +76,16 @@ async def test_seed_into_populates_site_creds_hosts(env):
         host = (await s.scalars(select(Host).where(Host.name == "nas-x"))).one()
         assert host.ssh_port == 2333
         assert host.ssh_credential_id == key.id
+        # 没写 upstream_mode 的主机 = frp 默认，行为零变化；没写限额 = None
+        assert host.upstream_mode == "frp"
+        assert host.mem_limit is None and host.cpu_limit is None
+        # 没登记回源/模型覆盖 = None：普通机走 §6.1.4 原口径，零变化
+        assert host.direct_backend is None and host.llm_base_url is None
+        vps = (await s.scalars(select(Host).where(Host.name == "vps-y"))).one()
+        assert vps.upstream_mode == "direct"
+        assert vps.mem_limit == "1g" and vps.cpu_limit == "2"
+        assert vps.direct_backend == "198.51.100.77"
+        assert vps.llm_base_url == "http://198.51.100.77:7777/v1"
 
     from dsh_control.settings import Settings, apply_site_overrides
     st = apply_site_overrides(Settings(_env_file=None), site["site"])
@@ -85,7 +100,16 @@ async def test_seed_into_populates_site_creds_hosts(env):
     finally:
         del _os.environ["SEED_TEST_PEM"]
     async with env.db.session() as s:
-        assert len((await s.scalars(select(Host))).all()) == 3  # fixture 两台 + nas-x
+        assert len((await s.scalars(select(Host))).all()) == 4  # fixture 两台 + nas-x + vps-y
+
+
+async def test_seed_rejects_unknown_upstream_mode(env):
+    import pytest
+
+    site = {"hosts": [{"name": "weird", "ssh_host": "203.0.113.41",
+                       "upstream_mode": "direct-tunnel"}]}
+    with pytest.raises(SystemExit, match="upstream_mode"):
+        await seed_into(env.db, site)
 
 
 async def test_migrations_contain_no_inserts():

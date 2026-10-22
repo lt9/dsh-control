@@ -131,6 +131,19 @@ async def max_frp_remote_port(s: AsyncSession) -> int:
     return (await s.scalar(select(func.max(Instance.frp_remote_port)))) or 0
 
 
+async def host_in_use_ports(s: AsyncSession, host_id: int, *,
+                            exclude_instance_id: int | None = None) -> set[int]:
+    """该机已登记在用的公网端口（frp_remote_port 单表查询，含 released——端口不复用）。
+
+    direct 主机挑端口用（§6.1.4）：占用探测在本机做，库里同机实例占着的端口是
+    另一半事实；purged 实例的登记已清空，天然不在内。"""
+    q = select(Instance.frp_remote_port).where(
+        Instance.host_id == host_id, Instance.frp_remote_port.is_not(None))
+    if exclude_instance_id is not None:
+        q = q.where(Instance.id != exclude_instance_id)
+    return {int(p) for p in (await s.scalars(q)).all() if p}
+
+
 async def all_slugs(s: AsyncSession) -> list[str]:
     return list((await s.scalars(select(Instance.slug))).all())
 

@@ -73,7 +73,28 @@ kit_path = "/srv/dsh-family"
 data_root = "/srv/dsh-data"
 frpc_client_id = "ops.c.nas1@1"
 credential_name = "console-ed25519"
+# 可选三列（不写=旧行为）：
+upstream_mode = "frp"              # frp=走隧道（默认）| direct=本机公网直连（见下节）
+mem_limit = "1g"                   # 实例内存上限，写进实例 .env 的 MEM_LIMIT；留空=kit 默认 4g
+cpu_limit = "2"                    # 实例 CPU 上限，写进实例 .env 的 CPU_LIMIT；留空=kit 默认 4 核
 ```
+
+## 直连主机（upstream_mode=direct）
+
+frp 的存在意义是 NAT 后面的机器；**本身有公网 IP 的主机不需要隧道**。
+`[[hosts]] upstream_mode = "direct"` 时（契约 §6.1.4）：
+
+- 开通第 40 步整步 skipped：不建隧道、`frp_proxy_id` 留空；公网端口仍从
+  `frp_port_start` 同一个池分配并写进 `frp_remote_port`（列名沿用不改），
+  它就是容器在本机发布的端口。
+- 端口占用探测**在目标机上做**：`ss -ltn` 实听 + 库里同机实例在用端口，
+  不再问 frp-panel；恢复时同样先本机实探再赎回原端口。
+- 第 50 步 NG upstream 后端 = `ssh_host:公网端口`（NG 仍在入口机，证书与
+  location 规则一字不变）；第 50 步 detail 会提醒：实例端口在云防火墙上
+  **只对入口机（`DSHC_INGRESS_IP`）放行**——安全组不由本控制台管理，运维在云上补。
+- `mem_limit`/`cpu_limit` 是主机级配额：有值时开通第 60 步写进实例 `.env` 的
+  `MEM_LIMIT`/`CPU_LIMIT`，无值不动（吃 kit 默认 4g/4 核）。**共享机必填**——
+  挤机跑实例不设配额，会把同机基础设施送进 OOM。
 
 ## 换掉 frps / nginxWebUI / 云解析要动什么
 

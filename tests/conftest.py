@@ -467,7 +467,8 @@ async def create_instance(client, extra: dict | None = None, headers: dict | Non
 async def seed_host(db, *, name="nas-1", ssh_host="192.0.2.10", ssh_port=22,
                     ssh_user="ops", data_root="/hdd1/dsh-data",
                     kit_path="/srv/dsh-family", frpc_client_id="ops.c.nas1@1",
-                    enabled=True) -> int:
+                    enabled=True, upstream_mode="frp",
+                    mem_limit=None, cpu_limit=None) -> int:
     from sqlalchemy import select
 
     from dsh_control.db.models import Host
@@ -485,6 +486,8 @@ async def seed_host(db, *, name="nas-1", ssh_host="192.0.2.10", ssh_port=22,
         host.kit_path, host.data_root = kit_path, data_root
         host.frpc_client_id = frpc_client_id
         host.enabled = enabled
+        host.upstream_mode = upstream_mode
+        host.mem_limit, host.cpu_limit = mem_limit, cpu_limit
         await s.commit()
         return host.id
 
@@ -525,6 +528,19 @@ async def env(tmp_path):
 
 async def wait_job(app, job_id: int, timeout: float = 15) -> None:
     await app.state.runner.wait(job_id, timeout)
+
+
+@pytest_asyncio.fixture
+async def direct_env(env):
+    """§6.1.4 直连变体：把主选择主机 nas-1 摆成"自带公网 IP"的机器——
+    upstream_mode=direct，并挂上共享机配额（mem_limit/cpu_limit）。其余一切同 env。"""
+    async with env.db.session() as s:
+        host = await repo.get_host(s, env.host_nas)
+        host.upstream_mode = "direct"
+        host.mem_limit = "1g"
+        host.cpu_limit = "2"
+        await s.commit()
+    return env
 
 
 @pytest_asyncio.fixture
