@@ -144,7 +144,7 @@ class JobCtx:
     """一次 job 执行的全部依赖。flows 只碰这个对象。"""
 
     def __init__(self, db, providers: Any, settings: Settings | None,
-                 job: DeployJob, instance: Instance, host: Host,
+                 job: DeployJob, instance: Instance | None, host: Host,
                  ssh_key_pem: str) -> None:
         self.db = db
         self.s = db.session()
@@ -239,7 +239,8 @@ class JobCtx:
 
     async def event(self, kind: str, message: str = "", data: dict[str, Any] | None = None) -> None:
         await repo.add_event(
-            self.s, kind, instance_id=self.instance.id, job_id=self.job.id,
+            self.s, kind, instance_id=self.instance.id if self.instance else None,
+            job_id=self.job.id,
             message=redact_text(message), data=_scrub(redact(data or {})),
         )
 
@@ -346,13 +347,20 @@ class JobRunner:
                 await s.commit()
                 return
             instance = await repo.get_instance(s, job.instance_id)
-            host = await repo.get_host(s, instance.host_id) if instance else None
+            if job.kind == "publish":
+                # 全站工单（§6.1.5）：不挂实例，instance_id=0；源主机在 params 里。
+                src_id = int((job.params or {}).get("from_host_id") or 0)
+                host = await repo.get_host(s, src_id) if src_id else None
+                if host is not None and not host.enabled:
+                    host = None
+            else:
+                host = await repo.get_host(s, instance.host_id) if instance else None
             ssh_key_pem = ""
             if host and host.ssh_credential_id:
                 from ..db.models import Credential
                 cred = await s.get(Credential, host.ssh_credential_id)
                 ssh_key_pem = (cred.secret or {}).get("private_key_pem", "") if cred else ""
-            if job is None or instance is None or host is None:
+            if job is None or host is None or (instance is None and job.kind != "publish"):
                 job.state = "failed"
                 job.error = "实例或主机不存在"
                 job.finished_at = utcnow()
@@ -371,7 +379,9 @@ class JobRunner:
             # 用外层 session 的实例对象会静默丢失 UPDATE。
             ctx.job = await repo.get_job(ctx.s, job.id)
             ctx.instance = await repo.get_instance(ctx.s, job.instance_id)
-            ctx.host = await repo.get_host(ctx.s, ctx.instance.host_id)
+            ctx.host = (await repo.get_host(ctx.s, ctx.instance.host_id)
+                        if ctx.instance is not None
+                        else await repo.get_host(ctx.s, host.id))
 
         error: str | None = None
         # 面板插件（NG 重试提示这类）拿到的是进程级共享实例，回调签名里塞不进
@@ -429,6 +439,7 @@ class JobRunner:
             j.finished_at = utcnow()
             await s.commit()
             await repo.add_event(
-                s, f"job_{j.kind}_{j.state}", instance_id=j.instance_id, job_id=j.id,
+                s, f"job_{j.kind}_{j.state}", instance_id=j.instance_id or None,
+                job_id=j.id,
                 message=redact_text(error or "完成"),
             )

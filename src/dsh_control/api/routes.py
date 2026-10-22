@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 from ..db import repo
@@ -40,13 +45,18 @@ from .schemas import (
     CreateInstanceRequest,
     DeployRequest,
     LoginRequest,
+    PublishImageRequest,
     PurgeRequest,
+    PutSettingsRequest,
     ReleaseRequest,
     UpdateInstanceRequest,
 )
 
 public_router = APIRouter()
 router = APIRouter()
+# 公开下载路由（§6.1.5）：token 即门票，单独一个 router、不挂会话依赖，
+# 在 main.py 里挂在应用根路径上（/dl/... 不在 /api 下）。
+dl_router = APIRouter()
 
 
 # ---------------------------------------------------------------- 依赖
@@ -588,3 +598,204 @@ async def job_stream(request: Request, job_id: int):
             await asyncio.sleep(0.3)
 
     return EventSourceResponse(generator(), headers={"X-Accel-Buffering": "no"})
+
+
+# ------------------------------------------------------ 面板设置（§6.1.5 / §4）
+
+_SHIP_MODES = ("ssh", "download")
+
+
+@router.get("/settings")
+async def get_settings_api(request: Request) -> dict[str, Any]:
+    """面板运行设置：base_url 返回**解析后的生效值**（空串=站点 public_base 已代入）。"""
+    state = _state(request)
+    async with state.db.session() as s:
+        mode, base = await repo.current_image_ship(s, default_base=state.settings.public_base)
+    return {"image_ship": {"mode": mode, "base_url": base}}
+
+
+@router.put("/settings", dependencies=[Depends(require_xrw)])
+async def put_settings(request: Request, body: PutSettingsRequest) -> dict[str, Any]:
+    """局部更新面板设置：只认 image_ship，写进 site 凭据 secret，deploy 每轮现读。
+
+    mode 非 ssh|download → 422（§4）；base_url 空串=回落站点 public_base。
+    """
+    state = _state(request)
+    if body.image_ship is None:
+        # 只认已知键：整包没有可认的键就原样回当前值，不报错也不写库。
+        return await get_settings_api(request)
+    patch = body.image_ship
+    mode = patch.mode if patch.mode is not None else None
+    if mode is not None and mode not in _SHIP_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "invalid_mode",
+                    "message": f"image_ship.mode 只认 {'|'.join(_SHIP_MODES)}，收到 {mode!r}"})
+    async with state.db.session() as s:
+        ship: dict[str, Any] = {}
+        raw = await repo.get_site_value(s, "image_ship")
+        if isinstance(raw, dict):
+            ship = dict(raw)
+        if mode is not None:
+            ship["mode"] = mode
+        if patch.base_url is not None:
+            ship["base_url"] = patch.base_url.strip().rstrip("/")
+        # 读旧 secret 整包再并上 image_ship 写回——upsert 是整段覆盖，别把
+        # public_base/dns_zone 这些同表兄弟键抹了（§2 seed 落的就是这一行）。
+        cred = await repo.get_credential_by_kind(s, "site")
+        secret = dict(cred.secret) if cred and cred.secret else {}
+        secret["image_ship"] = ship
+        await repo.upsert_credential(
+            s, kind="site", name="site", secret=secret,
+            note="站点描述文件 [site]+[providers] 段的落库镜像")
+    # 回读解析后的生效值（与 GET 同口径）
+    return await get_settings_api(request)
+
+
+def _store_free_bytes(path: str) -> int | None:
+    """制品库所在盘的剩余可写字节（os.statvfs）；目录不存在/读不到返回 None。"""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+@router.get("/images")
+async def list_images(request: Request) -> dict[str, Any]:
+    """制品列表（§4）：url = 解析后 base_url + /dl/{token}/{filename}；附库盘余量。"""
+    state = _state(request)
+    async with state.db.session() as s:
+        arts = await repo.list_artifacts(s)
+        _mode, base = await repo.current_image_ship(s,
+                                                    default_base=state.settings.public_base)
+    items = [serialize.image_artifact_item(a, base_url=base) for a in arts]
+    return {"items": items, "store_free_bytes": _store_free_bytes(state.settings.image_store)}
+
+
+@router.post("/images", dependencies=[Depends(require_xrw)])
+async def publish_image(request: Request, body: PublishImageRequest) -> dict[str, Any]:
+    """发布镜像制品（§6.1.5）→ kind=publish 工单。同 tag 重发=原子替换，旧链接立死。"""
+    state = _state(request)
+    tag = body.tag.strip()
+    if not tag or tag.startswith("-") or " " in tag:
+        raise HTTPException(status_code=422,
+                            detail={"ok": False, "error": "invalid_tag",
+                                    "message": f"镜像标签不合法: {body.tag!r}"})
+    async with state.db.session() as s:
+        host = await repo.get_host(s, body.from_host_id)
+        if host is None or not host.enabled:
+            raise HTTPException(status_code=404,
+                                detail={"ok": False, "error": "host_not_found",
+                                        "message": f"源主机 {body.from_host_id} 不存在或已禁用"})
+        # 全站工单：instance_id=0（§2 deploy_jobs.instance_id 逻辑列，无实例）
+        job = await repo.create_job(s, 0, "publish",
+                                    {"tag": tag, "from_host_id": host.id})
+        await repo.add_event(s, "image_publish_queued",
+                             message=f"发布镜像制品 {tag}（源 {host.name}）已入队",
+                             instance_id=None, job_id=job.id,
+                             data={"tag": tag, "from_host_id": host.id})
+    state.runner.spawn(job.id)
+    return {"job_id": job.id}
+
+
+@router.delete("/images/{artifact_id}", dependencies=[Depends(require_xrw)])
+async def delete_image(request: Request, artifact_id: int) -> dict[str, Any]:
+    """下架（§4）：删行删文件，链接即刻失效。撤销的正当姿势——不设过期，只认这一刀。"""
+    state = _state(request)
+    async with state.db.session() as s:
+        art = await repo.get_artifact(s, artifact_id)
+        if art is None:
+            raise HTTPException(status_code=404,
+                                detail={"ok": False, "error": "artifact_not_found"})
+        filename = art.filename
+        tag = art.tag
+        await repo.delete_artifact(s, art)   # 行先死：此后 token 查不到 → 链接立死
+        await repo.add_event(s, "image_artifact_revoked",
+                             message=f"制品 {tag} 已下架（删行删文件，链接失效）",
+                             instance_id=None,
+                             data={"tag": tag, "filename": filename})
+    # 行没了再删盘上文件：删失败也只是留个孤儿文件，链接已随删行死透。
+    try:
+        (Path(state.settings.image_store) / filename).unlink()
+    except OSError:
+        pass
+    return {"ok": True, "id": artifact_id}
+
+
+# ---------------------------------------------------- 公开下载（§6.1.5，免鉴权）
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
+_DL_CHUNK = 1 << 20
+
+
+def _read_slice(path: Path, start: int, length: int):
+    """从文件 start 起读 length 字节，分块产出——Generator 供 StreamingResponse。"""
+    with path.open("rb") as f:
+        f.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = f.read(min(_DL_CHUNK, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+@dl_router.get("/dl/{token}/{filename}")
+async def download_artifact(request: Request, token: str, filename: str):
+    """公开流式下载制品（§6.1.5）：**token 就是门票**，filename 只做展示名。
+
+    认 token 不认 filename——文件名对不上也照样发（curl -o 会自己命名）。
+    磁盘路径永远 = 表里的 filename join 制品库目录，**绝不接受调用方传路径段**：
+    {filename} 从路由里拿到也不参与拼路径，杜绝 ../ 逃逸。单区间 Range 续传
+    （curl -C - 依赖）；越界 416，多区间/畸形 Range 忽略退化成整发。
+    """
+    state = _state(request)
+    async with state.db.session() as s:
+        art = await repo.get_artifact_by_token(s, token)
+    if art is None:
+        raise HTTPException(status_code=404,
+                            detail={"ok": False, "error": "artifact_not_found"})
+    # filename 只从表里取，caller 传的那个连拼路径的资格都没有（防目录逃逸）。
+    path = Path(state.settings.image_store) / art.filename
+    try:
+        size = (await run_in_threadpool(path.stat)).st_size
+    except OSError:
+        # 行在文件没了（有人手删了盘）：仍 404，不半路吐个空 200。
+        raise HTTPException(status_code=404,
+                            detail={"ok": False, "error": "artifact_file_missing"}) from None
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'attachment; filename="{quote(art.filename)}"',
+    }
+    start, end = 0, size - 1
+    partial = False
+    rng = request.headers.get("range")
+    if rng:
+        m = _RANGE_RE.search(rng)
+        if m:
+            s_raw, e_raw = m.group(1), m.group(2)
+            if s_raw:
+                start = int(s_raw)
+                end = min(int(e_raw), size - 1) if e_raw else size - 1
+            elif e_raw:                       # bytes=-N：末 N 字节
+                n = int(e_raw)
+                start = max(0, size - n)
+                end = size - 1
+            else:
+                start, end = 0, size - 1
+            if start >= size or start > end:
+                return JSONResponse(status_code=416,
+                                    content={"ok": False, "error": "range_not_satisfiable"},
+                                    headers={"Content-Range": f"bytes */{size}"})
+            partial = True
+    length = end - start + 1
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers["Content-Length"] = str(length)
+    gen = _read_slice(path, start, length)
+    return StreamingResponse(gen,
+                             status_code=206 if partial else 200,
+                             media_type="application/octet-stream",
+                             headers=headers)

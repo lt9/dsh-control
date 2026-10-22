@@ -151,3 +151,51 @@ async def ship_image(db: Any, providers: Any, *, tag: str,
     out = await asyncio.to_thread(_ship_sync, src_conn, dst_conn, tag)
     out.update({"src": src_h.name, "dst": dst_h.name, "tag": tag})
     return out
+
+
+# ------------------------------------------------- 制品发布（契约 §6.1.5）
+
+SHIP_PROGRESS_EVERY = 100 << 20   # 每落 ~100MB 回显一行进度（测试可 monkeypatch 调小）
+
+
+def _save_to_store_sync(src_conn: dict, tag: str, dest_path: str,
+                        on_progress=None, bufsize: int = 1 << 20) -> int:
+    """源机 `docker save <tag> | gzip -n` 的 stdout 流进本机 dest_path，返回字节数。
+
+    与 _relay 同一族：直连 subprocess（JSON 执行通道装不下二进制流），临时 0600
+    密钥文件用后即删。只用 gzip——目标机未必有 zstd/xz，curl 与 sha256sum 全员自带。
+    on_progress 从工作线程回调（发布工单里转成任务日志行），不许在这里直接写库。
+    """
+    key = _tmp_key(src_conn["private_key_pem"])
+    total = 0
+    next_mark = SHIP_PROGRESS_EVERY
+    try:
+        sp = subprocess.Popen(
+            [*_ssh_argv(src_conn, key), f"docker save {tag!r} | gzip -n"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert sp.stdout is not None
+        try:
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = sp.stdout.read(bufsize)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+                    if on_progress is not None and total >= next_mark:
+                        next_mark += SHIP_PROGRESS_EVERY
+                        on_progress(total)
+        finally:
+            rc = sp.wait()
+        if rc != 0:
+            err = (sp.stderr.read().decode("utf-8", "replace").strip()
+                   if sp.stderr else "")
+            raise RuntimeError(
+                f"源机 docker save 失败（exit {rc}）——先 cli images ls 确认标签在不在"
+                + (f": {err}" if err else ""))
+        return total
+    finally:
+        try:
+            os.unlink(key)
+        except OSError:
+            pass

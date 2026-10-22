@@ -110,7 +110,17 @@ class AuthState:
 
 
 EXEMPT_PATHS = {"/api/login", "/api/healthz"}
+# 公开前缀（§6.1.5）：制品下载 /dl/{token}/{filename} 免鉴权——token 即门票。
+# 落地方式不是往精确集合里塞条目，而是 main.py 把 dl_router 单独挂在根路径、
+# 不套 _require_session（与 public_router 同德性）；这里登记前缀供路由与文档对账，
+# 任何"按路径批量上锁"的改动都必须连同 EXEMPT_PREFIXES 一起认，别再把它锁回去。
+EXEMPT_PREFIXES = ("/dl/",)
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def is_public_path(path: str) -> bool:
+    """这条路径是否免会话鉴权（精确名单 + 公开前缀）。"""
+    return path in EXEMPT_PATHS or any(path.startswith(p) for p in EXEMPT_PREFIXES)
 
 
 # 只信这些来源送来的转发头。我们的拓扑里请求要么从内网直连进来，要么经

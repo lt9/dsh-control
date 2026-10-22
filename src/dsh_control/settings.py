@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     dsh_image: str = Field(default="",
                            validation_alias=AliasChoices("DSHC_IMAGE", "DSHC_DSH_IMAGE",
                                                          "dsh_image"))
+    # 镜像制品库目录（契约 §6.1.5）：publish 落盘、/dl 下载都只在这下面走。
+    # 未挂载/不可写 = download 模式禁用（发布与搬运直接报错，不静默降级）。
+    image_store: str = "/var/lib/dsh-control/images"   # DSHC_IMAGE_STORE
 
     # ---- provider 注册表选择（site.toml [providers]；noop = 该层人工做，步骤标 skipped）
     provider_dns: str = "noop"        # aliyun | noop
