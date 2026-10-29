@@ -47,6 +47,9 @@ async def test_新建用户一步拿到默认_key():
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(req)
+        if req.url.path == "/v3/meta/user/get":       # 先查：查无此人 → 该建
+            return httpx.Response(404, json={"code": 404, "message": "user_not_found",
+                                             "data": None})
         assert req.url.path == "/v3/meta/user/create"
         assert json.loads(req.content) == {"username": "dshctl-dsh-07",
                                            "user_id": "dshctl-dsh-07"}
@@ -61,16 +64,11 @@ async def test_新建用户一步拿到默认_key():
                    "created": True, "team": "skipped"}
 
 
-async def test_同名用户按_duplicate_entry_幂等短路并补发_key():
+async def test_同名用户先查后建_不靠错误形状认已存在():
     paths: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         paths.append(req.url.path)
-        if req.url.path == "/v3/meta/user/create":
-            # core 对重复 user_id 回 HTTP 409，信封里 message 前缀是机器码
-            return httpx.Response(409, json={
-                "code": 409, "message": "duplicate_entry: user_id exists",
-                "data": None})
         if req.url.path == "/v3/meta/user/get":
             return env({"user_id": "dshctl-dsh-07", "user_type": "normal"})
         if req.url.path == "/v3/meta/user-key/create":
@@ -80,13 +78,41 @@ async def test_同名用户按_duplicate_entry_幂等短路并补发_key():
 
     hub = mk_hub(handler)
     out = await hub.ensure_instance_user("dsh-07")
-    assert paths == ["/v3/meta/user/create", "/v3/meta/user/get",
-                     "/v3/meta/user-key/create"]
+    # 现网 core 对重名回 500 不回 409（2026-10-29 实证）：判据必须是先查后建，
+    # get 命中就认已存在——create 根本不该发生
+    assert paths == ["/v3/meta/user/get", "/v3/meta/user-key/create"]
     assert out["created"] is False and out["user_key"] == "sk-mem-rotated12345"
+
+
+async def test_查无此人才建_竞态被抢建回500也认已存在():
+    paths: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        paths.append(req.url.path)
+        if req.url.path == "/v3/meta/user/get":
+            if paths.count("/v3/meta/user/get") == 1:
+                return httpx.Response(404, json={
+                    "code": 404, "message": "user_not_found: user not found",
+                    "data": None})
+            return env({"user_id": "dshctl-dsh-08", "user_type": "normal"})
+        if req.url.path == "/v3/meta/user/create":
+            # 查后被人抢建：core 只会回 500 internal_error（实机实证）
+            return httpx.Response(500, json={
+                "code": 500, "message": "internal_error", "data": None})
+        if req.url.path == "/v3/meta/user-key/create":
+            return env({"key_id": "key-3", "key_value": "sk-mem-race12345678"})
+        raise AssertionError(f"不该请求 {req.url.path}")
+
+    hub = mk_hub(handler)
+    out = await hub.ensure_instance_user("dsh-08")
+    assert out["created"] is False and out["user_key"] == "sk-mem-race12345678"
 
 
 async def test_拉群失败不毁接线但事实里说破():
     def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v3/meta/user/get":
+            return httpx.Response(404, json={"code": 404, "message": "user_not_found",
+                                             "data": None})
         if req.url.path == "/v3/meta/team-member/add":
             return httpx.Response(404, json={
                 "code": 404, "message": "team_not_found: team-x", "data": None})
@@ -100,6 +126,9 @@ async def test_拉群失败不毁接线但事实里说破():
 
 async def test_成员已存在算成功():
     def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v3/meta/user/get":
+            return httpx.Response(404, json={"code": 404, "message": "user_not_found",
+                                             "data": None})
         if req.url.path == "/v3/meta/team-member/add":
             return httpx.Response(409, json={
                 "code": 409, "message": "member_already_exists", "data": None})
@@ -210,6 +239,9 @@ async def test_dry_run_写动作不发读动作照跑():
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(req.url.path)
+        if req.url.path == "/v3/meta/user/get":   # 读动作照跑：查无此人
+            return httpx.Response(404, json={"code": 404, "message": "user_not_found",
+                                             "data": None})
         assert req.url.path == "/v3/meta/auth/verify"   # 只有读动作能到这里
         return env({"valid": True, "user": {"user_id": "dshctl-dsh-07"}})
 
@@ -217,7 +249,7 @@ async def test_dry_run_写动作不发读动作照跑():
     out = await hub.ensure_instance_user("dsh-07")
     assert out["dry_run"] is True and out["user_key"] == ""
     assert (await hub.verify_key("sk-mem-x000000000"))["valid"] is True
-    assert seen == ["/v3/meta/auth/verify"]
+    assert seen == ["/v3/meta/user/get", "/v3/meta/auth/verify"]
     assert [e.action for e in rec.entries] == ["user/create", "user-key/create"]
 
 

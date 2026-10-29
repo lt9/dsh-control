@@ -388,21 +388,37 @@ class MemoryHub:
         uid = user_id_for(slug)
         created = True
         user_key = ""
+        # 先查后建（2026-10-29 现网实证）：core 对重名回 HTTP 500 internal_error
+        # 而不是 409 duplicate——靠解析错误形状会把「已存在」当故障炸出来。
+        # user/get 存在回用户体、不存在回 404 user_not_found，两态干净，判据用它。
+        exists = False
         try:
-            data = await self._meta("/user/create", {"username": uid, "user_id": uid},
-                                    write=True, action="user/create")
-            user_key = str(data.get("default_user_key") or "")
-            if self.dry_run:
-                user_key = ""
-        except IntegrationError as exc:
-            if "duplicate" not in exc.code and "duplicate" not in exc.detail.lower():
-                raise
-            created = False
             got = await self._meta("/user/get", {"user_id": uid})
-            if str(got.get("user_id") or "") != uid:
-                raise IntegrationError(
-                    f"记忆中枢里 {uid} 建前查重后仍读不到（竞态或存储异常），"
-                    "重跑本步即可", code="user_gone") from exc
+            exists = str(got.get("user_id") or "") == uid
+        except IntegrationError as exc:
+            if exc.code != "user_not_found":
+                raise
+        if exists:
+            created = False
+        else:
+            try:
+                data = await self._meta("/user/create",
+                                        {"username": uid, "user_id": uid},
+                                        write=True, action="user/create")
+                user_key = str(data.get("default_user_key") or "")
+                if self.dry_run:
+                    user_key = ""
+            except IntegrationError as exc:
+                # 竞态兜底：查后被人抢建，core 只会回 500——认已存在前先确认人真在
+                if "duplicate" not in exc.code and "duplicate" not in exc.detail.lower() \
+                        and "internal_error" not in exc.code:
+                    raise
+                created = False
+                got = await self._meta("/user/get", {"user_id": uid})
+                if str(got.get("user_id") or "") != uid:
+                    raise IntegrationError(
+                        f"记忆中枢里 {uid} 建前查重后仍读不到（竞态或存储异常），"
+                        "重跑本步即可", code="user_gone") from exc
         if not user_key:
             k = await self._meta("/user-key/create",
                                  {"user_id": uid, "name": "dsh-control"},
