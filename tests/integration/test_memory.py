@@ -53,7 +53,7 @@ class FakeHub:
     async def core_health(self, *, timeout: float = 5.0) -> bool:
         return self.core_ok
 
-    async def ensure_instance_user(self, slug, *, team_id=""):
+    async def ensure_instance_user(self, slug, *, team_id="", agent_name=""):
         self.ensure_calls.append(f"{slug}|{team_id}")
         if self.fail_ensure:
             from dsh_control.integrations.base import IntegrationError

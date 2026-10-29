@@ -61,7 +61,7 @@ async def test_新建用户一步拿到默认_key():
     hub = mk_hub(handler)
     out = await hub.ensure_instance_user("dsh-07")
     assert out == {"user_id": "dshctl-dsh-07", "user_key": "sk-mem-newuserkey123",
-                   "created": True, "team": "skipped"}
+                   "created": True, "team": "skipped", "agent": "skipped"}
 
 
 async def test_同名用户先查后建_不靠错误形状认已存在():

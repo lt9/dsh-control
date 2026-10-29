@@ -376,7 +376,8 @@ class MemoryHub:
 
     # ---------------------------------------------------------- 用户生命周期
 
-    async def ensure_instance_user(self, slug: str, *, team_id: str = "") -> dict[str, Any]:
+    async def ensure_instance_user(self, slug: str, *, team_id: str = "",
+                                   agent_name: str = "") -> dict[str, Any]:
         """建（或认出）这台实例的业务用户，返回 {user_id, user_key, created, team}。
 
         幂等全押在确定性 user_id 上（core 同名不去重）：
@@ -447,8 +448,31 @@ class MemoryHub:
                 else:
                     # 拉群失败不毁接线：detail 里说破，页面上看得见
                     team = f"failed: {exc.detail or exc.code}"
+        # Agent 实体对齐（2026-10-29）：P0 时代每台实例在 Panel 里有个 owner 是
+        # 业务用户的 Agent（资产按 Agent 隔离的载体），控制台新开通漏建了——
+        # dsh-07 接线成功却在 Agents 管理里缺席。建用户顺手续 Agent，幂等。
+        agent = "skipped"
+        if team_id and not self.dry_run:
+            try:
+                lst = await self._meta("/agent/list", {"team_id": team_id,
+                                                       "page": 1, "page_size": 50})
+                mine = [it for it in (lst.get("items") or [])
+                        if str(it.get("owner_user_id") or "") == uid]
+                if mine:
+                    agent = "exists"
+                else:
+                    await self._meta("/agent/create", {
+                        "team_id": team_id, "owner_user_id": uid,
+                        "name": agent_name or f"{uid}（dsh-control）",
+                        "description": "dsh-control 自动接线",
+                        "visibility": "team"},
+                        write=True, action="agent/create")
+                    agent = "created"
+            except IntegrationError as exc:
+                # 与拉群同口径：Agent 没建成不毁接线，事实里说破
+                agent = f"failed: {exc.detail or exc.code}"
         return {"user_id": uid, "user_key": user_key, "created": created,
-                "team": team}
+                "team": team, "agent": agent}
 
     async def verify_key(self, user_key: str) -> dict[str, Any]:
         """auth/verify：判据是 data.valid，非法 key 也回 200/code=0（不能按 401 分支）。"""
@@ -546,7 +570,8 @@ class NoopMemoryHub:
     async def aclose(self) -> None:
         return None
 
-    async def ensure_instance_user(self, slug: str, *, team_id: str = "") -> dict[str, Any]:
+    async def ensure_instance_user(self, slug: str, *, team_id: str = "",
+                                   agent_name: str = "") -> dict[str, Any]:
         raise IntegrationError(f"{self.reason}（要人工：在 Hub 里手工建 "
                                f"{user_id_for(slug)} 并把 key 登记进凭据）",
                                code="memory_noop")

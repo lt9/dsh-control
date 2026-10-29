@@ -678,7 +678,8 @@ async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
 
     try:
         res = await hub.ensure_instance_user(
-            slug, team_id=str(ctx.settings.memory_team_id or ""))
+            slug, team_id=str(ctx.settings.memory_team_id or ""),
+            agent_name=f"{slug}（DSH 实例）")
     except IntegrationError as exc:
         raise StepFailed(f"记忆中枢建/认用户失败：{exc}"
                          "（user_id 是确定性的 dshctl-<slug>，恢复后重跑本步不会多出用户）"
@@ -693,6 +694,7 @@ async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
         raise StepFailed("记忆中枢没发回可用的 key（user/create 与 user-key/create 都没给 "
                          f"key_value 或形状异常）：查 core 的 key_limit 后重跑本步（幂等，"
                          f"用户 {uid} 不会重复建）")
+    facts["agent"] = str(res.get("agent") or "")
     if res.get("team", "").startswith("failed"):
         await ctx.log("warn", f"业务用户拉进 Team 没成功（{res['team']}）：接线照常，"
                               f"请人工把 {uid} 加进 [memory].team_id 指的 Team")
