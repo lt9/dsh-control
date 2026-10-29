@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# 第一道闸：暂存区。两道防线：文件名形状 + 内容密钥扫描。
+set -euo pipefail
+
+bad=$(git diff --cached --name-only --diff-filter=ACM | grep -E \
+'(^|/)\.env(\.|$)|\.bak([.-]|$)|\.pem$|\.key$|(^|/)id_rsa|\.p12$|\.pfx$|credentials?\.(json|ya?ml|toml)$' || true)
+if [ -n "${bad}" ]; then
+  echo "✗ 这些文件不该进仓（凭据/备份形状）：" >&2
+  echo "${bad}" | sed 's/^/    /' >&2
+  echo "  真要用它们的名字：改名或加进 .gitignore（教训见 .gitleaks.toml 头注）" >&2
+  exit 1
+fi
+
+GL=$(command -v gitleaks || echo "$HOME/.local/bin/gitleaks")
+if [ ! -x "$GL" ]; then
+  echo "✗ 没装 gitleaks，密钥闸无法执行。装一个：见 CONTRIBUTING「密钥扫描」" >&2
+  exit 1
+fi
+# --staged 只看暂存区新增内容；allowlist 在 .gitleaks.toml
+"$GL" protect --staged --redact --exit-code 1 || {
+  echo "✗ 暂存内容里扫到密钥。真实凭据放 .env/secrets/（已 gitignore），别提交。" >&2
+  exit 1
+}

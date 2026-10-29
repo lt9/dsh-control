@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# 第二道闸：推送前扫「这次要离开本机的提交」。
+# 漏网到 commit 层的密钥，在离开机器前拦下（GitHub push protection 只护 GitHub，
+# Gitee/Gogs 不设防——2026-10-29 就是 Gitee 先漏）。
+set -euo pipefail
+GL=$(command -v gitleaks || echo "$HOME/.local/bin/gitleaks")
+[ -x "$GL" ] || { echo "✗ 没装 gitleaks，推送前必须扫（见 CONTRIBUTING）" >&2; exit 1; }
+
+zr=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zr" ] && continue          # 删分支，不用扫
+  if [ "$remote_sha" = "$zr" ]; then
+    opts="$local_sha"                            # 新分支：整条链都要扫
+  else
+    opts="$remote_sha..$local_sha"
+  fi
+  "$GL" detect --source . --redact --exit-code 1 --log-opts="$opts" || {
+    echo "✗ 这次推送的提交里有密钥（上面列出）。改历史（rebase/amend）或走 allowlist，别硬推。" >&2
+    exit 1
+  }
+done

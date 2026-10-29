@@ -3,7 +3,7 @@ UV ?= uv
 MIRROR := https://pypi.tuna.tsinghua.edu.cn/simple
 SITE ?= deploy/site.toml
 
-.PHONY: venv install check migrate init seed serve test lint docker upgrade
+.PHONY: venv install check migrate init seed serve test lint docker upgrade hooks
 
 venv:
 	$(UV) venv .venv || python3 -m venv .venv
@@ -36,6 +36,10 @@ check: lint test
 docker:
 	docker build -t dsh-control:latest .
 
+# clone 之后跑一次：挂上三道密钥闸的本地两道（详见 CONTRIBUTING「密钥扫描」）
+hooks:
+	git config core.hooksPath .githooks
+
 # 上线升级（契约 §6.1.2 同一纪律，管到控制台自己）：升级源必须是干净
 # commit，镜像烙来源 label，compose 钉具体 tag——latest 只是本地开发用。
 #   make upgrade TAG=v0.2.0
@@ -45,6 +49,9 @@ upgrade:
 	@[ -n "$(TAG)" ] || { echo "用法：make upgrade TAG=vX.Y.Z（要落账的升级必须带版本号）"; exit 2; }
 	@git diff --quiet && git diff --cached --quiet || { echo "工作树不干净：升级源必须是 commit。先提交或还原再跑。"; exit 2; }
 	@! git tag -l "$(TAG)" | grep -q . || { echo "tag $(TAG) 已存在，换号"; exit 2; }
+	@GL=$$(command -v gitleaks || echo "$$HOME/.local/bin/gitleaks"); \
+	 [ -x "$$GL" ] || { echo "出网必须过密钥扫描：装 gitleaks（见 CONTRIBUTING）"; exit 2; }; \
+	 "$$GL" detect --source . --redact --exit-code 1 >/dev/null || { echo "全历史密钥扫描未过——这个版本禁止出网"; exit 1; }
 	cd frontend && npm run build
 	docker build --label "dshc.git-rev=$(REV)" --label "org.opencontainers.image.revision=$(REV)" \
 		--label "org.opencontainers.image.version=$(TAG)" \

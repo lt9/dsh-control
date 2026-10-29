@@ -1,0 +1,44 @@
+# 密钥扫描策略（2026-10-29 .env.bak 误提交事件后立的规矩）
+# 三道闸共用这份配置：.githooks/pre-commit、.githooks/pre-push、make upgrade。
+title = "dsh-control 密钥策略"
+
+[extend]
+useDefault = true   # 默认规则已含阿里云 LTAI、AWS、私钥块等
+
+# 本站自造的凭据形状（默认规则不认识的那些）
+[[rules]]
+id = "aliyun-access-key"
+description = "阿里云 AccessKey ID（实测 8.18.4 默认包对「AK=LTAI…」裸写法漏检，自写兜底）"
+regex = '''LTAI[A-Za-z0-9]{12,20}'''
+keywords = ["ltai"]
+
+[[rules]]
+id = "dshc-operator-key"
+description = "dsh-control 操作者密钥"
+regex = '''dshc-[A-Za-z0-9_-]{20,}'''
+keywords = ["dshc-"]
+
+[[rules]]
+id = "memory-user-key"
+description = "记忆中枢用户/管理 key"
+regex = '''sk-mem-[A-Za-z0-9]{12,}'''
+keywords = ["sk-mem-"]
+
+# 豁免：测试与 mock 里的假密钥、文档里的占位符
+[[allowlists]]
+description = "测试与前端 mock"
+regexTarget = "match"
+regexes = [
+  '''(?i)(redacted|changeme|placeholder|your[-_]?(key|token|secret)|dummy|example)''',
+  '''\*{4,}''',                      # 打码样式 sk-mem-hXG0****
+  '''[xX]{6,}''',
+]
+
+[[allowlists]]
+description = "测试目录整体豁免"
+paths = [
+  '''(^|/)tests?/''',
+  '''frontend/mock/''',
+  '''(^|/)conftest\.py$''',
+  '''\.gitleaks\.toml$''',
+]

@@ -36,6 +36,22 @@ VITE_API_TARGET=http://127.0.0.1:13300 npx vite        # 打开 http://127.0.0.1
 [CHANGELOG.md](CHANGELOG.md)，按 [Keep a Changelog](https://keepachangelog.com/) 组织，
 版本号遵循 [SemVer](https://semver.org/)。
 
+## 密钥扫描（三道闸）
+
+2026-10-29 一次 `git add -A` 把 `.env` 备份卷进了公开仓（阿里云主账号 AK 公网挂了
+6 分钟），此后立了机器闸，不靠自觉：
+
+1. **pre-commit**：凭据/备份形状的文件名直接拒（`.env*`、`*.bak*`、`*.pem`……），
+   暂存内容再过 gitleaks；
+2. **pre-push**：扫"这次要离开本机的提交"——GitHub 有 push protection，
+   Gitee/Gogs 没有，这闸对所有远端一视同仁；
+3. **make upgrade**：出网版本前全历史扫一遍，不过不许上线。
+
+启用（clone 后一次）：装 [gitleaks](https://github.com/gitleaks/gitleaks/releases)
+（≥8.24，旧版 allowlist 支持不全）放 `PATH` 或 `~/.local/bin/`，然后 `make hooks`。
+规则与豁免在 [.gitleaks.toml](.gitleaks.toml)；测试与 mock 里的假密钥已豁免，
+新误报往 allowlist 里加，别 `--no-verify` 硬闯。
+
 ## 安全漏洞
 
 不要开公开 issue，见 [SECURITY.md](SECURITY.md)。
