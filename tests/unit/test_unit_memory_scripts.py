@@ -156,3 +156,52 @@ def test_摘后重铺_接得回(tmp_path):
     rc, out = run(mh.script_home_patch(str(tmp_path), "http://x.test/dsh",
                                        model_id="M"))
     assert rc == 0 and "PATCH_WIRED" in out  # 摘干净了，能再接
+
+
+# ---------------------------------------------------------------- 接管（过户）
+
+def test_接管_拆p0段重铺控制台段_邻居段不动(tmp_path):
+    f = tmp_path / "cordis.patch.yml"
+    # 照 dsh-02 实机：P0 段在前，后面压着控制台 agent-team 段
+    f.write_text("# 头注\n# dsh-control-p0: memory-hub 接线\n"
+                 "- id: llm-deepseek\n  config:\n    apiKeyEnv: PROXY_USER_KEY\n"
+                 "    baseURL: http://x.test/dsh\n"
+                 "- id: agent-default-model\n  config: {}\n"
+                 "# dsh-control: 智能体团队由控制台铺设\n- id: team-patch\n",
+                 encoding="utf-8")
+    rc, out = run(mh.script_home_takeover(str(tmp_path), "http://x.test/dsh",
+                                          model_id="M"))
+    assert rc == 0, out
+    assert "TAKEOVER_P0_REMOVED" in out and "PATCH_WIRED" in out
+    body = read(f)
+    assert "# 头注" in body and "team-patch" in body       # 邻居一根毫毛不少
+    assert "dsh-control-p0" not in body
+    assert mh.MEMORY_MARKER in body and mh.MEMORY_MARKER_END in body
+    assert body.count("- id: llm-deepseek") == 1           # 旧段真拆了，不是叠一段
+
+
+def test_接管_幂等_再跑就是已接线(tmp_path):
+    f = tmp_path / "cordis.patch.yml"
+    f.write_text("# dsh-control-p0: 接线\n- id: llm-deepseek\n  config:\n"
+                 "    apiKeyEnv: PROXY_USER_KEY\n    baseURL: http://x.test/dsh\n",
+                 encoding="utf-8")
+    run(mh.script_home_takeover(str(tmp_path), "http://x.test/dsh", model_id="M"))
+    rc, out = run(mh.script_home_takeover(str(tmp_path), "http://x.test/dsh", model_id="M"))
+    assert rc == 0 and "PATCH_ALREADY" in out
+    assert read(f).count("- id: llm-deepseek") == 1
+
+
+def test_接管_切出来不像记忆段就拒绝动手(tmp_path):
+    f = tmp_path / "cordis.patch.yml"
+    original = ("# dsh-control-p0: 谁手滑写的\n- id: someone-else\n"
+                "  config:\n    a: 1\n")
+    f.write_text(original, encoding="utf-8")
+    rc, out = run(mh.script_home_takeover(str(tmp_path), "http://x.test/dsh", model_id="M"))
+    assert rc == 0 and "PATCH_TAKEOVER_UNSAFE" in out
+    assert read(f) == original                              # 拒绝=一字不动
+
+
+def test_接管_没有p0段直说没有(tmp_path):
+    (tmp_path / "cordis.patch.yml").write_text("- id: other\n", encoding="utf-8")
+    rc, out = run(mh.script_home_takeover(str(tmp_path), "http://x.test/dsh", model_id="M"))
+    assert rc == 0 and "TAKEOVER_NO_P0" in out

@@ -626,6 +626,10 @@ async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
     base = memhub.memory_base_url(ctx.settings, getattr(host, "name", ""),
                                   getattr(host, "ssh_host", ""))
     wired = bool(state["memory"] or state["p0"])
+    # 接管语义（2026-10-29 用户点「接管启用」后的更正）：主动点的工单遇到 P0 手写
+    # 段要过户——拆旧段重铺控制台段（下走完整动作序）；开通第 68 步（非 strict）
+    # 维持兼容短路，不折腾存量。
+    takeover = bool(strict and state["p0"] and not state["memory"])
     facts: dict[str, Any] = {
         "skipped": False, "wired": wired,
         "base_url": base if wired else "",
@@ -661,7 +665,8 @@ async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
     want_uid = memhub.user_id_for(slug)
 
     # 幂等短路：补丁在位 + refs 在位 + 台账 key 在 core 侧仍有效 → 只复核不动手
-    if wired and state["refs"] and stored:
+    # （接管在途时不短路：P0 段要换成控制台段才算数）
+    if wired and state["refs"] and stored and not takeover:
         v = await hub.verify_key(stored)
         if v["valid"] and (not v.get("user_id") or v["user_id"] == want_uid):
             facts.update(user_id=v.get("user_id") or want_uid,
@@ -710,24 +715,27 @@ async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
             await ctx.log("info", f"[记忆] {line.strip()}"[:200])
 
     model_id = (ctx.settings.memory_model_id or ctx.settings.llm_model_id or "").strip()
-    if not wired:
+    if not wired or takeover:
         if not base:
             raise StepFailed("出口前缀没解析出来（[memory].proxy_url 为空且无按主机覆盖）："
                              "home 层补丁写不出 baseURL，请先补站点配置")
         if not model_id:
             raise StepFailed("home 层补丁要写 models.id：memory_model_id 与 llm_model_id "
                              "都是空的，补站点配置后重跑（用户和 key 已就位，重跑不重复建）")
+        script = (memhub.script_home_takeover if takeover else memhub.script_home_patch)
         r = await ctx.ssh(f"docker exec {shlex.quote(container)} sh -c "
-                          + shlex.quote(memhub.script_home_patch(home, base,
-                                                                 model_id=model_id)),
+                          + shlex.quote(script(home, base, model_id=model_id)),
                           timeout=120)
         if not r.ok:
             raise StepFailed(f"home 层补丁铺设失败: {r.tail()}")
         out = r.stdout or ""
-        if "PATCH_WIRED" in out:
+        if "PATCH_TAKEOVER_UNSAFE" in out:
+            raise StepFailed("接管拒绝：P0 记号到下一条记号之间切出来的段不像记忆段"
+                             "（缺 apiKeyEnv/baseURL 特征），未做任何改动——请人工核对该段")
+        if "PATCH_ALREADY" in out:
+            facts["patched"] = "memory"
+        elif "PATCH_WIRED" in out:
             facts["patched"] = "laid"
-        elif "PATCH_P0_LEGACY" in out:
-            facts["patched"] = "p0_legacy"
         else:
             facts["patched"] = "memory"
 

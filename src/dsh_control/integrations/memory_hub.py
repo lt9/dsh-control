@@ -167,16 +167,8 @@ def script_refs_merge(dsh_home: str) -> str:
     ])
 
 
-def script_home_patch(dsh_home: str, base_url: str, *, model_id: str,
-                      display_name: str = "家庭模型（经记忆层）") -> str:
-    """home 层补丁：模型出口指向 Proxy。见 marker 就短路（幂等）；见 P0 旧记号也短路
-    并报 P0_LEGACY——兼容判据在编排层，脚本只报事实。
-
-    补丁正文照 P0 四台实机逐字对齐（2026-10-29 从 dsh-02 容器读回）：
-    llm-deepseek 启用 + apiKeyEnv 指 refs 键 + baseURL 不带 /v1；
-    agent-default-model 切到 provider deepseek-official。
-    """
-    f = shlex.quote(f"{dsh_home}/cordis.patch.yml")
+def _home_patch_lay(f: str, base_url: str, model_id: str, display_name: str) -> list[str]:
+    """铺段共用体：heredoc 正文 + 追加 + 报事实。"""
     body = "\n".join([
         "- id: llm-deepseek",
         '  name: "@deepseek-ai/dsh-llm-deepseek-api-key"',
@@ -198,6 +190,26 @@ def script_home_patch(dsh_home: str, base_url: str, *, model_id: str,
         "    reasoningEffort: xhigh",
         MEMORY_MARKER_END,
     ])
+    return [
+        f"{{ echo; echo {shlex.quote(MEMORY_MARKER)}; cat <<'DSHC_MEM_EOF'",
+        body,
+        "DSHC_MEM_EOF",
+        "} >> \"$f\"",
+        "echo '[mem] PATCH_WIRED'",
+        "wc -c \"$f\"",
+    ]
+
+
+def script_home_patch(dsh_home: str, base_url: str, *, model_id: str,
+                      display_name: str = "家庭模型（经记忆层）") -> str:
+    """home 层补丁：模型出口指向 Proxy。见新记号就短路（幂等）；见 P0 旧记号也短路
+    并报 P0_LEGACY——兼容判据在编排层，脚本只报事实。接管走 script_home_takeover。
+
+    补丁正文照 P0 四台实机逐字对齐（2026-10-29 从 dsh-02 容器读回）：
+    llm-deepseek 启用 + apiKeyEnv 指 refs 键 + baseURL 不带 /v1；
+    agent-default-model 切到 provider deepseek-official。
+    """
+    f = shlex.quote(f"{dsh_home}/cordis.patch.yml")
     return "\n".join([
         "set -e",
         f"f={f}",
@@ -205,12 +217,37 @@ def script_home_patch(dsh_home: str, base_url: str, *, model_id: str,
          "echo '[mem] PATCH_ALREADY'; exit 0; fi"),
         (f"if [ -f \"$f\" ] && grep -qF {shlex.quote(P0_MARKER)} \"$f\"; then "
          "echo '[mem] PATCH_P0_LEGACY'; exit 0; fi"),
-        f"{{ echo; echo {shlex.quote(MEMORY_MARKER)}; cat <<'DSHC_MEM_EOF'",
-        body,
-        "DSHC_MEM_EOF",
-        "} >> \"$f\"",
-        "echo '[mem] PATCH_WIRED'",
-        "wc -c \"$f\"",
+        *_home_patch_lay(f, base_url, model_id, display_name),
+    ])
+
+
+def script_home_takeover(dsh_home: str, base_url: str, *, model_id: str,
+                         display_name: str = "家庭模型（经记忆层）") -> str:
+    """接管（详情页点「接管启用」专用）：把手写 P0 段换成控制台段。
+
+    边界口径：从 P0 记号行起，到下一条顶格 `# dsh-control` 记号行之前（没有就
+    到文件尾）。切出来的旧段必须含 P0 段特征（apiKeyEnv/baseURL 两样），不符就
+    PATCH_TAKEOVER_UNSAFE 拒绝动手——宁可拒，不切错别人的段。切完走与
+    script_home_patch 完全相同的铺段正文（单源，不出现两种段）。
+    """
+    f = shlex.quote(f"{dsh_home}/cordis.patch.yml")
+    p0 = shlex.quote(P0_MARKER)
+    return "\n".join([
+        "set -e",
+        f"f={f}",
+        ("if [ ! -f \"$f\" ]; then echo '[mem] TAKEOVER_NOFILE'; exit 0; fi"),
+        (f"if grep -qF {shlex.quote(MEMORY_MARKER)} \"$f\"; then "
+         "echo '[mem] PATCH_ALREADY'; exit 0; fi"),
+        (f"if ! grep -qF {p0} \"$f\"; then echo '[mem] TAKEOVER_NO_P0'; exit 0; fi"),
+        (f"n=$(grep -nF {p0} \"$f\" | head -1 | cut -d: -f1); "
+         "next=$(awk -v n=\"$n\" 'NR>n && /^# dsh-control/{print NR; exit}' \"$f\"); "
+         "last=$([ -n \"$next\" ] && echo $((next-1)) || echo '$'); "
+         "seg=$(sed -n \"${n},${last}p\" \"$f\"); "),
+        ("printf %s \"$seg\" | grep -q apiKeyEnv && printf %s \"$seg\" | grep -q baseURL "
+         "|| { echo '[mem] PATCH_TAKEOVER_UNSAFE'; exit 0; }"),
+        "sed -i \"${n},${last}d\" \"$f\"",
+        "echo '[mem] TAKEOVER_P0_REMOVED'",
+        *_home_patch_lay(f, base_url, model_id, display_name),
     ])
 
 

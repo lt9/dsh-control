@@ -112,8 +112,11 @@ class FakeContainer:
 def old_caps():
     """git HEAD 里的 heredoc 时代模块——对账基线，不作废不重写。"""
     try:
+        # 对账基线钉死在收编前的版本（P3 收编提交 5e22172 的父 2da807e）。
+        # 用 HEAD 会随提交漂移失效——2026-10-29 v0.2.1 当天就被 HEAD 翻篇坑过一次。
         src = subprocess.run(
-            ["git", "show", "HEAD:src/dsh_control/jobs/capabilities.py"],
+            ["git", "show",
+             "2da807e:src/dsh_control/jobs/capabilities.py"],
             capture_output=True, text=True, check=True, cwd=REPO).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
         pytest.skip("需要 git 取 HEAD 里的 heredoc 作对账基线")
@@ -148,7 +151,7 @@ def _git_show(rev_path: str) -> str:
 def test_kit_资产与git_HEAD正文一致():
     """收编不是重写：kit 包里的技能正文必须与 heredoc 时代内嵌文件逐字节相同。"""
     for name in ("SKILL.md", "comfy_generate.py"):
-        head = _git_show(f"HEAD:src/dsh_control/skills/comfy-image/{name}")
+        head = _git_show(f"2da807e:src/dsh_control/skills/comfy-image/{name}")
         assert (REPO / "kit" / "capabilities" / "comfy-image" / name).read_bytes() \
             == head.encode("utf-8")
 
