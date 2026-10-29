@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+import time
 from typing import Any
 
 import httpx
@@ -566,6 +567,38 @@ class NoopMemoryHub:
 
 
 # ---------------------------------------------------------------- 装配
+
+# ---------------------------------------------------------------- admin 身份
+
+# admin key 的持有人缓存（TTL 300s）。Panel 的「我的 team」列表是拿会话里的
+# user_id 去 core 查的（2026-10-29 现网实证）：嵌入应答若回占位名
+# dshctl-console，选择器就永远「团队（0）」——必须回 admin key 的真实主体。
+_ADMIN_ID_TTL = 300.0
+_admin_id_cache: dict[str, tuple[float, str]] = {}
+
+
+async def admin_identity(hub: Any) -> str:
+    """admin key 对应的真实 user_id（auth/verify 用 admin key 照自己）。
+
+    查不到回空串：调用方决定回落形状，这里不炸——身份问不出来不该把
+    免登会话挡死，最差也就是 Panel 里团队列表暂时空着。
+    """
+    key = getattr(hub, "_admin_key", "") or ""
+    if not key:
+        return ""
+    now = time.monotonic()
+    hit = _admin_id_cache.get(key)
+    if hit and now - hit[0] < _ADMIN_ID_TTL:
+        return hit[1]
+    try:
+        v = await hub.verify_key(key)
+    except (IntegrationError, httpx.HTTPError):   # 栈挂/信封错都算问不出来
+        return ""
+    uid = str(v.get("user_id") or "") if v.get("valid") else ""
+    if uid:
+        _admin_id_cache[key] = (now, uid)
+    return uid
+
 
 async def build_memory_hub(s: Any, settings: Any,
                            *, recorder: DryRunRecorder | None = None) -> tuple[Any, str]:

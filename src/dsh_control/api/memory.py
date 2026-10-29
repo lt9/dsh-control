@@ -190,6 +190,24 @@ async def memory_action(request: Request, slug: str,
 # ---------------------------------------------------------------- 成员治理（P4 最小版）
 
 
+@router.get("/memory/panel-identity")
+async def panel_identity(request: Request) -> dict[str, Any]:
+    """Panel 引导会话的「我是谁」：前端挂 iframe 前先问这个。
+
+    与代理 /api/v1/auth/session 同源同理——Panel 拿这个 user_id 去 core 查
+    「我的 team」（2026-10-29 现网实证：写死 dshctl-console 就团队（0））。
+    hub 没配或问不出来回空串，前端按占位名渲染，不砸页面。
+    """
+    uid = ""
+    try:
+        async with request.app.state.db.session() as s:
+            hub, _missing = await memhub.build_memory_hub(s, request.app.state.settings)
+        uid = await memhub.admin_identity(hub) if hub else ""
+    except Exception:  # noqa: BLE001 —— 身份问不出来回空，前端自会回落
+        uid = ""
+    return {"ok": True, "user_id": uid, "display_name": "控制台运维"}
+
+
 @router.get("/memory/members")
 async def memory_members(request: Request) -> dict[str, Any]:
     """业务成员列表：credentials(kind=memory_user_key) 逐条 + Hub 现核。

@@ -148,6 +148,17 @@ def _panel_client(request: Request) -> httpx.AsyncClient:
     return client
 
 
+async def _admin_uid(request: Request) -> str:
+    """admin key 的真实主体 id；hub 没配或问不出来给空串（调用方回落）。"""
+    from ..integrations.memory_hub import admin_identity, build_memory_hub
+    try:
+        async with request.app.state.db.session() as s:
+            hub, _missing = await build_memory_hub(s, request.app.state.settings)
+        return await admin_identity(hub) if hub else ""
+    except Exception:  # noqa: BLE001 —— 身份问不出来照旧应答，不砸免登
+        return ""
+
+
 async def _admin_key(request: Request) -> str:
     """记忆管理 key：与 memory_hub.build_memory_hub 同一找法（先名字后 kind）。"""
     async with request.app.state.db.session() as s:
@@ -224,11 +235,14 @@ async def panel_api(request: Request, path: str) -> StarletteResponse:
     if full == "/api/v1/knowledge/status-callback":
         raise _err(404, "not_found")
     # 免登应答：形状照 ③-A.1.4（auth.ts:116-126），不敲上游。
+    # user_id 必须是 admin key 在 core 里的真实主体（memory_hub.admin_identity：
+    # Panel 拿它查「我的 team」，答占位名就是团队（0））；问不出来才回落。
     if request.method == "GET" and full == "/api/v1/auth/session":
+        uid = await _admin_uid(request) or _ADMIN_USER_ID
         return JSONResponse({
             "ok": True, "authenticated": True, "method": "idp",
-            "instance_id": "default", "user_id": _ADMIN_USER_ID,
-            "user": {"user_id": _ADMIN_USER_ID, "name": _ADMIN_USER_NAME,
+            "instance_id": "default", "user_id": uid,
+            "user": {"user_id": uid, "name": _ADMIN_USER_NAME,
                      "display_name": _ADMIN_USER_NAME},
         })
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, api, type MemoryMember } from "../api/client";
 import { useAsync } from "../lib/hooks";
 import { HoldButton, HelpTip, Icon, ToneChip, Toast, useToast } from "../components/ui";
@@ -43,12 +43,23 @@ export default function MemoryPage() {
   const [credentialLost, setCredentialLost] = useState(false);
   const [frameKey, setFrameKey] = useState(0);
 
-  const openDeep = () => {
-    writePanelSession();          // 先写引导会话，后挂 iframe——顺序就是免登的前提
+  // 挂框前先问服务端「我是谁」：Panel 拿这个 user_id 查「我的 team」，
+  // 写死占位名会永远团队（0）（2026-10-29 现网实证）。问不到就照占位名走。
+  const identityRef = useRef<{ user_id: string; display_name: string } | null>(null);
+  const loadIdentity = async () => {
+    try {
+      const r = await api.panelIdentity();
+      identityRef.current = r.user_id ? { user_id: r.user_id, display_name: r.display_name } : null;
+    } catch { identityRef.current = null; }
+  };
+  const openDeep = async () => {
+    await loadIdentity();
+    writePanelSession(identityRef.current ?? undefined);  // 先写引导会话，后挂 iframe——顺序就是免登的前提
     setDeep(true);
   };
   const reenter = () => {
-    writePanelSession();
+    void loadIdentity();
+    writePanelSession(identityRef.current ?? undefined);
     setCredentialLost(false);
     setFrameKey((k) => k + 1);    // 重挂一次，Panel 重新走 auth/session
   };

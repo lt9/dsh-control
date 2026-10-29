@@ -17,21 +17,29 @@ export interface PanelSession {
   user: { user_id: string; display_name: string };
 }
 
-export function buildPanelSession(): PanelSession {
+/** 占位身份：只在问不到 admin key 真实主体时用（Panel 拿 user_id 去 core 查
+ * 「我的 team」，占位名查出来就是团队（0）——2026-10-29 现网实证）。 */
+export const FALLBACK_PANEL_IDENTITY: PanelSession["user"] = {
+  user_id: "dshctl-console",
+  display_name: "控制台运维",
+};
+
+export function buildPanelSession(user?: PanelSession["user"]): PanelSession {
   return {
     authMethod: "idp",
     instanceId: "default",
     userKey: "",
-    user: { user_id: "dshctl-console", display_name: "控制台运维" },
+    user: user && user.user_id ? user : FALLBACK_PANEL_IDENTITY,
   };
 }
 
 /** 建 iframe **之前**调用（顺序就是契约：先写会话，后挂框，Panel 一睁眼就是登录态）。 */
 export function writePanelSession(
+  user?: PanelSession["user"],
   store: Pick<Storage, "setItem"> = localStorage,
 ): void {
   try {
-    store.setItem(PANEL_SESSION_KEY, JSON.stringify(buildPanelSession()));
+    store.setItem(PANEL_SESSION_KEY, JSON.stringify(buildPanelSession(user)));
   } catch {
     // 隐私模式写不进：iframe 会自己撞登录门，页面不因此崩，也不该把运维登出。
   }

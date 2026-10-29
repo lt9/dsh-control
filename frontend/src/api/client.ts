@@ -481,6 +481,9 @@ export const api = {
   memoryMemberAction: (userId: string, action: "disable" | "reclaim") =>
     http<{ ok: boolean }>(`/memory/members/${encodeURIComponent(userId)}/action`,
       { method: "POST", json: { action } }),
+  /** Panel 引导会话身份（挂 iframe 前问一次；user_id 空串=服务端问不到，前端用占位名）。 */
+  panelIdentity: () =>
+    http<{ ok: boolean; user_id: string; display_name: string }>("/memory/panel-identity"),
 
   // —— 能力目录（api/capabilities.py）——
   capabilities: async (state?: string): Promise<CatalogCapability[]> => {

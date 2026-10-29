@@ -124,6 +124,29 @@ async def test_auth_session_answered_locally(proxied, env):
     assert proxied == []          # 免登应答一次都没敲上游
 
 
+async def test_auth_session_报的是_admin_key_真实主体(env, monkeypatch):
+    # Panel 拿这个 user_id 去 core 查「我的 team」：占位名 dshctl-console 会永远
+    # 团队（0）（2026-10-29 现网实证），应答必须换成 admin key 的真实 id。
+    from dsh_control.api import memory_proxy
+    async def fake_uid(request):
+        return "usr-x0tauaebyo"
+    monkeypatch.setattr(memory_proxy, "_admin_uid", fake_uid)
+    r = await env.client.get("/api/v1/auth/session")
+    body = r.json()
+    assert body["user_id"] == "usr-x0tauaebyo"
+    assert body["user"]["user_id"] == "usr-x0tauaebyo"
+    assert body["user"]["display_name"] == "控制台运维"
+
+
+async def test_auth_session_身份问不到回落占位名(env, monkeypatch):
+    from dsh_control.api import memory_proxy
+    async def dead_uid(request):
+        return ""
+    monkeypatch.setattr(memory_proxy, "_admin_uid", dead_uid)
+    r = await env.client.get("/api/v1/auth/session")
+    assert r.json()["user_id"] == "dshctl-console"
+
+
 async def test_forward_injects_admin_key_and_strips_client_identity(proxied, env):
     # env.client 本就带着真实会话 cookie；代理既不把它转上游，也不让客户端自报身份头。
     assert env.client.cookies.get("dshc_session") is not None
