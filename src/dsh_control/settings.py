@@ -67,6 +67,34 @@ class Settings(BaseSettings):
     # 站点字体库目录：实例宿主机上的绝对路径，开通时 cp -n 进实例 DATA_DIR 的
     # home/.fonts（Word→PDF 两条转换路共同认的投递口）。留空 = 不铺，步骤标 skipped。
     font_library: str = ""            # DSHC_FONT_LIBRARY：站点字体库目录（绝对路径）
+    # 字体库来源主机（hosts.name 或 ssh_host，须唯一命中 enabled 主机）：实例宿主机上
+    # 没有 font_library 目录时，67 步先从这台机器经**控制台内存中转**复制一份到同样的
+    # 路径再铺（tar→控制台→目标，两台机器之间不需要任何互信，形态同 cli images ship）。
+    # 留空 = 老行为：目标机没库目录就记 warning 跳过。
+    font_library_source: str = ""     # DSHC_FONT_LIBRARY_SOURCE
+
+    # ---- 记忆中枢（memory-hub，能力 kind=service；site.toml [memory] 段）
+    # enabled 默认 false：站点没有 [memory] 段时，开通第 68 步标 skipped、
+    # watcher 不探、purge 只保留——行为与引入本功能之前逐字节一致。
+    memory_enabled: bool = False          # DSHC_MEMORY_ENABLED
+    # Core 元数据面基址（控制台直连，如 http://192.0.2.9:8420）：建用户/verify/回收都打它
+    memory_core_url: str = ""             # DSHC_MEMORY_CORE_URL
+    # 实例模型出口前缀（Proxy，不带 /v1——proxy 的 anthropic 转发自己拼 /v1/messages）；
+    # 实例实际 baseURL = proxy_url + "/" + space_id
+    memory_proxy_url: str = ""            # DSHC_MEMORY_PROXY_URL
+    memory_space_id: str = "default"      # DSHC_MEMORY_SPACE_ID（U-1 定案：全家一个 space）
+    # 可选：业务用户建好后拉进这个 Team（Memory Hub 的组织结构，P0 现场是「家庭」team）
+    memory_team_id: str = ""              # DSHC_MEMORY_TEAM_ID
+    # 按主机覆盖出口前缀（{hosts.name 或 ssh_host: 前缀}）：不在记忆栈同网段的机器
+    # 走自己的路（例：云上机器经 frp 隧道口）。命中顺序 name → ssh_host → 默认。
+    memory_host_proxy: dict[str, str] = {}  # DSHC_MEMORY_HOST_PROXY（JSON 对象）
+    # home 层补丁 models 段的模型 id：留空 = 用 llm_model_id（与 kit 现值对齐）
+    memory_model_id: str = ""             # DSHC_MEMORY_MODEL_ID
+    # Panel 同源反代壳的两个坐标（MEMORY-PANEL-EMBED ③-B；memory_proxy.py 用）：
+    # 空串 = 用 memory_proxy 内置缺省（上游 http://192.168.3.109:8125、
+    # dist /opt/dsh-panel/dist）；站点不同才在这显式覆盖
+    memory_panel_base: str = ""           # DSHC_MEMORY_PANEL_BASE
+    memory_panel_dist: str = ""           # DSHC_MEMORY_PANEL_DIST
 
     # ---- 镜像（契约 §6.1.2：镜像是「准备好的版本」，开通阶段永不构建）
     # 默认部署镜像标签（准备好的版本，如 registry.local/dsh:stable）
@@ -135,12 +163,33 @@ def apply_site_overrides(settings: Settings, site: dict[str, Any] | None) -> Set
         "llm_base_url": "llm_base_url", "llm_model_id": "llm_model_id",
         "image_api_url": "image_api_url", "image_backup_url": "image_backup_url",
         "team_max_members": "team_max_members", "font_library": "font_library",
+        "font_library_source": "font_library_source",
         "frp_port_start": "frp_port_start", "prefer_hdd": "prefer_hdd",
         "purge_after_days": "purge_after_days",
+        # 记忆中枢也收 flat 写法（[site].memory_enabled=…）：seed_into 现在只镜像
+        # [site]+[providers]，这条路径不依赖 cli.py 改动，站点可以先这么写。
+        "memory_enabled": "memory_enabled", "memory_core_url": "memory_core_url",
+        "memory_proxy_url": "memory_proxy_url", "memory_space_id": "memory_space_id",
+        "memory_team_id": "memory_team_id", "memory_host_proxy": "memory_host_proxy",
+        "memory_model_id": "memory_model_id",
+        "memory_panel_base": "memory_panel_base", "memory_panel_dist": "memory_panel_dist",
     }
     for src, dst in mapping.items():
         if site.get(src) not in (None, ""):
             setattr(settings, dst, site[src])
+    # [memory] 独立段（docs/SITE-CONFIG.md 的正写）：段内键不带 memory_ 前缀。
+    # 段整体缺省 = 一个字段都不碰，enabled 停在 False——无 [memory] 的站点行为与
+    # 引入本功能之前逐字节一致（enabled 的 False 也照写覆盖，段在就以段为准）。
+    mem = site.get("memory")
+    if isinstance(mem, dict):
+        flat = {"enabled": "memory_enabled", "core_url": "memory_core_url",
+                "proxy_url": "memory_proxy_url", "space_id": "memory_space_id",
+                "team_id": "memory_team_id", "host_proxy": "memory_host_proxy",
+                "model_id": "memory_model_id", "panel_base": "memory_panel_base",
+                "panel_dist": "memory_panel_dist"}
+        for src, dst in flat.items():
+            if src in mem and mem[src] is not None:
+                setattr(settings, dst, mem[src])
     providers = site.get("providers") or {}
     for name, dst in (("dns", "provider_dns"), ("frp", "provider_frp"),
                       ("ng", "provider_ng")):

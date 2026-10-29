@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -84,8 +86,12 @@ def _tmp_key(pem: str) -> str:
 
 
 def _relay(src_proc: subprocess.Popen, dst_proc: subprocess.Popen,
-           bufsize: int = 1 << 20) -> int:
-    """内存管道：src.stdout → dst.stdin，返回搬运字节数。不落盘。"""
+           bufsize: int = 1 << 20, *,
+           src_label: str = "源机 docker save",
+           dst_label: str = "目标机 docker load") -> int:
+    """内存管道：src.stdout → dst.stdin，返回搬运字节数。不落盘。
+
+    报错文案按场景给（docker 搬运之外，字体库中转也走这条管道）。"""
     assert src_proc.stdout is not None and dst_proc.stdin is not None
     total = 0
     try:
@@ -103,10 +109,10 @@ def _relay(src_proc: subprocess.Popen, dst_proc: subprocess.Popen,
             dst_rc = dst_proc.wait()
     if src_proc.returncode != 0:
         raise RuntimeError(
-            f"源机 docker save 失败（exit {src_proc.returncode}）——"
-            "先 cli images ls --host <源机> 确认标签在不在")
+            f"{src_label}失败（exit {src_proc.returncode}）"
+            + ("——先 cli images ls --host <源机> 确认标签在不在" if "docker" in src_label else ""))
     if dst_rc != 0:
-        raise RuntimeError(f"目标机 docker load 失败（exit {dst_rc}）")
+        raise RuntimeError(f"{dst_label}失败（exit {dst_rc}）")
     return total
 
 
@@ -150,6 +156,83 @@ async def ship_image(db: Any, providers: Any, *, tag: str,
         dst_conn = await _host_conn(s, dst_h)
     out = await asyncio.to_thread(_ship_sync, src_conn, dst_conn, tag)
     out.update({"src": src_h.name, "dst": dst_h.name, "tag": tag})
+    return out
+
+
+# ------------------------------------------------- 字体库中转（deploy 67 步）
+
+def _fontlib_install_script(lib: str) -> str:
+    """目标机接 tar.gz 落库：解到 `${lib}.install.$$` 临时目录 → cp -a 并进正式目录
+    → 权限 644/755。先解临时目录再 cp 的意义：**中转断在半路时正式目录原封不动**，
+    下次开通不会把半成品库当成真库直接铺。trap 兜底删临时目录。"""
+    q = shlex.quote(lib)
+    esc = (lib.replace("\\", "\\\\").replace('"', '\\"')
+              .replace("$", "\\$").replace("`", "\\`"))
+    return "\n".join([
+        "set -e",
+        f'tmp="{esc}.install.$$"',
+        'trap \'rm -rf "$tmp"\' EXIT',
+        'rm -rf "$tmp"; mkdir -p "$tmp"',
+        'tar -xzf - -C "$tmp"',
+        f'mkdir -p {q}',
+        f'cp -a "$tmp"/. {q}/',
+        f'find {q} -type d -exec chmod 755 {{}} +',
+        f'find {q} -type f -exec chmod 644 {{}} +',
+        f'echo "[fontlib] FILES=$(find {q} -type f | wc -l)"',
+    ])
+
+
+def _fontlib_relay_sync(src_conn: dict, dst_conn: dict, lib: str) -> dict[str, Any]:
+    """源机 `tar -cf - -C <lib> . | gzip -n` 的 stdout 经本进程内存管道进目标机
+    落库（形态同 _ship_sync：直连 subprocess、临时 0600 密钥用后即删，两台机器
+    之间不需要互信）。只用 gzip——目标机未必有 zstd/xz。"""
+    key_src = key_dst = ""
+    t0 = time.monotonic()
+    try:
+        key_src = _tmp_key(src_conn["private_key_pem"])
+        key_dst = _tmp_key(dst_conn["private_key_pem"])
+        # 管道的退出码是 gzip 的：源机目录不存在时 tar 的失败会被吞掉、
+        # 20 字节的空 gzip 一路"成功"到目标——先 [ -d ] 挡下，exit 41 见名知意。
+        src_cmd = (f"[ -d {shlex.quote(lib)} ] || "
+                   "{ echo 'no font library directory on source' >&2; exit 41; }; "
+                   f"tar -cf - -C {shlex.quote(lib)} . | gzip -n")
+        sp = subprocess.Popen(
+            [*_ssh_argv(src_conn, key_src), src_cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        dp = subprocess.Popen(
+            [*_ssh_argv(dst_conn, key_dst), _fontlib_install_script(lib)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            total = _relay(sp, dp, src_label="源机字体库 tar",
+                           dst_label="目标机字体库落库")
+        except RuntimeError as exc:
+            se = (sp.stderr.read().decode("utf-8", "replace").strip()
+                  if sp.stderr else "")
+            de = (dp.stderr.read().decode("utf-8", "replace").strip()
+                  if dp.stderr else "")
+            extra = f"｜源机: {se[-200:]}" if se else (f"｜目标机: {de[-200:]}" if de else "")
+            raise RuntimeError(f"{exc}{extra}") from None
+        out = dp.stdout.read().decode("utf-8", "replace") if dp.stdout else ""
+        m = re.search(r"FILES=(\d+)", out)
+        return {"bytes": total, "seconds": round(time.monotonic() - t0, 1),
+                "files": int(m.group(1)) if m else -1}
+    finally:
+        for k in (key_src, key_dst):
+            if k:
+                try:
+                    os.unlink(k)
+                except OSError:
+                    pass
+
+
+async def relay_font_library(s: Any, src_ref: str,
+                             dst_conn: dict[str, Any], lib: str) -> dict[str, Any]:
+    """字体库中转：源主机（name 或 ssh_host）→ 控制台内存 → 目标（实例宿主机）。
+    session 由调用方给（deploy 步骤复用 ctx.s）。"""
+    src_h = await find_host(s, src_ref)
+    src_conn = await _host_conn(s, src_h)
+    out = await asyncio.to_thread(_fontlib_relay_sync, src_conn, dst_conn, lib)
+    out["src"] = src_h.name
     return out
 
 

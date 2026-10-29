@@ -287,6 +287,9 @@ upgrade/restore 三个互不重叠；列表行携带与详情相同的
 | `invalid_repo` | 422 | `mirrors.{ch}.repo` 不是 `owner/repo` 形（空串=清掉配置） | 仓库名写错了格式 |
 | `invalid_channel` | 422 | `PUT /api/mirror-tokens/{channel}` 渠道不是 `github|gitee` | 外部渠道只有这两个 |
 | `invalid_token` | 422 | 同上接口，token 是空白 | 令牌栏还空着 |
+| `invalid_action` | 422 | 记忆启停/成员治理的 `action` 不在认列表（enable/disable、disable/reclaim 之外） | 这个动作现在做不了 |
+| `cannot_memory_from_<state>` | 409 | 从非 running 状态发起记忆启停（前缀退化机制同 `cannot_` 家族） | 只有运行中的实例能操作记忆 |
+| `memory_unavailable` | 409 | 站点没配记忆或 admin key 缺料，成员治理动作无处安放 | 记忆中枢还没配好 |
 
 不在表里但会遇到的两种：
 
@@ -431,14 +434,14 @@ sqlite；把库物化成磁盘 conf 的入口是 `/api/nginx/replace`，UI 保�
 | seq | key | 做什么 | 失败怎么办 |
 |---|---|---|---|
 | 10 | `plan` | 生成域名标签（§6.1.1），查 DNS 与库确认未被占用 | 直接失败，无副作用 |
-| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就按设置的分发方式自动搬运（§6.1.5），搬运失败才拦。本步骤**永不构建镜像** | 镜像缺失时会在目标机 load 一份 |
+| 20 | `host_prepare` | SSH 检查主机可达、数据盘剩余空间、dsh-family kit 在位，**并检查 `image_tag` 指向的镜像在本机存在**（`docker image inspect`）；不在就按设置的分发方式自动搬运（§6.1.5），搬运失败才拦。本步骤**永不构建镜像**。kit 脚本同理会**对账换装**：控制台 `kit_releases` 有现行版时比对目标机 `kit/.dshctl-kit-version`，不符就整包下发（只增盖 scripts/compose.yaml/.env.example，不动 `instances/`）；未入库则沿用机器预装 | 同上；kit 下发失败标 error 可重跑 |
 | 30 | `dns_create` | 加 A 记录，回读拿 RecordId | 删掉刚建的记录 |
 | 40 | `frp_create` | 建隧道（remotePort 从 frp_port_start 起递增，先探测 VPS 上未被占用）；**direct 主机整步 skipped**（§6.1.4） | 删刚建的隧道 |
 | 50 | `ng_create` | 建 upstream + 反代站点（location：`$host` + websocket）；upstream 后端：frp 主机=入口机 `ingress_ip:公网端口`，direct 主机=`hosts.direct_backend`（留空=`ssh_host`）`:公网端口`（§6.1.4） | 删刚建的站点/upstream |
 | 60 | `container_deploy` | SSH 跑 `new-instance.sh` + `deploy.sh`，传 `DSH_IMAGE`（选定的镜像） `PUBLIC_URL`/`TRUSTED_HOSTS`；`hosts.mem_limit`/`cpu_limit` 有值时改写实例 `.env` 的 `MEM_LIMIT`/`CPU_LIMIT`（共享机的护栏，§2）；`direct_backend` 有值时改写 `HOST_BIND_IP`、`hosts.llm_base_url` 有值时改写 `LLM_BASE_URL`（§6.1.4） | 保留现场，标 error |
 | 65 | `config_backfill` | 从实例 `.env` 与 docker 端口映射读回**生效值**，覆盖第 10/20 步按猜测写的配置快照 | 读不到不失败，快照自标来源 |
 | 66 | `capabilities` | 铺生图技能与智能体团队（站点没配生图就跳过并记一行警告），并读回 DSH 生效配置 | 缺材料跳过，不挡住开通 |
-| 67 | `fonts` | **铺字体**：把站点字体库（`font_library`）里的文件 `cp -n` 进实例 DATA_DIR 的 `home/.fonts`（容器内 `/data/home/.fonts`，Word→PDF 两条转换路共同认的投递口），落地后文件 644、目录 755。只 cp 不挂载，同名不覆盖。库未配置或宿主上目录不存在 → 记 warning 并跳过，不失败工单 | 记 warning 跳过（铺字体失败才标 error） |
+| 67 | `fonts` | **铺字体**：把站点字体库（`font_library`）里的文件 `cp -n` 进实例 DATA_DIR 的 `home/.fonts`（容器内 `/data/home/.fonts`，Word→PDF 两条转换路共同认的投递口），落地后文件 644、目录 755。只 cp 不挂载，同名不覆盖。宿主上没有库目录时按序取货：①控制台制品库现行版（`fontlib_releases`，同 §6.1.5 形态下发，NAS 宕了不挡开通）；②`font_library_source` 主机经控制台内存中转（兜底，两台机器不需要互信；目标先解临时目录再 cp，半路断线原库不动）；库未配置，或目录不存在且两条取货渠道都没有 → 记 warning 并跳过，不失败工单 | 记 warning 跳过（取货失败标 error，可重跑续建） |
 | 70 | `token_capture` | 从容器日志抓一键地址 | 标 error，可重试 |
 | 80 | `probe_public` | 公网探测：首页 200 + 无 token 打 `/api/remote.mux` 期望 401（403 说明反代 Host 又错了） | 标 degraded，给出修正提示 |
 | 90 | `verify` | 跑 kit 的 `verify.sh <slug>`，收条目数 | 记录，不推翻成功 |
@@ -683,6 +686,8 @@ DSHC_NG_URL / _USER / _PASS
 DSHC_ALIYUN_AK / _SK
 DSHC_SSH_KEY_PATH_NAS8 / _HOST109    init 时读进库，之后从库取
 DSHC_FONT_LIBRARY            站点字体库目录（实例宿主机上的绝对路径；留空 = 开通第 67 步铺字体跳过）
+DSHC_FONT_LIBRARY_SOURCE     字体库来源主机（hosts.name 或 ssh_host）：67 步发现实例宿主机没有库目录时，
+                             从这台经控制台内存中转复制过去再铺；留空 = 没目录直接跳过（老行为）
 DSHC_IMAGE_STORE             镜像制品库目录（§6.1.5），默认 /var/lib/dsh-control/images；未挂载/不可写=download 模式禁用
 DSHC_PURGE_AFTER_DAYS        released 保留天数，默认 15；到期 watcher 自动 purge（§6.4）。库里的值优先（seed 可改，watcher 每轮现读）
 DSHC_DRY_RUN                 1 = 所有外部写操作只打印
@@ -738,3 +743,7 @@ token 默认打码，点一下才展开。
   **界面不轮询抓密钥**；reveal 与自动重抓同守 §3 去重——没变化不产生任何事件。
 - 危险与不可逆动作不用弹窗套弹窗，一屏内把后果说完。
 - 不显示用户用不上的字段（镜像 id、内部状态机原始值这类收进次要位置或不显示）。
+- **界面做减法，解释进 tips**：解释性文字（机制、参数、原理、背景）一律不进页面正文常驻，
+  放进 tips（设置页 `HelpTip` 已有先例），要看了才出现。机制参数（cookie 时长、限流阈值、
+  重试次数）只在错误发生的当下于错误文案里说，不做说明书上墙。唯一例外是失败提示里的
+  下一步指引——那是错误文案的一部分。

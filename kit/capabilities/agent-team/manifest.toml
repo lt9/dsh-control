@@ -1,0 +1,49 @@
+# 智能体团队能力包（ADR-0001 决策二 kind=patch 的落货品；P3 从
+# jobs/capabilities.py 的 _team_patch_script heredoc 收编而来——装法逐条等价：
+# 幂等 marker、镜像里找官方组合包、找不到 skipped、追加成员数覆盖段）。
+id = "agent-team"
+version = "1.0.0"                        # 首次发布定（现网能力此前没有版本概念）
+kind = "patch"
+title = "智能体团队（实验组合包）"
+compatible_dsh = ">=0.2.1-rc.2"          # ADR 决策二示例口径（dsh-family 现锁版本）
+
+# 「默认开」载体：站点没配开关时 desired=present；关停走 site.toml
+# credentials(kind=site) 的 secret capabilities = { agent-team = false }。
+# 第 66 步 apply_capabilities 的 team 开关读的就是这条（engine.site_desires）。
+default_on = true
+
+# 幂等锚点：与 heredoc 时代的 TEAM_MARKER 逐字相同（迁移信号第 4 条）——
+# 现存实例卷里唯一的幂等依据，差一个空格就会把所有历史实例重铺一遍。
+marker = "# dsh-control: 智能体团队（实验组合包）由控制台铺设"
+
+# 观测（决策三）：只认这两行探针。status 用 marker 的子串判「装着」，
+# healthcheck 认成员数覆盖条目在位。
+status = 'grep -qF "dsh-control: 智能体团队" "${DSH_HOME}/cordis.patch.yml"'
+healthcheck = 'grep -q maxMembers "${DSH_HOME}/cordis.patch.yml"'
+
+uninstall = "reverse"
+restart_required = true                  # DSH 只在启动时组合一次配置，铺完必须重启才生效
+
+# 补丁正文不抄进仓库：运行时顺着 dsh 可执行文件解析包根，在镜像里找官方
+# 组合包那一份（现网实测 183 ms 命中；找不到就 skipped，不猜路径）。
+source = { bundle = "@deepseek-ai/dsh-experimental-agent-team-profile", file = "cordis.patch.yml" }
+
+# 追加条目：与 heredoc 逐字等价的同 id 覆盖段——补丁按顺序应用，后面的
+# config 整段替换前面的，把成员数压到家庭机器扛得住的量。
+append = '''
+- id: agent-team
+  name: "@deepseek-ai/dsh-experimental-agent-team"
+  config:
+    maxMembers: {{max_members}}
+    maxTasks: 256
+    maxMessageBytes: 65536
+    disposalTimeoutMs: 5000
+'''
+
+[params]
+on_missing = "skipped"                   # 镜像里找不到官方组合包 → 跳过并说明，不挡开通
+
+[params.max_members]
+type = "integer"
+required = true
+secret = false

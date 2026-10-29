@@ -9,6 +9,7 @@ provider 注册表（docs/SITE-CONFIG.md）：settings.provider_dns/frp/ng 为 `
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 from collections.abc import Awaitable, Callable
@@ -16,6 +17,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from ..assets import install_fontlib, install_kit
 from ..db import repo
 from ..db.models import Credential, Instance
 from ..domain.config_docs import CONFIG_VERSION, default_rendered
@@ -23,10 +25,21 @@ from ..domain.dsh_config import annotate_model_drift
 from ..domain.frp_port import pick_direct_port, pick_free_port
 from ..domain.safety import MUST_BE_DISABLED, config_violations
 from ..domain.slug import derive, dns_rr
+from ..images import relay_font_library
+from ..integrations import memory_hub as memhub
+from ..integrations.base import IntegrationError
 from .capabilities import apply_capabilities, read_dsh_config
 from .capture import capture_token
 from .release import EXTERNAL_ID_FIELDS, clear_external_ids, delete_ng_upstream, idempotent_delete
-from .runner import JobCtx, StepFailed
+from .runner import JobCtx, StepFailed, redact_text
+
+
+def _ep_conn(ctx: JobCtx) -> dict[str, Any]:
+    """本次 job 目标宿主机的高保真连接参数（给 assets 的原生 ssh 管道用——
+    执行器通道是 JSON 文本的，装不下二进制流，见 images._relay 同一族注释）。"""
+    ep = ctx.endpoint()
+    return {"host": ep.host, "port": ep.port, "user": ep.user,
+            "private_key_pem": ep.private_key_pem}
 
 
 def _synthetic_id(v: object) -> bool:
@@ -553,6 +566,321 @@ def _font_cp_script(lib: str, dst: str) -> str:
     ])
 
 
+# ---------------------------------------------------------------- 记忆中枢接线
+# （能力 memory-hub，kind=service：ADR-0001 决策二示例 + docs/site/MEMORY-P0.md）
+#
+# 位置在容器 healthy（60/65）之后、复核（80/90）之前：装的是配置层的东西，
+# home 层补丁与 refs 都落在数据卷里，容器重建不丢；DSH 只在启动时组合一次配置，
+# 所以「新铺了补丁」必须重启一次容器才生效——这一步自己负责重启与等健康。
+#
+# 缺料（无 [memory] 段 / admin key 没登记 / 栈不通）→ 整步 skipped + 一行警告 +
+# 事件，**不挡开通**（先例：第 66 步生图技能）。running 实例上的启用/停用走
+# kind="memory" 工单重跑同一套机器（jobs/runner 注册点在 main.py，lead 接）。
+
+async def _memory_data_home(ctx: JobCtx, container: str) -> str:
+    """容器里的 DSH_HOME（口径同 capabilities：只认容器自己的 ENV，不猜路径）。"""
+    r = await ctx.ssh(f"docker exec {shlex.quote(container)} sh -c "
+                      + shlex.quote('printf %s "${DSH_HOME:-/data}"'), timeout=60)
+    return (r.stdout or "").strip().rstrip("/") or "/data"
+
+
+async def _memory_restart_apply(ctx: JobCtx, container: str) -> None:
+    """铺/摘 home 层补丁后重启容器让配置重组，并等回健康（先例：restart 工单 10/20 步）。"""
+    rt = ctx.runtime()
+    r = await rt.restart(container, line_sink=ctx.buffered_sink(_buf := []))
+    await ctx.flush_lines(_buf)
+    await ctx.log("info", f"docker restart -> exit {r.code}")
+    if not r.ok:
+        raise StepFailed(f"容器重启失败（记忆补丁已落卷，不丢）: {r.tail()}")
+    deadline = float(ctx.settings.wait_healthy_seconds)
+    waited = 0.0
+    interval = max(0.05, float(getattr(ctx.settings, "wait_healthy_interval", 2.0)))
+    while waited < deadline:
+        snap = await rt.inspect(container)
+        if snap is not None and snap.state == "running" and snap.health in ("healthy", "none"):
+            return
+        await asyncio.sleep(interval)
+        waited += interval
+    raise StepFailed(f"{deadline:.0f}s 内容器仍未恢复健康（补丁已落卷）："
+                     "容器起来后重跑本步/本工单即可（幂等）")
+
+
+async def memory_wiring(ctx: JobCtx, inst: Any, host: Any, container: str,
+                        *, strict: bool = False) -> dict[str, Any]:
+    """记忆接线本体（幂等）。返回事实 dict，由调用方决定 skipped/failed 与重启。
+
+    动作序（全成才算接线）：Hub 建/认用户（确定性 user_id=dshctl-<slug>）→
+    台账 upsert(kind=memory_user_key) → key 走 stdin docker exec 合并写 refs →
+    home 层补丁指 baseURL（新 marker；P0 旧 marker 认作已接线）→ auth/verify 回读。
+
+    strict=True（详情页点「启用」的工单）：缺料一律 StepFailed——用户主动点的动作
+    不能静默跳过；strict=False（开通第 68 步）：缺料 skipped，不挡开通。
+    """
+    slug = inst.slug
+    home = await _memory_data_home(ctx, container)
+    r = await ctx.ssh(f"docker exec {shlex.quote(container)} sh -c "
+                      + shlex.quote(memhub.script_patch_state(home)), timeout=60)
+    state = memhub.parse_patch_state(r.stdout or "")
+    hub, missing = await memhub.build_memory_hub(
+        ctx.s, ctx.settings, recorder=getattr(ctx.providers, "recorder", None))
+    base = memhub.memory_base_url(ctx.settings, getattr(host, "name", ""),
+                                  getattr(host, "ssh_host", ""))
+    wired = bool(state["memory"] or state["p0"])
+    facts: dict[str, Any] = {
+        "skipped": False, "wired": wired,
+        "base_url": base if wired else "",
+        "user_id": "", "key_masked": "", "patched":
+            "memory" if state["memory"] else ("p0_legacy" if state["p0"] else ""),
+        "restarted": False, "verified": False,
+    }
+    if hub is None or getattr(hub, "manual_required", False):
+        why = missing or getattr(hub, "reason", "") or "记忆层为 noop"
+        if strict:
+            raise StepFailed(f"{why}——这是主动点的「启用」，缺料必须先补，不静默跳过")
+        facts.update(skipped=True, reason=why)
+        return facts
+    # 探活：core /health + Proxy TCP。TCP 探的是站点默认出口（控制台视角）——
+    # 按主机覆盖的出口（如经隧道）控制台未必够得着，不装能测，容器侧首条消息即见分晓。
+    core_ok = await hub.core_health()
+    proxy_ok = await memhub.probe_tcp(str(ctx.settings.memory_proxy_url or ""))
+    if not core_ok or not proxy_ok:
+        why = ("记忆栈不通（core "
+               f"{'通' if core_ok else '不通'} / Proxy "
+               f"{'通' if proxy_ok else '不通'}）：本次跳过记忆接线，实例其他功能不受影响"
+               "——栈恢复后重跑开通，或在详情页点「启用记忆」")
+        if strict:
+            raise StepFailed(why.replace("本次跳过记忆接线", "启用失败")
+                             + "；实例未做任何改动")
+        facts.update(skipped=True, reason=why)
+        return facts
+
+    cred = await repo.get_credential_by_name(ctx.s, memhub.credential_name_for(slug))
+    stored = ""
+    if cred is not None and cred.kind == "memory_user_key":
+        stored = str((cred.secret or {}).get("user_key") or "")
+    want_uid = memhub.user_id_for(slug)
+
+    # 幂等短路：补丁在位 + refs 在位 + 台账 key 在 core 侧仍有效 → 只复核不动手
+    if wired and state["refs"] and stored:
+        v = await hub.verify_key(stored)
+        if v["valid"] and (not v.get("user_id") or v["user_id"] == want_uid):
+            facts.update(user_id=v.get("user_id") or want_uid,
+                         key_masked=memhub.mask_key(stored), verified=True,
+                         detail=("记忆已接线，key 复核有效（auth/verify 通过），本次不重铺"
+                                 + ("；接线为 P0 手工版（旧记号 # dsh-control-p0，"
+                                    "状态里认作已接线）" if state["p0"] else "")))
+            return facts
+
+    try:
+        res = await hub.ensure_instance_user(
+            slug, team_id=str(ctx.settings.memory_team_id or ""))
+    except IntegrationError as exc:
+        raise StepFailed(f"记忆中枢建/认用户失败：{exc}"
+                         "（user_id 是确定性的 dshctl-<slug>，恢复后重跑本步不会多出用户）"
+                         ) from exc
+    uid = str(res.get("user_id") or want_uid)
+    key = str(res.get("user_key") or "")
+    facts["user_id"] = uid
+    if res.get("dry_run"):
+        facts.update(skipped=True, reason="dry-run：Hub 写动作只记录未发送，容器侧未改动")
+        return facts
+    if not memhub.key_shape_ok(key):
+        raise StepFailed("记忆中枢没发回可用的 key（user/create 与 user-key/create 都没给 "
+                         f"key_value 或形状异常）：查 core 的 key_limit 后重跑本步（幂等，"
+                         f"用户 {uid} 不会重复建）")
+    if res.get("team", "").startswith("failed"):
+        await ctx.log("warn", f"业务用户拉进 Team 没成功（{res['team']}）：接线照常，"
+                              f"请人工把 {uid} 加进 [memory].team_id 指的 Team")
+
+    await repo.upsert_credential(
+        ctx.s, kind="memory_user_key", name=memhub.credential_name_for(slug),
+        secret={"user_key": key, "user_id": uid},
+        note=f"实例 {slug} 的业务 key（记忆中枢用户 {uid}；停用=回收，记忆数据在 Hub 卷）")
+    await ctx.s.commit()
+
+    # 业务 key 进容器只走 stdin（不进 argv、不进日志、不进目标机 ps——ADR 硬规则 3）
+    r = await ctx.ssh(f"docker exec -i {shlex.quote(container)} sh -c "
+                      + shlex.quote(memhub.script_refs_merge(home)),
+                      timeout=120, stdin=f"{key}\n", quiet=True)
+    if not r.ok:
+        raise StepFailed(f"合并写 .credentials.yaml refs 失败（records 段没动过）: "
+                         f"{r.tail()}")
+    for line in (r.stdout or "").splitlines():
+        if line.strip():
+            await ctx.log("info", f"[记忆] {line.strip()}"[:200])
+
+    model_id = (ctx.settings.memory_model_id or ctx.settings.llm_model_id or "").strip()
+    if not wired:
+        if not base:
+            raise StepFailed("出口前缀没解析出来（[memory].proxy_url 为空且无按主机覆盖）："
+                             "home 层补丁写不出 baseURL，请先补站点配置")
+        if not model_id:
+            raise StepFailed("home 层补丁要写 models.id：memory_model_id 与 llm_model_id "
+                             "都是空的，补站点配置后重跑（用户和 key 已就位，重跑不重复建）")
+        r = await ctx.ssh(f"docker exec {shlex.quote(container)} sh -c "
+                          + shlex.quote(memhub.script_home_patch(home, base,
+                                                                 model_id=model_id)),
+                          timeout=120)
+        if not r.ok:
+            raise StepFailed(f"home 层补丁铺设失败: {r.tail()}")
+        out = r.stdout or ""
+        if "PATCH_WIRED" in out:
+            facts["patched"] = "laid"
+        elif "PATCH_P0_LEGACY" in out:
+            facts["patched"] = "p0_legacy"
+        else:
+            facts["patched"] = "memory"
+
+    v = await hub.verify_key(key)
+    if not v["valid"] or (v.get("user_id") and v["user_id"] != uid):
+        raise StepFailed(f"发回的 key 过不了 auth/verify 回读（valid={v['valid']}"
+                         f"，期望用户 {uid}）：core 侧问题，恢复后重跑本步即可"
+                         "（key 会补发一把新的，旧的留在 Hub 台账里）")
+    facts.update(verified=True, wired=True, base_url=base,
+                 key_masked=memhub.mask_key(key))
+    await ctx.event("memory_wired",
+                    f"记忆中枢接线完成：用户 {uid} 出口 {base}"
+                    + (f"；Team 拉群 {res.get('team')}" if res.get("team") else ""),
+                    {"user_id": uid, "key_masked": memhub.mask_key(key),
+                     "base_url": base, "patched": facts["patched"],
+                     "team": res.get("team", "")})
+    return facts
+
+
+async def memory_wiring_step(ctx: JobCtx, inst: Any, host: Any, container: str,
+                             st: Any, *, strict: bool = False) -> dict[str, Any]:
+    """把 memory_wiring 的返回落成步骤三态；新铺补丁时负责重启与等健康。"""
+    facts = await memory_wiring(ctx, inst, host, container, strict=strict)
+    if facts["skipped"]:
+        st.state = "skipped"
+        st.detail = facts["reason"]
+        await ctx.log("warn", facts["reason"])
+        await ctx.event("memory_wiring_skipped", facts["reason"],
+                        {"slug": inst.slug})
+        await ctx.s.commit()
+        return facts
+    bits = []
+    if facts.get("patched") == "laid":
+        bits.append(f"home 层补丁新铺（marker {memhub.MEMORY_MARKER}，baseURL "
+                    f"{facts['base_url']}）")
+    elif facts.get("patched") == "p0_legacy":
+        bits.append("认 P0 手工接线为已接线（旧记号 # dsh-control-p0），未重复铺段")
+    elif facts.get("patched") == "memory":
+        bits.append("home 层补丁早已在位，本次只补 key/refs 或复核")
+    if facts.get("user_id"):
+        bits.append(f"用户 {facts['user_id']}（key {facts.get('key_masked') or '未变'}）")
+    if facts.get("verified"):
+        bits.append("auth/verify 回读通过")
+    if facts.get("detail"):
+        bits = [facts["detail"]]
+    st.detail = "；".join(b for b in bits if b)[:500]
+    if facts.get("patched") == "laid":
+        await ctx.log("info", "home 层补丁新铺：重启容器让 DSH 重组配置"
+                              "（只在启动时组合一次，不重启这次接线不算生效）")
+        await _memory_restart_apply(ctx, container)
+        facts["restarted"] = True
+        st.detail += "；已重启容器并确认健康"
+    await ctx.s.commit()
+    return facts
+
+
+async def run_memory(ctx: JobCtx) -> None:
+    """记忆启用/停用工单（job kind="memory"，params {"action": "enable"|"disable"}）。
+
+    running 实例上可反复重跑：enable 是全套接线（幂等），disable 是
+    「回收业务 key（U-7：停用＝回收）+ 摘容器接线 + 重启还原直连」。
+    两种动作都不删记忆数据——数据永远在 Hub 卷里，重新 enable 就接回来。
+    """
+    inst = ctx.instance
+    host = ctx.host
+    slug = inst.slug
+    container = inst.container_name or derive(slug, ctx.settings.dns_zone).container
+    action = str((ctx.job.params or {}).get("action") or "").strip()
+    if action not in ("enable", "disable"):
+        raise StepFailed(f'memory 工单 params.action={action!r}，只认 "enable"/"disable"'
+                         "（从详情页重新发起即可，工单不改参数重跑）")
+
+    if action == "enable":
+        async with ctx.step(10, "memory_wiring", "启用记忆（接线）") as st:
+            facts = await memory_wiring_step(ctx, inst, host, container, st, strict=True)
+        if facts.get("restarted"):
+            async with ctx.step(20, "token_capture", "重抓登录密钥") as st:
+                tok = await capture_token(ctx.s, ctx.runtime(), inst, "restart")
+                if tok.changed:
+                    st.detail = "接线重启后已抓到最新一键地址"
+                    await ctx.event("token_captured", "记忆接线重启后重抓登录密钥",
+                                    {"source": "restart", "url": tok.url,
+                                     "token": tok.token})
+                else:
+                    st.detail = "登录密钥与库里最新值一致（未轮换）：不落新行、不记事件"
+        else:
+            st2 = await repo.add_step(ctx.s, ctx.job.id, 20, "token_capture",
+                                      "重抓登录密钥")
+            st2.state = "skipped"
+            st2.detail = "本次没重启容器（本来就接好线），密钥没轮换"
+            await ctx.s.commit()
+        return
+
+    # ---- disable：回收 key（Hub 侧）→ 摘容器接线 → 重启还原直连 → 重抓 token
+    async with ctx.step(10, "memory_revoke", "停用业务用户（回收 key）") as st:
+        hub, missing = await memhub.build_memory_hub(
+            ctx.s, ctx.settings, recorder=getattr(ctx.providers, "recorder", None))
+        if hub is None or getattr(hub, "manual_required", False):
+            raise StepFailed(f"记忆中枢不可达（{missing or getattr(hub, 'reason', '')}）："
+                             "停用要在 Hub 侧回收 key。补好站点配置重跑本工单，"
+                             "或去 Hub 面板人工回收（容器侧这步失败可重跑，未做改动）")
+        uid = memhub.user_id_for(slug)
+        try:
+            rv = await hub.revoke_user_keys(uid)
+        except IntegrationError as exc:
+            raise StepFailed(f"回收 {uid} 的 key 失败：{exc}（重跑本工单即可，幂等——"
+                             "已回收的不会重复回收）") from exc
+        if rv["failed"]:
+            detail = "；".join(f"{f['key_id']}: {f['why']}" for f in rv["failed"])
+            raise StepFailed(f"回收不完整：{detail}。若是 last_key_cannot_revoke，"
+                             f"是 core 保护「用户至少留一把 key」——去 Hub 删除用户 {uid} "
+                             "或人工回收后再重跑本工单")
+        st.detail = (f"用户 {uid}：回收 {len(rv['revoked'])} 把 active key"
+                     "（记忆数据留在 Hub 卷里，本控制台从不删；重新启用即接回）")
+        await ctx.event("memory_user_disabled",
+                        f"业务用户 {uid} 已停用（回收 {len(rv['revoked'])} 把 key）",
+                        {"user_id": uid, "revoked": rv["revoked"]})
+        await ctx.s.commit()
+
+    async with ctx.step(20, "memory_strip", "摘容器接线（还原直连）") as st:
+        home = await _memory_data_home(ctx, container)
+        r = await ctx.ssh(f"docker exec {shlex.quote(container)} sh -c "
+                          + shlex.quote(memhub.script_home_strip(home)),
+                          timeout=120)
+        if not r.ok:
+            raise StepFailed(f"摘除容器接线失败（未做改动或改动可重跑）: {r.tail()}")
+        out = r.stdout or ""
+        st.detail = "；".join(ln.strip() for ln in out.splitlines()
+                              if ln.strip())[:500]
+        if "PATCH_P0_LEGACY" in out:
+            await ctx.log("warn", "P0 手工段没有结束记号，段没敢自动摘（记忆通路已因回收 key "
+                                  "而停用）：要完全还原直连，人工删该段与 refs 键后重启，"
+                                  "或先「启用」再「停用」一次让控制台接管")
+        if "RESTART_NEEDED" in out:
+            await ctx.log("info", "容器接线有改动：重启还原直连")
+            await _memory_restart_apply(ctx, container)
+            async with ctx.step(30, "token_capture", "重抓登录密钥") as st30:
+                tok = await capture_token(ctx.s, ctx.runtime(), inst, "restart")
+                if tok.changed:
+                    st30.detail = "还原直连重启后已抓到最新一键地址"
+                    await ctx.event("token_captured", "记忆停用重启后重抓登录密钥",
+                                    {"source": "restart", "url": tok.url,
+                                     "token": tok.token})
+                else:
+                    st30.detail = "登录密钥与库里最新值一致（未轮换）：不落新行、不记事件"
+        else:
+            st2 = await repo.add_step(ctx.s, ctx.job.id, 30, "token_capture",
+                                      "重抓登录密钥")
+            st2.state = "skipped"
+            st2.detail = "容器侧没有可摘的接线（可能本来就未接线或 P0 手工段），未重启"
+            await ctx.s.commit()
+
+
 async def run_deploy(ctx: JobCtx) -> None:
     inst = ctx.instance
     host = ctx.host
@@ -678,6 +1006,33 @@ async def run_deploy(ctx: JobCtx) -> None:
             # 都办不到才拦（文案点名着手指路 + 附该机现有镜像）。
             await _ship_missing_image(
                 ctx, host, image, _have_dsh_images(r_img.stdout))
+        # kit 脚本版本化（和镜像同一思路，§6.1.2）：入库后控制台是唯一事实源，
+        # 目标机 .dshctl-kit-version 标记不符就当场整包下发——只增盖 scripts/、
+        # compose.yaml、.env.example，绝不动 instances/（实例目录是运行时状态）。
+        # 控制台还没入库 → 沿用机器预装，只记一行 info，不失败工单（存量零冲击）。
+        kit_rel = await repo.current_kit_release(ctx.s)
+        if kit_rel is None:
+            await ctx.log("info", "[kit] 控制台未入库 kit 版本，沿用机器预装"
+                                  "（dsh-control kit publish --dir <kit仓库> 可入库）")
+        else:
+            r_kit = await ctx.ssh(
+                f"cat {shlex.quote(kit)}/{'.dshctl-kit-version'} "
+                "2>/dev/null || echo MISSING", timeout=60)
+            have_v = (r_kit.stdout or "").strip().splitlines()
+            have_v = have_v[-1].strip() if have_v else "MISSING"
+            if have_v == kit_rel.version:
+                await ctx.log("info", f"[kit] 版本已是最新 {have_v}")
+            else:
+                await ctx.log("info", f"[kit] 机器版本 {have_v!r} ≠ 现行 {kit_rel.version}："
+                                      "整包下发（只增盖脚本与模板，不动 instances/）")
+                try:
+                    info = await install_kit(_ep_conn(ctx), kit_rel.files,
+                                             kit_rel.version, kit)
+                except RuntimeError as e:
+                    raise StepFailed(f"kit 下发失败: {e}") from None
+                await ctx.log("info", f"[kit] {kit_rel.version} 就位"
+                                      f"（{info['files']} 个文件 / "
+                                      f"{max(1, info['bytes'] >> 10)} KiB 压缩）")
         rendered = default_rendered(
             slug=slug, public_url=public_url, trusted_hosts=[dns_name],
             container_port=0, frp_remote_port=0, data_dir=data_dir,
@@ -939,6 +1294,60 @@ async def run_deploy(ctx: JobCtx) -> None:
 
     # ---- 60 container_deploy：跑 kit 的 new-instance.sh + deploy.sh。
     # 契约：此步失败「保留现场，标 error」——从这里开始不再回滚已建对象。
+    # ---- 58 capability_gate：兼容闸门（ADR-0001 决策五：升级不静默越过不兼容）。
+    # 只对「台账里有 desired=present 的能力」的实例有意义；目标版本从镜像 tag
+    # 解析（tag 里取 semver 前缀），解析不出或没货 → skipped
+    # 并在 detail 说破（闸门宁可不咬，不瞎咬）。
+    async with ctx.step(58, "capability_gate", "能力兼容闸门") as st:
+        from sqlalchemy import func
+        from sqlalchemy import select as sa_select
+
+        from ..db.models import Capability, InstanceCapability
+        from ..integrations import capability_engine as capeng
+        n_caps = await ctx.s.scalar(
+            sa_select(func.count()).select_from(InstanceCapability)
+            .where(InstanceCapability.instance_id == inst.id,
+                   InstanceCapability.desired_state == "present"))
+        image_ref = str((ctx.job.params or {}).get("image")
+                        or ctx.settings.dsh_image or "")
+        target = ""
+        tail_tag = image_ref.rsplit(":", 1)[-1] if ":" in image_ref else ""
+        for chunk in tail_tag.replace("-", ".").split("."):
+            import re as _re
+            if _re.match(r"^\d+$", chunk):
+                continue
+            break
+        cand = ".".join(tail_tag.replace("-", ".").split(".")[:3])
+        if capeng.parse_version(cand) is not None:
+            target = cand
+        if not n_caps:
+            st.state = "skipped"
+            st.detail = "台账里没有启用的能力：闸门无事可咬"
+        elif not target:
+            st.state = "skipped"
+            st.detail = f"目标镜像 tag「{image_ref}」里解析不出 DSH 版本：闸门跳过（升级后由能力工单的现读自检兜底）"
+        else:
+            blockers: list[str] = []
+            rows = (await ctx.s.scalars(
+                sa_select(InstanceCapability).where(
+                    InstanceCapability.instance_id == inst.id,
+                    InstanceCapability.desired_state == "present"))).all()
+            for led in rows:
+                cap = await ctx.s.scalar(
+                    sa_select(Capability).where(
+                        Capability.capability_id == led.capability_id,
+                        Capability.current.is_(True)))
+                if cap is None or not cap.compatible_dsh:
+                    continue
+                if not capeng.satisfies(target, cap.compatible_dsh):
+                    blockers.append(
+                        f"{cap.capability_id}@{cap.version} 要求 {cap.compatible_dsh}，"
+                        f"目标 {target} 不满足")
+            if blockers:
+                raise StepFailed("兼容闸门拦截：" + "；".join(blockers)
+                                 + "——先禁用该能力再升级，或换镜像")
+            st.detail = f"{n_caps} 项能力对目标 DSH {target} 全部兼容"
+
     async with ctx.step(60, "container_deploy", "主机上部署容器（kit 脚本）"):
         ctx.rollback_actions.clear()
         kit = host.kit_path
@@ -1120,7 +1529,11 @@ async def run_deploy(ctx: JobCtx) -> None:
     # 放在容器部署之后：DATA_DIR 此刻已由 kit 脚本按生效值建好（口径同 65 步，
     # 优先读实例 .env 的 DATA_DIR，读不到才按 data_root 拼）。对已 running 的
     # 实例重复部署（redeploy 切镜像）同样跑：cp -n 幂等，只可能新增、绝不覆盖。
-    # 库没配 / 宿主上没这个目录 → 记 warning 跳过，不失败工单（先例：生图技能）。
+    # 库没配 → 记 warning 跳过，不失败工单（先例：生图技能）。
+    # 库目录不在实例宿主机上，按序取货：①控制台制品库的现行版（fontlib_releases，
+    # NAS 宕了也不挡开通）；②font_library_source 主机经控制台内存中转（兜底，
+    # 形态同 cli images ship）；两者都没有 → warning + skipped。取货失败=铺字体
+    # 失败，标 error 可重跑——配了货还缺字体是真故障，不静默。
     async with ctx.step(67, "fonts", "铺字体") as st:
         lib = (ctx.settings.font_library or "").strip().rstrip("/")
         if not lib:
@@ -1131,22 +1544,145 @@ async def run_deploy(ctx: JobCtx) -> None:
         else:
             facts = await env_facts(ctx, slug)   # 同 65 步口径：DATA_DIR 认机器上的事实
             dst = f"{(facts.get('DATA_DIR') or data_dir).rstrip('/')}/{_FONT_DST_REL}"
+            obtained = ""
             r = await ctx.ssh(_font_cp_script(lib, dst), timeout=600)
             if not r.ok:
                 raise StepFailed(f"铺字体失败: {r.tail()}")
             out = r.stdout or ""
             if "[fonts] LIB_MISSING" in out:
-                st.state = "skipped"
-                st.detail = (f"字体库目录 {lib} 在主机 {host.name} 上不存在："
-                             "本次跳过铺字体，实例其他功能不受影响")
-                await ctx.log("warn", st.detail)
-            else:
+                src_ref = (ctx.settings.font_library_source or "").strip()
+                rel = await repo.current_fontlib_release(ctx.s)
+                store_file = (f"{ctx.settings.image_store.rstrip('/')}/{rel.filename}"
+                              if rel is not None else "")
+                if rel is not None and not os.path.isfile(store_file):
+                    await ctx.log("warn", f"账上有字体库制品 {rel.version}，制品库文件却不在"
+                                          f"（{store_file}）：降级走兜底渠道")
+                    rel = None
+                if rel is not None:
+                    await ctx.log("info", f"宿主 {host.name} 上没有字体库：从控制台制品库"
+                                          f"下发 {rel.version}（{rel.file_count} 个文件 / "
+                                          f"{max(1, rel.size_bytes >> 20)} MiB）")
+                    info = await install_fontlib(_ep_conn(ctx), store_file, lib)
+                    obtained = (f"从制品库 {rel.version} 下发 {info['files']} 个文件"
+                                f"落库 {lib}；")
+                    await ctx.log("info", obtained.rstrip("；"))
+                elif src_ref and src_ref in (host.name, host.ssh_host):
+                    raise StepFailed(
+                        f"字体库来源主机就是实例宿主机自己（{src_ref}），"
+                        f"但库目录 {lib} 不存在：先把字体库入库"
+                        "（dsh-control fontlib publish）或在那台机器备好库")
+                elif src_ref:
+                    await ctx.log(
+                        "info",
+                        f"宿主 {host.name} 上没有字体库：从 {src_ref} 中转复制"
+                        "（源机→控制台内存→目标，两台机器之间不需要互信）")
+                    relay = await relay_font_library(ctx.s, src_ref, _ep_conn(ctx), lib)
+                    obtained = (f"已从 {relay['src']} 中转：搬 "
+                                f"{max(1, relay['bytes'] >> 20)} MiB"
+                                f"/{relay['seconds']}s，落库 {relay['files']} 个文件"
+                                f"到 {lib}；")
+                    await ctx.log("info", obtained.rstrip("；"))
+                else:
+                    st.state = "skipped"
+                    st.detail = (f"字体库目录 {lib} 在主机 {host.name} 上不存在，"
+                                 "制品库也没有现行制品、没配 font_library_source："
+                                 "本次跳过铺字体，实例其他功能不受影响")
+                    await ctx.log("warn", st.detail)
+            if st.state != "skipped":
+                if obtained:
+                    # 库刚落到本机：再跑同一遍 cp（cp -n 幂等，形态不变）
+                    r = await ctx.ssh(_font_cp_script(lib, dst), timeout=600)
+                    if not r.ok:
+                        raise StepFailed(f"铺字体失败（落库后）: {r.tail()}")
+                    out = r.stdout or ""
+                    if "[fonts] LIB_MISSING" in out:
+                        raise StepFailed(f"字体库落库后仍报库目录不存在：{lib}")
                 new = _FONT_NEW_RE.search(out)
-                st.detail = (f"{lib} → {dst}：本次新增 "
+                st.detail = (obtained + f"{lib} → {dst}：本次新增 "
                              f"{new.group(1) if new else '?'} 个文件"
                              "（cp -n 不覆盖同名，文件 644 / 目录 755）")
                 await ctx.log("info", st.detail)
             await ctx.s.commit()
+
+    # ---- 68 memory_wiring：记忆中枢接线（能力 memory-hub，kind=service）
+    # 位置：容器 healthy（60/65）之后、复核（80/90）之前。装的是配置层的东西，
+    # 数据全在卷里；新铺 home 层补丁时本步自己重启容器并等健康（token 还没抓，
+    # 第 70 步抓的就是重启后的最新值）。缺料 → skipped + 警告事件，**不挡开通**
+    # （先例：第 66 步生图）。P0 手工接线的台子认作已接线（兼容判据：home 层里
+    # 有旧记号 "# dsh-control-p0"，见 integrations/memory_hub.py）。
+    mem_facts: dict[str, Any] = {}
+    async with ctx.step(68, "memory_wiring", "记忆中枢接线") as st:
+        mem_facts = await memory_wiring_step(ctx, inst, host,
+                                             inst.container_name or names.container, st)
+        await ctx.s.commit()
+
+    # ---- 69 capability_apply：默认能力铺装（ADR-0001 决策二：speckit 默认开）。
+    # 只铺目录里 published 且 site 未关的能力（desired 由 provision_default_ledger
+    # 立账，已有行不覆盖=实例级可关）。目录是空的 → skipped 不挡开通（先例 66/68）。
+    async with ctx.step(69, "capability_apply", "铺默认能力（spec-kit 等）") as st:
+        from ..db.models import utcnow
+        from ..integrations import capability_engine as capeng
+        from .capabilities import capability_ledger, capability_row, capability_secrets
+        site_row = await repo.get_credential_by_kind(ctx.s, "site")
+        created = await capeng.provision_default_ledger(
+            ctx.s, inst.id, (site_row.secret or {}) if site_row else {})
+        # 期望态全量：不止本次新建的行——续跑要对存量 desired=present 逐行核对
+        from sqlalchemy import select as sa_select69
+
+        from ..db.models import InstanceCapability as IC69
+        want_rows = (await ctx.s.scalars(sa_select69(IC69).where(
+            IC69.instance_id == inst.id,
+            IC69.desired_state == "present"))).all()
+        if not want_rows:
+            st.state = "skipped"
+            st.detail = ("站点默认能力目录是空的（kit 没随包发能力，或都被站点关了）："
+                         "跳过铺装，等 dsh-control capability publish 发货后"
+                         "在页面点「启用」即可")
+            await ctx.log("warn", st.detail)
+        else:
+            rt69 = ctx.runtime()
+            ctn69 = inst.container_name or names.container
+            home69 = await capeng.read_dsh_home(ctx.ssh, ctn69)
+            laid: list[str] = []
+            if created:
+                laid.append(f"新立期望 {len(created)} 项")
+            # P3 过渡期：这两包由第 66 步带站点参数亲铺（69 步裸 apply 必缺料），
+            # 这里只登记不重铺；两包改走工单制后删掉这个排除集
+            _HELD_BY_66 = {"agent-team", "comfy-image"}
+            for led0 in want_rows:
+                cap_id = led0.capability_id
+                if cap_id in _HELD_BY_66:
+                    laid.append(f"{cap_id} 由 66 步带参铺（此处跳过）")
+                    continue
+                cap = await capability_row(ctx.s, cap_id)
+                man = dict(cap.manifest or {})
+                secrets = await capability_secrets(ctx.s, cap_id)
+                dsh_ver, source = await capeng.read_dsh_version(rt69, ctn69)
+                if cap.compatible_dsh and (
+                        not dsh_ver or not capeng.satisfies(dsh_ver, cap.compatible_dsh)):
+                    laid.append(f"{cap_id} 跳过（DSH {dsh_ver or '现读不到'} 不在 "
+                                f"{cap.compatible_dsh}，source={source}）")
+                    continue
+                resolved = capeng.resolve_params(man, {}, secrets)
+                res = await capeng.run_action(ctx.ssh, ctn69, man, home69, "apply",
+                                              resolved, kit_dir=host.kit_path or "",
+                                              version=cap.version)
+                # 探针回读写台账（成没成以探针为准；69 步与 66/30 步同一口径）
+                obs = await capeng.run_probe(ctx.ssh, ctn69, man, home=home69,
+                                             values={})
+                led69 = await capability_ledger(ctx.s, inst.id, cap_id)
+                led69.installed = bool(obs["installed"])
+                led69.enabled = bool(obs["enabled"])
+                led69.observed_version = obs["observed_version"]
+                led69.marker_present = bool(obs["marker_present"])
+                led69.health = obs["health"]
+                led69.health_detail = redact_text(str(obs["health_detail"]))[:400]
+                led69.observed_at = utcnow()
+                await ctx.s.commit()
+                laid.append(f"{cap_id}@{cap.version} {res.state}"
+                            f"（探针 installed={obs['installed']} "
+                            f"health={obs['health']}）")
+            st.detail = "；".join(laid)[:500]
 
     # ---- 70 token_capture：从容器日志抓一键地址（标 error，可重试）
     async with ctx.step(70, "token_capture", "从容器日志抓登录密钥"):
@@ -1194,13 +1730,18 @@ async def run_deploy(ctx: JobCtx) -> None:
         # 期望端点：主机登记了覆盖就用覆盖（§6.1.4：云上机器拨不到局域网网关，
         # 覆盖值是人写进库里的，走的是自家 frps 隧道——换门不换网关，授权成立）。
         expect_llm = (host.llm_base_url or "").strip() or ctx.settings.llm_base_url
-        bad = config_violations(gate.stdout or "", base_url=expect_llm)
+        # 记忆已接线（本次铺的或 P0 旧记号认出的）：模型出口合法值多一个——自家
+        # Proxy。没接线的台子传空串，判定与今天逐字节一致。
+        expect_mem = str(mem_facts.get("base_url") or "") if mem_facts.get("wired") else ""
+        bad = config_violations(gate.stdout or "", base_url=expect_llm,
+                                memory_base_url=expect_mem)
         if bad:
             raise StepFailed("安全门不通过（花钱/外传这两条不外包给脚本）：\n  - "
                              + "\n  - ".join(bad))
         await ctx.log("info", f"安全门：{len(MUST_BE_DISABLED)} 条云端路径确认已断开，"
                               f"模型端点确认为 {expect_llm}"
-                              + ("（主机登记的入口覆盖）" if host.llm_base_url else ""))
+                              + ("（主机登记的入口覆盖）" if host.llm_base_url else "")
+                              + (f"；记忆出口确认为 {expect_mem}" if expect_mem else ""))
 
         r = await ctx.ssh(f"cd {shlex.quote(host.kit_path)} && "
                           f"./scripts/verify.sh {shlex.quote(slug)}", timeout=300)

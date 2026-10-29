@@ -432,7 +432,9 @@ class JobRunner:
                 # release/purge 失败不许把实例改判 error：它们的前态（released）
                 # 本身就是可停留状态，purge 还要能重跑或改走恢复（契约 §6.4
                 # 「记 error，可重跑」说的是工单）。deploy/restart 才落 error。
-                if inst and j.kind not in ("release", "purge"):
+                # memory 工单同理：启停失败时容器一直在正常服务，把人家的
+                # running 改判红牌是误导——工单红与 last_error 说清就够了。
+                if inst and j.kind not in ("release", "purge", "memory"):
                     await repo.set_instance_state(s, inst, "error", last_error=error[:2000])
                 elif inst:
                     inst.last_error = error[:2000]

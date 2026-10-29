@@ -8,6 +8,8 @@ import DetailPage from "./pages/DetailPage";
 import NewPage from "./pages/NewPage";
 import SettingsPage from "./pages/SettingsPage";
 import JobPage from "./pages/JobPage";
+import MemoryPage from "./pages/MemoryPage";
+import CapabilityPage from "./pages/CapabilityPage";
 
 const router = createBrowserRouter([
   { path: "/login", element: <App /> },
@@ -17,6 +19,8 @@ const router = createBrowserRouter([
       { path: "/instances/new", element: <NewPage /> },
       { path: "/instances/:id", element: <DetailPage /> },
       { path: "/jobs/:id", element: <JobPage /> },
+      { path: "/memory", element: <MemoryPage /> },
+      { path: "/capabilities", element: <CapabilityPage /> },
       { path: "/settings", element: <SettingsPage /> },
       { path: "*", element: <Navigate to="/" replace /> },
     ],

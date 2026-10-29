@@ -62,6 +62,14 @@ export default function JobPage() {
             台账这一条与它的工单、事件都留着，只读——要再用只能新建一台。</p>
         </div>
       )}
+      {job?.state === "succeeded" && kind === "memory" && (
+        <div className="card done-panel">
+          <h2>{q.get("op") === "disable" ? "记忆已停用" : q.get("op") === "enable" ? "记忆已启用" : "记忆启停完成"}</h2>
+          <p className="mut">{q.get("op") === "disable"
+            ? <>容器里的记忆注入已拆下，这台不再读写记忆；<b>已有的记忆原样留在 Hub</b>，回来启用就接上。</>
+            : <>这台已经接上记忆中枢：新会话会带上他的历史记忆。<br />回去详情页的「记忆」小块能看到接线状态变成已接。</>}</p>
+        </div>
+      )}
       {job?.state === "succeeded" && kind === "publish" && (
         <div className="card done-panel">
           <h2>已发布</h2>

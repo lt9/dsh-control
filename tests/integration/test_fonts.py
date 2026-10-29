@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 
+from dsh_control.db import repo
 from dsh_control.integrations.base import ExecResult
 from tests.conftest import XRW, create_instance, wait_job
 
@@ -140,3 +141,181 @@ async def test_redeploy_relay_keeps_no_clobber_and_does_not_break(env):
         "任何一次铺字体都不许丢掉防覆盖参数"
     d2 = (await env.client.get(f"/api/instances/{body['instance_id']}")).json()
     assert d2["state"] == "running", d2["last_error"]
+
+
+# ---------------------------------------------------------------- 中转（font_library_source）
+
+async def test_font_step_skips_without_source_when_dir_missing(env, monkeypatch):
+    """目录缺失 + 没配 font_library_source：老口径不变——warning + skipped，
+    一次中转都不发起（存量站零行为变化）。"""
+    from dsh_control.jobs import deploy as dep
+    calls: list = []
+    monkeypatch.setattr(dep, "relay_font_library",
+                        lambda *a, **k: calls.append(a))
+    env.settings.font_library = "/srv/no-such-fonts"
+    env.settings.font_library_source = ""
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "skipped" and "font_library_source" in st["detail"]
+    assert not calls, "没配来源主机就不该发起中转"
+
+
+async def test_font_step_relays_library_from_source_host(env, monkeypatch):
+    """目录缺失 + 配了来源主机：先经控制台内存中转把库复制到实例宿主机
+    （形态同 images ship），再跑第二次 cp 铺进投递口；中转与铺设两段都记账。"""
+    env.settings.font_library = "/srv/dsh-fonts"
+    env.settings.font_library_source = "host-2"   # 实例按 prefer_hdd 落 nas-1
+    calls: list[dict] = []
+
+    async def fake_relay(s, src_ref, dst_conn, lib):
+        calls.append({"src_ref": src_ref, "dst_conn": dict(dst_conn), "lib": lib})
+        # 中转"完成"后，假主机上再有铺字体命令就报库在了
+        env.providers.executor.handlers[:] = [
+            (p, (ExecResult(0, "[fonts] DONE src=/srv/dsh-fonts "
+                               "dst=/hdd1/dsh-data/dsh-01/home/.fonts new=97\n", "")
+                 if "[fonts] LIB_MISSING" in r.stdout else r))
+            for p, r in env.providers.executor.handlers]
+        return {"bytes": 372 << 20, "seconds": 41.2, "files": 97, "src": "host-2"}
+
+    monkeypatch.setattr("dsh_control.jobs.deploy.relay_font_library", fake_relay)
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "succeeded", st["detail"]
+
+    assert len(calls) == 1, "只该中转一次"
+    assert calls[0]["src_ref"] == "host-2"
+    assert calls[0]["lib"] == "/srv/dsh-fonts"
+    dst = calls[0]["dst_conn"]
+    assert (dst["host"], dst["port"], dst["user"]) == ("192.0.2.10", 2333, "ops"), dst
+    assert dst["private_key_pem"], "中转必须带实例宿主机的 SSH 私钥"
+
+    assert "中转" in st["detail"] and "host-2" in st["detail"], st["detail"]
+    assert "本次新增 97 个文件" in st["detail"], st["detail"]
+    # 中转后第二次 cp 仍然是防覆盖形态
+    assert all(NO_CLOBBER.search(c) for c in _font_cmds(env))
+    lines = await _log_lines(env, body["job_id"])
+    assert any("中转" in ln and "host-2" in ln for ln in lines), lines
+
+
+async def test_font_relay_failure_fails_the_step(env, monkeypatch):
+    """中转本身失败 = 铺字体失败：步骤标 failed、工单失败（可重跑续建），
+    绝不静默降级成 skipped——配了来源主机还缺字体是真故障。"""
+    async def broken_relay(s, src_ref, dst_conn, lib):
+        raise RuntimeError("源机字体库 tar失败（exit 2）")
+    monkeypatch.setattr("dsh_control.jobs.deploy.relay_font_library", broken_relay)
+    env.settings.font_library = "/srv/dsh-fonts"
+    env.settings.font_library_source = "host-2"
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "failed", job
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "failed" and "exit 2" in (st["detail"] or "")
+
+
+async def test_font_relay_source_is_instance_host_fails_clearly(env):
+    """来源主机填成了实例宿主机自己：目录缺失本来就无解，报错要说破，
+    不许拿着同一台机器做中转空转。"""
+    env.settings.font_library = "/srv/dsh-fonts"
+    env.settings.font_library_source = "nas-1"
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "failed", job
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "failed" and "就是实例宿主机自己" in (st["detail"] or "")
+
+
+# ------------------------------------------------ 制品库优先（资产分发）
+
+async def _seed_fontlib(env, version: str, filename: str) -> None:
+    async with env.db.session() as s:
+        await repo.add_fontlib_release(s, version=version, filename=filename,
+                                       size_bytes=380 << 20, sha256="0" * 64,
+                                       file_count=97, origin="nas-8")
+
+
+def _flip_to_done(env) -> None:
+    env.providers.executor.handlers[:] = [
+        (p, (ExecResult(0, "[fonts] DONE src=/srv/dsh-fonts "
+                           "dst=/hdd1/dsh-data/dsh-01/home/.fonts new=97\n", "")
+             if "[fonts] LIB_MISSING" in r.stdout else r))
+        for p, r in env.providers.executor.handlers]
+
+
+async def test_font_step_prefers_artifact_over_relay(env, tmp_path, monkeypatch):
+    """制品库有现行版且文件在库：走下发，不再碰 font_library_source——
+    NAS 宕了也不挡开通，这就是把字体纳进制品库的意义。"""
+    env.settings.font_library = "/srv/dsh-fonts"
+    env.settings.font_library_source = "host-2"   # 来源也在，但制品库优先
+    env.settings.image_store = str(tmp_path)
+    (tmp_path / "fontlib-t1.tar.gz").write_bytes(b"\x1f\x8b gz")
+    await _seed_fontlib(env, "fontlib-t1", "fontlib-t1.tar.gz")
+    artifact_calls: list[dict] = []
+
+    async def fake_install(conn, store_file, lib):
+        artifact_calls.append({"conn": dict(conn), "store_file": store_file,
+                               "lib": lib})
+        _flip_to_done(env)
+        return {"files": 97}
+
+    async def no_relay(*a, **k):
+        raise AssertionError("制品库有货就不该走来源机中转")
+
+    monkeypatch.setattr("dsh_control.jobs.deploy.install_fontlib", fake_install)
+    monkeypatch.setattr("dsh_control.jobs.deploy.relay_font_library", no_relay)
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "succeeded", st["detail"]
+    assert len(artifact_calls) == 1
+    assert artifact_calls[0]["store_file"] == str(tmp_path / "fontlib-t1.tar.gz")
+    assert artifact_calls[0]["lib"] == "/srv/dsh-fonts"
+    assert artifact_calls[0]["conn"]["host"] == "192.0.2.10"
+    assert "制品库 fontlib-t1" in st["detail"], st["detail"]
+    assert "本次新增 97 个文件" in st["detail"]
+    assert all(NO_CLOBBER.search(c) for c in _font_cmds(env))
+
+
+async def test_font_step_falls_back_to_relay_when_artifact_file_missing(
+        env, tmp_path, monkeypatch):
+    """账上有、仓库里文件没了（制品库被清盘）：warning 点名，降级走中转，
+    不静默、也不硬拦开通。"""
+    env.settings.font_library = "/srv/dsh-fonts"
+    env.settings.font_library_source = "host-2"
+    env.settings.image_store = str(tmp_path)   # 空目录：文件不在
+    await _seed_fontlib(env, "fontlib-gone", "fontlib-gone.tar.gz")
+
+    async def no_install(*a, **k):
+        raise AssertionError("文件不在库，不该发起下发")
+
+    async def fake_relay(s, src_ref, dst_conn, lib):
+        _flip_to_done(env)
+        return {"bytes": 360 << 20, "seconds": 40.0, "files": 97, "src": "host-2"}
+
+    monkeypatch.setattr("dsh_control.jobs.deploy.install_fontlib", no_install)
+    monkeypatch.setattr("dsh_control.jobs.deploy.relay_font_library", fake_relay)
+    env.providers.executor.handlers.insert(
+        0, (FONT_MARK, ExecResult(0, "[fonts] LIB_MISSING\n", "")))
+
+    body = await _deploy(env)
+    job = await _job(env, body["job_id"])
+    assert job["state"] == "succeeded", job["error"]
+    st = next(s for s in job["steps"] if s["key"] == "fonts")
+    assert st["state"] == "succeeded" and "中转" in st["detail"], st["detail"]
+    lines = await _log_lines(env, body["job_id"])
+    assert any("fontlib-gone" in ln and "降级" in ln for ln in lines), lines

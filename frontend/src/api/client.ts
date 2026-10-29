@@ -5,7 +5,7 @@
 export type InstanceState =
   | "pending" | "deploying" | "running" | "unhealthy"
   | "restarting" | "released" | "purged" | "error";
-export type JobKind = "deploy" | "release" | "restart" | "purge" | "publish";
+export type JobKind = "deploy" | "release" | "restart" | "purge" | "publish" | "memory" | "capability";
 // §4：deploy 工单的来路，服务端入队时按当时状态写死（新建 / running 续建 / released 恢复）。
 // 工单页的标题与完成文案看这个，不看 URL——手敲链接、分享链接也得说对话。
 export type JobPurpose = "create" | "upgrade" | "restore";
@@ -156,6 +156,49 @@ export interface ImageArtifact {
 }
 export interface ImageList { items: ImageArtifact[]; store_free_bytes: number | null }
 
+/** GET /instances/{slug}/memory（api/memory.py 落地形状）：三层事实分开给——
+ *  enabled/missing 是站点配没配；wired/legacy_p0 是容器里的接线事实；hub 是栈探活。
+ *  wired=null 是宿主机够不着（容器侧事实未知），不是「没接」。 */
+export interface MemoryStatus {
+  ok: boolean; slug: string;
+  enabled: boolean; missing: string;
+  wired: boolean | null; legacy_p0: boolean | null;
+  user: { user_id: string; key_masked: string; key_status: "valid" | "invalid" | "absent" | null } | null;
+  hub: { core_ok: boolean; proxy_tcp: boolean | null; error?: string } | null;
+  last_job: { id: number; state: string; params: Record<string, unknown> } | null;
+}
+
+/** /memory 页成员治理行（批量路由定稿形状）：hub 够不着时 key_status=null、
+ *  state="unknown"，hub_note 是人话原因（属于错误文案，可直接上屏）。 */
+export interface MemoryMember {
+  slug: string; user_id: string; key_masked: string;
+  key_status: "valid" | "invalid" | "absent" | null;
+  state: "active" | "disabled" | "unknown";
+  hub_note: string;
+}
+
+/** 能力目录行（api/capabilities.py）：一行一个「能力+版本」，current 打星。
+ *  params 是 manifest 的 schema 字典，secret 项后端只标不显值。 */
+export interface CatalogCapability {
+  capability_id: string; version: string; kind: string;
+  title: string; state: string; current: boolean;
+  compatible_dsh: string; on_missing: string; kit_version: string;
+  note: string; params: Record<string, unknown>;
+  default_on: boolean; restart_required: boolean;
+}
+
+/** 实例能力台账行 + 后端算好的对账结论（drift/unknown_version 前端照字段渲染，不自己推）。 */
+export interface InstanceCapability {
+  capability_id: string; title: string; kind: string;
+  desired_state: "present" | "absent"; desired_version: string; want_version: string;
+  installed: boolean; enabled: boolean; observed_version: string; marker_present: boolean;
+  health: string; health_detail: string; reason: string; last_job_id: number | null;
+  observed_at: string | null; in_catalog: boolean;
+  drift: boolean; unknown_version: boolean;
+  /** 后端给的按钮依据（人话标签：升级|重试 / 启用|禁用 / 卸载）。 */
+  actions: string[];
+}
+
 export class ApiError extends Error {
   status: number;
   /** §4.1 机器码（响应里有的话）。文案由前端自己组织，需要按码分情况的界面认这个，
@@ -220,16 +263,28 @@ async function http<T>(
 const ERR_ZH: Record<string, string> = {
   bad_key: "运维密钥不对",
   unauthenticated: "登录过期了，重新登录",
+  rate_limited: "试得太快，等一分钟再试",
   not_found: "找不到了，回台账看看",
   confirm_mismatch: "页面数据过期了，刷新后再试",
   already_released: "已经释放过了",
   cannot_purge: "只有已释放的实例能彻底释放",
   cannot_restart: "当前状态不能重启",
   cannot_deploy: "当前状态不能重新开通",
+  // —— 记忆启停（api/memory.py）：invalid_action 422；cannot_memory_from_<state>
+  //    走下面的 cannot_ 前缀退化，一个词条吃所有状态后缀 ——
+  invalid_action: "这个动作现在做不了",
+  cannot_memory: "只有运行中的实例能启用或停用记忆；已释放的实例记忆留在 Hub，恢复后再启用",
+  // 记忆成员治理（lead 侧批量路由）与工单撞车的兜底词条：
+  job_in_progress: "该实例已有任务在跑，等它结束再操作",
+  memory_admin_key_missing: "记忆管理密钥还没登记进凭据，控制台代不进 Panel",
+  memory_unavailable: "记忆中枢还没配好——站点的记忆配置配全后这里才可用",
+  // —— 能力（api/capabilities.py）——
+  instance_not_found: "这台实例不在了，回台账看看",
+  capability_not_published: "目录里没有这个能力的可用版本",
 };
 
 /** `cannot_purge_from_running` 这类带状态后缀的码，查表前先退到前缀（§4.1 的写法）。 */
-function errZh(code: string): string {
+export function errZh(code: string): string {
   if (ERR_ZH[code]) return ERR_ZH[code];
   if (!code.startsWith("cannot_")) return code;
   const prefix = code.split("_from_")[0];
@@ -308,6 +363,51 @@ function toSettings(raw: unknown): Settings {
   };
 }
 
+/** 能力目录/台账的响应形状后端已定稿，这里照旧做防御式归一：缺键落回最保守值
+ *  （没装、没启用、没漂移），让界面显示成空态而不是崩成一片 undefined。 */
+function toCatalogItem(c: Record<string, unknown>): CatalogCapability {
+  return {
+    capability_id: String(c.capability_id ?? ""),
+    version: String(c.version ?? ""),
+    kind: String(c.kind ?? ""),
+    title: String(c.title ?? c.capability_id ?? ""),
+    state: String(c.state ?? ""),
+    current: c.current === true,
+    compatible_dsh: String(c.compatible_dsh ?? ""),
+    on_missing: String(c.on_missing ?? ""),
+    kit_version: String(c.kit_version ?? ""),
+    note: String(c.note ?? ""),
+    params: (c.params && typeof c.params === "object" ? c.params : {}) as Record<string, unknown>,
+    default_on: c.default_on === true,
+    restart_required: c.restart_required !== false,
+  };
+}
+
+function toLedgerItem(c: Record<string, unknown>): InstanceCapability {
+  return {
+    capability_id: String(c.capability_id ?? ""),
+    title: String(c.title ?? c.capability_id ?? ""),
+    kind: String(c.kind ?? ""),
+    desired_state: c.desired_state === "absent" ? "absent" : "present",
+    desired_version: String(c.desired_version ?? ""),
+    want_version: String(c.want_version ?? ""),
+    installed: c.installed === true,
+    enabled: c.enabled === true,
+    observed_version: String(c.observed_version ?? ""),
+    marker_present: c.marker_present === true,
+    health: String(c.health ?? ""),
+    health_detail: String(c.health_detail ?? ""),
+    reason: String(c.reason ?? ""),
+    last_job_id: typeof c.last_job_id === "number" ? c.last_job_id : null,
+    observed_at: (c.observed_at as string) ?? null,
+    in_catalog: c.in_catalog === true,
+    drift: c.drift === true,
+    unknown_version: c.unknown_version === true,
+    actions: Array.isArray(c.actions)
+      ? c.actions.filter((a): a is string => typeof a === "string") : [],
+  };
+}
+
 export const api = {
   login: (key: string) =>
     http<Session>("/login", { method: "POST", json: { key } }),
@@ -352,9 +452,53 @@ export const api = {
   release: (id: number | string, confirm: string) =>
     http<{ job_id: number }>(`/instances/${id}/release`, { method: "POST", json: { confirm } }),
   /** 彻底释放（§6.4）：删容器 + 删数据目录，不可恢复。仅 released 可发起；
-   *  confirm 同样由前端填 slug，防误靠 §9 的长按确认。 */
-  purge: (id: number | string, confirm: string) =>
-    http<{ job_id: number }>(`/instances/${id}/purge`, { method: "POST", json: { confirm } }),
+   *  confirm 同样由前端填 slug，防误靠 §9 的长按确认。
+   *  memory_disposal（P1）：确认卡上二选一——"keep" 保留记忆（默认）或
+   *  "revoke" 停用业务用户；两种选择下记忆数据都留在 Hub 卷，这里从不删。 */
+  purge: (id: number | string, confirm: string, memoryDisposal?: "keep" | "revoke") =>
+    http<{ job_id: number }>(`/instances/${id}/purge`,
+      { method: "POST", json: memoryDisposal ? { confirm, memory_disposal: memoryDisposal } : { confirm } }),
+
+  // —— 记忆（api/memory.py：路径参数是 slug，不是数字 id）——
+  memoryStatus: (slug: string) => http<MemoryStatus>(`/instances/${slug}/memory`),
+  /** 只入队 kind=memory 工单，重跑=再点一次；{job_id} 后照常去工单页看进度。 */
+  memoryAction: (slug: string, action: "enable" | "disable") =>
+    http<{ job_id: number }>(`/instances/${slug}/memory`, { method: "POST", json: { action } }),
+  /** 成员治理列表（批量路由在 lead 侧；没上线时按 not_found 降级成占位）。 */
+  memoryMembers: async (): Promise<MemoryMember[]> => {
+    const raw = await http<unknown>("/memory/members");
+    const o = (Array.isArray(raw) ? { members: raw } : raw) as { members?: unknown[]; items?: unknown[] } | null;
+    return ((o?.members ?? o?.items ?? []) as Record<string, unknown>[]).map((m) => ({
+      slug: String(m.slug ?? ""),
+      user_id: String(m.user_id ?? ""),
+      key_masked: typeof m.key_masked === "string" ? m.key_masked : "",
+      key_status: m.key_status === "valid" || m.key_status === "invalid" || m.key_status === "absent"
+        ? m.key_status : null,
+      state: m.state === "disabled" ? "disabled" : m.state === "unknown" ? "unknown" : "active",
+      hub_note: typeof m.hub_note === "string" ? m.hub_note : "",
+    }));
+  },
+  memoryMemberAction: (userId: string, action: "disable" | "reclaim") =>
+    http<{ ok: boolean }>(`/memory/members/${encodeURIComponent(userId)}/action`,
+      { method: "POST", json: { action } }),
+
+  // —— 能力目录（api/capabilities.py）——
+  capabilities: async (state?: string): Promise<CatalogCapability[]> => {
+    const qs = state ? `?state=${encodeURIComponent(state)}` : "";
+    const raw = await http<unknown>(`/capabilities${qs}`);
+    const o = (Array.isArray(raw) ? { items: raw } : raw) as { items?: unknown[] } | null;
+    return ((o?.items ?? []) as Record<string, unknown>[]).map(toCatalogItem);
+  },
+  instanceCapabilities: async (id: number | string): Promise<InstanceCapability[]> => {
+    const raw = await http<unknown>(`/instances/${id}/capabilities`);
+    const o = (Array.isArray(raw) ? { items: raw } : raw) as { items?: unknown[] } | null;
+    return ((o?.items ?? []) as Record<string, unknown>[]).map(toLedgerItem);
+  },
+  /** 一键动作都是工单（§vendor 决策三）：升级到 vX＝apply+version；重试＝apply 不带 version。 */
+  capabilityAction: (id: number | string, body: {
+    action: "install" | "apply" | "enable" | "disable" | "uninstall";
+    capability: string; version?: string; params?: Record<string, unknown>;
+  }) => http<{ job_id: number }>(`/instances/${id}/capability`, { method: "POST", json: body }),
 
   job: (id: number | string) => http<Job>(`/jobs/${id}`),
   jobLogs: (id: number | string, after: number) =>

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -15,6 +15,7 @@ from .models import (
     DeployLog,
     DeployStep,
     Event,
+    FontlibRelease,
     Host,
     ImageArtifact,
     ImageChannel,
@@ -22,6 +23,7 @@ from .models import (
     InstanceConfig,
     InstanceSnapshot,
     InstanceToken,
+    KitRelease,
     utcnow,
 )
 
@@ -226,6 +228,62 @@ async def upsert_credential(
         cred.note = note
     await s.commit()
     return cred
+
+
+# ---------------------------------------------------------------- kit / 字体库制品（资产分发）
+
+async def current_kit_release(s: AsyncSession) -> KitRelease | None:
+    return await s.scalar(select(KitRelease).where(KitRelease.current.is_(True))
+                          .order_by(KitRelease.id.desc()).limit(1))
+
+
+async def list_kit_releases(s: AsyncSession) -> Sequence[KitRelease]:
+    return (await s.scalars(select(KitRelease).order_by(KitRelease.id.desc()))).all()
+
+
+async def add_kit_release(s: AsyncSession, *, version: str, files: dict[str, Any],
+                          size_bytes: int, file_count: int,
+                          note: str = "") -> KitRelease:
+    if await s.scalar(select(KitRelease).where(KitRelease.version == version)):
+        raise ValueError(f"kit 版本已存在: {version}")
+    row = KitRelease(version=version, files=files, size_bytes=size_bytes,
+                     file_count=file_count, note=note, current=True)
+    s.add(row)
+    await s.flush()
+    # 换行同事务：新行落定才把旧的 demote，中途崩了两边都有 current，重启幂等
+    await s.execute(update(KitRelease)
+                    .where(KitRelease.id != row.id)
+                    .values(current=False))
+    await s.commit()
+    return row
+
+
+async def current_fontlib_release(s: AsyncSession) -> FontlibRelease | None:
+    return await s.scalar(select(FontlibRelease).where(FontlibRelease.current.is_(True))
+                          .order_by(FontlibRelease.id.desc()).limit(1))
+
+
+async def list_fontlib_releases(s: AsyncSession) -> Sequence[FontlibRelease]:
+    return (await s.scalars(select(FontlibRelease).order_by(
+        FontlibRelease.id.desc()))).all()
+
+
+async def add_fontlib_release(s: AsyncSession, *, version: str, filename: str,
+                              size_bytes: int, sha256: str, file_count: int,
+                              origin: str = "", note: str = "") -> FontlibRelease:
+    if await s.scalar(select(FontlibRelease).where(
+            FontlibRelease.version == version)):
+        raise ValueError(f"字体库版本已存在: {version}")
+    row = FontlibRelease(version=version, filename=filename, size_bytes=size_bytes,
+                         sha256=sha256, file_count=file_count, origin=origin,
+                         note=note, current=True)
+    s.add(row)
+    await s.flush()
+    await s.execute(update(FontlibRelease)
+                    .where(FontlibRelease.id != row.id)
+                    .values(current=False))
+    await s.commit()
+    return row
 
 
 # ---------------------------------------------------------------- hosts

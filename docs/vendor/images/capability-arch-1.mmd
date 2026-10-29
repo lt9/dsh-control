@@ -1,0 +1,42 @@
+flowchart LR
+  USER["家人浏览器"]
+
+  subgraph CON["dsh-control 控制台（=dshctl，取自域名）—— 唯一动手的人，也是唯一记账的人"]
+    direction TB
+    WEB["Web 界面 + API<br/>能力目录页 · 实例能力块 · 升级/禁用按钮"]
+    CAT["能力目录<br/>id@version · kind∈skill/patch/cordis-plugin/service<br/>兼容 dsh 与 kit 版本区间"]
+    LED["实例能力台账<br/>desired ↔ observed · 漂移检测"]
+    JOB["能力工单 job+steps+events<br/>失败可续 · 日志脱敏"]
+    ENG["capability 引擎<br/>解释 manifest 执行，不写死每个能力的 shell 知识<br/>执行机械 = SSH + docker exec（deploy 步骤机同构）"]
+    ADP["外部系统适配器 integrations/<br/>阿里云DNS · frp · nginxWebUI · memory_hub 新增<br/>全部带 noop"]
+  end
+
+  PACK["能力包（『货』）<br/>manifest（幂等铺法/卸法/探针命令）+ 资产<br/>kit capabilities/ 随换装发，或独立发布"]
+
+  subgraph HOST["被管主机（NAS / 云机）—— 只是文件落点，不是执行者"]
+    direction TB
+    subgraph CTN["实例容器 = 一个人"]
+      HOME["数据卷 $DSH_HOME<br/>skills/* · cordis.patch.yml · .credentials.yaml"]
+      RT["DSH 运行时<br/>entrypoint 渲染 profile 层，home 层做每实例例外"]
+    end
+    STACK["Memory 三件套（主机级部署，实例共享）<br/>MemoryProxy :8096 · Core :8420 · Panel :8125"]
+    COMFY["ComfyUI 生图"]
+  end
+
+  GW["自部署模型网关 :8080<br/>Anthropic Messages /v1/messages + OpenAI（实测通过）"]
+
+  USER -->|"HTTPS 域名（DNS+frp+反代 三件套工单）"| RT
+  WEB --> JOB
+  CAT --> JOB
+  LED --> WEB
+  JOB --> ENG
+  PACK -.->|"publish 入册（kit publish 同款通道）→ 换装下发"| CAT
+  ENG -->|"按 manifest 写补丁/技能/凭据 + 重启 + 探针"| HOME
+  HOME --> RT
+  JOB -->|"HTTP：/v3/meta/* 建用户 · verify · 停用"| ADP
+  ADP -->|"探活与治理（noop=人工动作）"| STACK
+  ENG -.->|"service 类：主机上跑 compose 拉起/升级三件套"| STACK
+  RT -->|"模型出口（开记忆）：经 Proxy 注入再转发"| STACK
+  STACK -->|"upstream /v1/messages"| GW
+  RT -.->|"模型出口（关记忆）：直连"| GW
+  RT -.->|"生图技能调 ComfyUI"| COMFY

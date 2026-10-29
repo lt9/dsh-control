@@ -107,8 +107,11 @@ async def test_purge_full_flow_marks_purged(env):
     assert job["kind"] == "purge"
     # 步骤 seq/key 逐字照契约 §6.4 的表
     assert [(st["seq"], st["key"]) for st in job["steps"]] == [
-        (10, "confirm_guard"), (20, "external_cleanup"), (30, "container_remove"),
-        (40, "data_delete"), (50, "mark_purged")]
+        (10, "confirm_guard"), (15, "memory_disposal"), (20, "external_cleanup"),
+        (30, "container_remove"), (40, "data_delete"), (50, "mark_purged")]
+    # 站点没配 [memory]：记忆处置按默认 keep 走（skipped+留痕），不挡终态化
+    mem = next(st for st in job["steps"] if st["key"] == "memory_disposal")
+    assert mem["state"] == "skipped" and "保留记忆" in mem["detail"]
 
     # 容器：先 stop（释放时已停，这里不该再 stop）再 rm；数据目录 rm -rf 过护栏的路径
     cmds = env.providers.executor.commands

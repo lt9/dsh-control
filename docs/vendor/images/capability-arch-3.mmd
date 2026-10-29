@@ -1,0 +1,18 @@
+sequenceDiagram
+  autonumber
+  participant U as 家人浏览器
+  participant D as DSH 实例容器
+  participant X as MemoryProxy :8096
+  participant C as MemoryCore :8420
+  participant G as 模型网关 :8080
+  U->>D: 「妈妈平时爱吃什么」
+  D->>X: POST /dsh/spaceId/v1/messages（Anthropic）
+  X->>C: 按 space/user 召回长期记忆
+  C-->>X: L1 事实 + 团队资产
+  X->>X: system 段注入 user_memory / agent_skills
+  X->>G: upstream /v1/messages（模型不动）
+  G-->>X: assistant 响应（含 thinking 块）
+  X-->>D: SSE 透传
+  D-->>U: 「她爱吃川菜，上次还说过…」
+  X->>C: 对话超阈值自动归档 L0→L1→L2→L3
+  Note over D,X: 实例侧改动只有两处：home 补丁改 baseURL、凭据文件填 sk-mem key<br/>零代码零技能；卸载 = 还原直连 + 停用记忆用户

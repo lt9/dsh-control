@@ -30,6 +30,7 @@ from .db import repo
 from .db.models import Credential, Host, Instance
 from .domain.timeutil import in_window
 from .integrations.base import ContainerStats, redact
+from .integrations.memory_hub import build_memory_hub, probe_tcp
 from .jobs.capture import TokenNotFound, capture_token
 from .jobs.runner import HostEndpoint, make_runtime, redact_text
 from .settings import Settings, get_settings
@@ -53,6 +54,10 @@ class WatcherState:
     last_restart_count: dict[int, int] = field(default_factory=dict)
     # 已经提示过"容器不存在"的实例：这条只在状态跳变时记一次，别每轮刷屏
     absent_noted: set[int] = field(default_factory=set)
+    # 记忆栈健康边的上一轮结论（None=还没采过）。只在跳变沿记事件（§3 去重：
+    # 栈挂一下午不该把事件流刷满）。进程重启清零：重启后第一轮若仍挂着会再记
+    # 一次 down——方向是安全的（宁多报不漏报）。
+    memory_ok: bool | None = None
 
 
 def _is_failure(snap: Any) -> bool:
@@ -148,6 +153,50 @@ async def _queue_due_purges(s: AsyncSession, released_rows: list[Instance],
         log.info("实例 %s 保留期已过，入队 purge（job %s）", inst.slug, job.id)
         if runner is not None:
             runner.spawn(job.id)
+
+
+async def _memory_stack_probe(s: AsyncSession, settings: Settings,
+                              wstate: WatcherState) -> None:
+    """记忆栈探针（core /health + Proxy TCP）：**只记 events，不重启实例**。
+
+    栈挂 ≠ 实例挂：实例模型出口都经 Proxy，栈不通时挨个重启实例没意义
+    （重启也接不上不存在的栈），所以自动重启不参与，事件只在两种时候记
+    （§3 去重纪律，判据住在 WatcherState.memory_ok 的跳变沿）：
+    - 确认挂着且上一轮不是挂：memory_stack_down 一条；
+    - 从挂恢复：memory_stack_recovered 一条。
+    进程重启清零后第一轮若仍挂着会再记一次 down——方向是安全的（宁多报不漏报）。
+    站点没配记忆（无 [memory] 段 / admin key 没登记）不记任何事件：那是
+    未配置，不是故障（与开通第 68 步的 skip 口径一致，但 skip 事件归开通管）。
+    """
+    hub, _missing = await build_memory_hub(s, settings)
+    if hub is None or getattr(hub, "manual_required", False):
+        return
+    try:
+        try:
+            core_ok = await hub.core_health()
+            proxy_ok = await probe_tcp(str(getattr(settings, "memory_proxy_url", "") or ""))
+        except Exception as exc:  # noqa: BLE001 —— 探针自身异常不记事件，下一轮再来
+            log.warning("记忆栈探针异常（本轮跳过）: %s", redact_text(str(exc)))
+            return
+        ok = core_ok and proxy_ok
+        prev = wstate.memory_ok
+        wstate.memory_ok = ok
+        if ok and prev is False:
+            await repo.add_event(
+                s, "memory_stack_recovered",
+                message="记忆栈恢复：core /health 与 Proxy TCP 重新可达，"
+                        "实例模型出口自动接上（实例从未被动过）")
+        elif not ok and prev is not False:
+            bad = [txt for txt, good in (("core /health 不通", core_ok),
+                                         ("Proxy TCP 不通", proxy_ok)) if not good]
+            await repo.add_event(
+                s, "memory_stack_down",
+                message="记忆栈不可用（" + "、".join(bad) + "）：经 Proxy 的模型出口"
+                        "暂时不可用。控制台不会为此重启实例——请先修记忆栈"
+                        "（tdai-memory-core / tdai-proxy 容器），恢复后无需人工操作")
+        await s.commit()
+    finally:
+        await hub.aclose()
 
 
 async def scan_once(
@@ -264,6 +313,10 @@ async def scan_once(
 
         # released 不在采集循环里，但保留期到了要自动终态化（§3/§6.4）
         await _queue_due_purges(s, due_released, settings, runner, now)
+        # 记忆栈探针放在实例循环之外：它不是逐实例的健康检查（栈挂时挨个重启
+        # 实例毫无意义），只记 events。见函数 docstring 的跳变沿口径。
+        if getattr(settings, "memory_enabled", False):
+            await _memory_stack_probe(s, settings, wstate)
 
 
 async def _recapture_after_auto_restart(

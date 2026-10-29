@@ -19,3 +19,6 @@ deploy/site.compose.yml
 
 # 前端设计走查工具的缓存（含真机截图），不随开源仓库发布
 .impeccable/
+
+# .env 的备份绝不进仓（AK/SK 藏不住，GitHub push protection 实锤 2026-10-29）
+.env.bak*

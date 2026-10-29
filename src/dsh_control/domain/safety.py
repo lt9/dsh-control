@@ -49,10 +49,18 @@ def _block(lines: list[str], plugin_id: str) -> list[str] | None:
     return None
 
 
-def config_violations(dump: str, *, base_url: str = "") -> list[str]:
+def config_violations(dump: str, *, base_url: str = "",
+                      memory_base_url: str = "") -> list[str]:
     """返回违规说明列表；空列表 = 安全门通过。
 
     宁可误报也不放行：条目**找不到**也算违规（"没有这一项"不等于"已禁用"）。
+
+    ``memory_base_url``（记忆接线后的复核口径）：实例的模型出口被 home 层补丁
+    切到自家 Proxy 后，llm-deepseek **必须活着**且 baseURL 就是本站记忆出口——
+    它此时是「这张网内的路由器」，不再是云端路径；其余 MUST_BE_DISABLED 一条不让。
+    全局 baseURL 核对放宽为「本站两个合法出口之一」（.env 的 LLM_BASE_URL 与记忆
+    出口在 dump 里并存，谁是第一条取决于组合顺序，不押顺序）。传空 = 行为与
+    引入记忆功能之前逐字节一致。
     """
     lines = (dump or "").splitlines()
     out: list[str] = []
@@ -60,11 +68,25 @@ def config_violations(dump: str, *, base_url: str = "") -> list[str]:
         return ["拿不到容器内配置（dsh web --dump-config 输出为空），无法判定安全门"]
 
     for pid in MUST_BE_DISABLED:
+        if memory_base_url and pid == "llm-deepseek":
+            continue  # 记忆接线态：下面按 baseURL 单独审它，见 docstring
         blk = _block(lines, pid)
         if blk is None:
             out.append(f"配置里没有 {pid} 这一项，无法确认云端路径已关闭")
         elif not any(_DISABLED_RE.match(x) for x in blk[1:]):
             out.append(f"{pid} 没有被禁用 —— 这台机器还能往云端发请求、产生账单")
+
+    if memory_base_url:
+        blk = _block(lines, "llm-deepseek")
+        if blk is None:
+            out.append("配置里没有 llm-deepseek 这一项——记忆接线后模型出口本经它走"
+                       "自家 Proxy，现在出口不明")
+        else:
+            m = _BASE_URL_RE.search("\n".join(blk))
+            got = m.group(1) if m else ""
+            if got != memory_base_url:
+                out.append(f"llm-deepseek 的 baseURL 是 {got or '（空）'}，不是本站记忆出口 "
+                           f"{memory_base_url} —— 指向别处就意味着她的内容会离开这张网")
 
     for pid in MUST_STAY_ON:
         blk = _block(lines, pid)
@@ -74,7 +96,9 @@ def config_violations(dump: str, *, base_url: str = "") -> list[str]:
     if base_url:
         m = _BASE_URL_RE.search(dump)
         got = m.group(1) if m else ""
-        if got != base_url:
+        allowed = {base_url} | ({memory_base_url} if memory_base_url else set())
+        if got not in allowed:
             out.append(f"模型端点是 {got or '（空）'}，不是本站配置的 {base_url}"
-                       " —— 指向别处就意味着她的内容会离开这张网")
+                       + (f"（也不是记忆出口 {memory_base_url}）" if memory_base_url else "")
+                       + " —— 指向别处就意味着她的内容会离开这张网")
     return out

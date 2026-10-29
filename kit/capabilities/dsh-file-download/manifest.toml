@@ -1,0 +1,36 @@
+# 工作区文件下载能力包（ADR-0001 决策二 kind=plugin；P3 收编＝**登记**：
+# 两插件——UI 半 dsh-file-download + host 半 dsh-host-file-download——随
+# dsh-family 镜像分发，由 entrypoint 启动时铺进 profile node_modules（U-4
+# 定案），控制台只量不动运行时副本。本包让它们在目录里可查、闸门可拦。
+id = "dsh-file-download"
+version = "1.0.0"                        # 首次发布定；两包一对，版本跟镜像走
+kind = "plugin"
+title = "工作区文件下载"
+compatible_dsh = ">=0.2.1-rc.2"          # 官方插槽改名时按钮会「安静地不画」，闸门按它拦
+
+# default_on 故意 false：铺法归 entrypoint，登记不等于立期望——
+# 若 true，开通第 69 步会经 _action_plugin 往 home 层写启用条目，
+# 那是现网没有的新动作（U-4「要根治启动打回就不给 plugin 类 console 铺法」）。
+# 想常态观测：页面/CLI 对它 install（只写启用条目），或站点显式打开。
+default_on = false
+
+marker = "# dsh-control: dsh-file-download 由控制台铺设"
+
+# 路由注册成功的可观测信号：未登录打 /api/download 回 401，未注册的 /api/* 回 404
+# （dsh-family plugins/README.md 实测的两种返回，正好能区分「装上了」和「没进 handler」）。
+# 探针依赖容器内有 curl：未实测，缺命令时引擎按 health=unknown 记并说明（U-4 观察项）。
+status = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${DSH_PORT}/api/download | grep -q 401"
+healthcheck = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${DSH_PORT}/api/download | grep -q 401"
+
+uninstall = "reverse"                    # 卸 = 摘启用条目；运行时副本归 entrypoint（U-4）
+restart_required = true
+
+packages = ["dsh-file-download", "dsh-host-file-download"]   # UI 半 + host 半，一对
+enable_entries = [
+  { id = "host-file-download", name = "dsh-host-file-download" },
+  { id = "ui-file-download",   name = "dsh-file-download" },
+]
+laid_by = "entrypoint"                   # U-4 定案：包体由镜像 entrypoint 铺，引擎只量
+
+[params]
+on_missing = "failed"                    # 包在镜像里，缺文件属于安装问题，不该静默跳过

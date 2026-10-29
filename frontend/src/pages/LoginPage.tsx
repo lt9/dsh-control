@@ -50,7 +50,6 @@ export default function LoginPage({ onDone }: { onDone: () => void }) {
         <button type="submit" className="btn btn-primary btn-lg" disabled={busy || !key}>
           {busy ? "正在核对…" : "进入台账"}
         </button>
-        <p className="gate-hint">登录后 7 天内免登录（本机 cookie）。连错 5 次会限流一分钟。</p>
       </form>
     </div>
   );

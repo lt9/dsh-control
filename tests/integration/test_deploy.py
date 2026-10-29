@@ -5,7 +5,8 @@ from __future__ import annotations
 from tests.conftest import XRW, create_instance, wait_job
 
 STEP_KEYS_DEPLOY = ["plan", "host_prepare", "dns_create", "frp_create", "ng_create",
-                    "container_deploy", "config_backfill", "capabilities", "fonts",
+                    "capability_gate", "container_deploy", "config_backfill",
+                    "capabilities", "fonts", "memory_wiring", "capability_apply",
                     "token_capture", "probe_public", "verify"]
 
 
@@ -99,7 +100,13 @@ async def test_deploy_full_flow_with_derived_names(env):
     job = (await env.client.get(f"/api/jobs/{body['job_id']}")).json()
     assert job["state"] == "succeeded", job["error"]
     assert [st["key"] for st in job["steps"]] == STEP_KEYS_DEPLOY
-    assert all(st["state"] == "succeeded" for st in job["steps"])
+    # 站点没配 [memory]：第 68 步 skipped + 警告事件，其余步骤必须全绿（缺料不挡开通）。
+    # 能力两步同理：站点空目录/无台账时 gate 与 apply 都 skipped，属设计内缺料。
+    _SKIPPABLE = {"memory_wiring", "capability_gate", "capability_apply"}
+    mem = next(st for st in job["steps"] if st["key"] == "memory_wiring")
+    assert mem["state"] == "skipped" and "[memory]" in mem["detail"]
+    assert all(st["state"] == "succeeded" for st in job["steps"]
+               if st["key"] not in _SKIPPABLE)
     # plan 步骤要把「NG 用哪个地址回源」打印给运维看（在步骤日志流里）
     logs = (await env.client.get(f"/api/jobs/{body['job_id']}/logs",
                                  params={"after": 0})).json()["items"]

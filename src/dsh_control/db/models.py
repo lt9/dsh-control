@@ -35,13 +35,20 @@ BigIntPk = BigInteger().with_variant(Integer, "sqlite")
 INSTANCE_STATES = ("pending", "deploying", "running", "unhealthy", "restarting",
                    "released", "purged", "error")
 DESIRED_STATES = ("running", "released")
-JOB_KINDS = ("deploy", "restart", "release", "purge", "publish")
+# capability：能力工单（ADR-0001 决策三）；memory：记忆启用/停用（P1，task-3）
+JOB_KINDS = ("deploy", "restart", "release", "purge", "publish", "memory",
+             "capability")
 JOB_STATES = ("pending", "running", "succeeded", "failed")
 STEP_STATES = ("pending", "running", "succeeded", "failed", "skipped")
 TOKEN_SOURCES = ("bootstrap", "logs", "restart", "manual")
 CREDENTIAL_KINDS = ("ssh_key", "ssh_password", "aliyun_ak", "frp_panel",
                     "ng_panel", "operator_key", "site", "llm_key", "image_key",
-                    "mirror_token")
+                    "mirror_token", "memory_user_key", "memory_admin_key")
+# 能力目录的 kind：四类实装 + asset 第五类（ADR U-5 定案 fonts 归此类；P2 只留解析位）
+CAPABILITY_KINDS = ("skill", "patch", "plugin", "service", "asset")
+CAPABILITY_STATES = ("draft", "published", "retired")
+CAP_DESIRED_STATES = ("present", "absent")
+CAP_HEALTH = ("unknown", "ok", "failed")
 HOST_UPSTREAM_MODES = ("frp", "direct")
 # 制品外部分发渠道（§6.1.6）：github/gitee 两路公共 Releases，console 恒兜底
 MIRROR_CHANNELS = ("github", "gitee")
@@ -79,7 +86,8 @@ class Credential(Base):
     kind: Mapped[str] = mapped_column(
         String(32),
         comment="类别：ssh_key/ssh_password/aliyun_ak/frp_panel/ng_panel"
-                               "/operator_key/site/llm_key/image_key/mirror_token")
+                                "/operator_key/site/llm_key/image_key/mirror_token"
+                                "/memory_user_key/memory_admin_key")
     name: Mapped[str] = mapped_column(String(128), unique=True,
                                       comment="唯一名称，如 console-ed25519")
     secret: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict,
@@ -282,8 +290,9 @@ class DeployJob(Base):
     instance_id: Mapped[int] = mapped_column(BigInteger, index=True,
                                              comment="逻辑指向 instances.id，无外键；"
                                                      "0=不挂实例（publish 这类全站工单）")
-    kind: Mapped[str] = mapped_column(String(16),
-                                      comment="任务类型：deploy/restart/release/purge/publish")
+    kind: Mapped[str] = mapped_column(
+        String(16),
+        comment="任务类型：deploy/restart/release/purge/publish/memory/capability")
     state: Mapped[str] = mapped_column(String(16), default="pending", index=True,
                                        comment="任务状态：pending/running/succeeded/failed")
     params: Mapped[dict[str, Any] | None] = mapped_column(
@@ -429,3 +438,166 @@ class ImageChannel(Base):
                                        comment="failed 时的原因（已脱敏）；ok 后留空或留历史说明")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
                                                  onupdate=utcnow, comment="最后推送时间（UTC）")
+
+
+# ---------------------------------------------------------------- 资产（kit / 字体库）
+# 存储位置按体量分（docs/SITE-CONFIG.md「资产分发」）：kit 脚本小文本进 DB；
+# 字体库大二进制文件进制品库目录、这里只记账。下发同一条管道：控制台内存 →
+# ssh stdin → 目标机脚本解包。
+
+
+class KitRelease(Base):
+    """kit 脚本版本库：一行一个整包（scripts/** + compose.yaml + .env.example）。
+
+    第 20 步拿目标机 `kit/.dshctl-kit-version` 和 current 行比对，不符就整包
+    下发——只增盖清单内文件，绝不动 instances/（实例目录是运行时状态）。
+    """
+
+    __tablename__ = "kit_releases"
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    version: Mapped[str] = mapped_column(String(64), unique=True,
+                                         comment="版本号（[A-Za-z0-9._-]）；目标机版本标记就写它")
+    files: Mapped[dict] = mapped_column(JsonType,
+                                        comment="kit 全量文件：路径 → {b64, mode}")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, comment="解码后字节总数")
+    file_count: Mapped[int] = mapped_column(Integer, comment="文件数")
+    note: Mapped[str] = mapped_column(String(512), default="", comment="发布说明（git sha 等）")
+    current: Mapped[bool] = mapped_column(default=False,
+                                          comment="是否现行版：最多一行为真，发布时换行")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 comment="发布时间（UTC）")
+
+
+class FontlibRelease(Base):
+    """字体库制品账本：文件在 image_store 目录（和镜像制品同盘），一行一版本。
+
+    「行存在即文件已完整落库」沿用 image_artifacts（0008）硬约定：文件写完、
+    改好名，才插行。开通 67 步在实例宿主机缺库目录时**优先**用现行版下发，
+    font_library_source 主机中转降为兜底。
+    """
+
+    __tablename__ = "fontlib_releases"
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    version: Mapped[str] = mapped_column(String(64), unique=True,
+                                         comment="版本号，如 fontlib-20261027-1430")
+    filename: Mapped[str] = mapped_column(String(255), unique=True,
+                                          comment="image_store 内文件名（version.tar.gz）")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, comment="gzip 后字节数")
+    sha256: Mapped[str] = mapped_column(String(64),
+                                        comment="文件 sha256（发布落盘时流式算好）")
+    file_count: Mapped[int] = mapped_column(Integer, comment="库内字体文件数（账目核对用）")
+    origin: Mapped[str] = mapped_column(String(128), default="",
+                                        comment="来源：主机名或本机路径；空=手工投放")
+    note: Mapped[str] = mapped_column(String(512), default="", comment="发布说明")
+    current: Mapped[bool] = mapped_column(default=False,
+                                          comment="是否现行版：最多一行为真，67 步只认现行版")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 comment="发布时间（UTC）")
+
+
+# ---------------------------------------------------------------- 能力目录与台账（ADR-0001 决策四）
+# 能力知识住在 kit 包里的 manifest，这里只有目录与对账：capabilities 一行一个
+# 「能力+版本」，instance_capabilities 每实例每能力一行 desired ↔ observed。
+# 对账在程序里做，两张表不联（§2.0）。
+
+
+class Capability(Base):
+    """能力目录：一行一个「能力 + 版本」，正文来自 kit 包里的 manifest。"""
+
+    __tablename__ = "capabilities"
+    __table_args__ = (
+        _in("kind", CAPABILITY_KINDS),
+        _in("state", CAPABILITY_STATES),
+        UniqueConstraint("capability_id", "version"),
+        {"comment": "能力目录：id/版本/kind/manifest/兼容区间/发布状态（发货台账的一类）"},
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    capability_id: Mapped[str] = mapped_column(String(64), index=True,
+                                               comment="能力 id，等于 kit 里 capabilities/<id> 目录名")
+    version: Mapped[str] = mapped_column(String(64),
+                                         comment="包版本，取 manifest 的 version")
+    kind: Mapped[str] = mapped_column(
+        String(16),
+        comment="能力类别：skill/patch/plugin/service，asset 为第五类（U-5，P2 只留解析位）；"
+                "决定装法与卸法")
+    title: Mapped[str] = mapped_column(String(128), default="", comment="详情页展示名")
+    manifest: Mapped[dict[str, Any]] = mapped_column(
+        JsonType,
+        comment="manifest 解析结果全量（参数 schema 与 kind 专属字段都在里面）；"
+                "kit publish 时读包内文件解析，有未知字段就拒发")
+    manifest_sha256: Mapped[str] = mapped_column(String(64), default="",
+                                                 comment="manifest 正文 sha256：与目标机上换装落地的文件比对，"
+                                                         "发现货与台账不符")
+    kit_version: Mapped[str] = mapped_column(String(64), default="",
+                                             comment="这份 manifest 随哪个 kit 版本发货，"
+                                                     "逻辑指向 kit_releases.version，无外键")
+    compatible_dsh: Mapped[str] = mapped_column(String(64), default="",
+                                                comment="兼容的 DSH 版本区间原文，切镜像前的闸门读它")
+    on_missing: Mapped[str] = mapped_column(String(16), default="failed",
+                                            comment="缺料策略：skipped=步骤记 skipped（不挡开通）；failed=步骤失败")
+    state: Mapped[str] = mapped_column(String(16), default="published", index=True,
+                                       comment="发布状态：draft/published/retired——只有 published 可铺")
+    current: Mapped[bool] = mapped_column(default=False,
+                                          comment="是否现行版：同一 capability_id 最多一行为真，"
+                                                  "发布时代码换行（同 kit_releases）")
+    note: Mapped[str] = mapped_column(String(512), default="", comment="发布说明")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 comment="创建时间（UTC）")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, comment="更新时间（UTC）")
+
+
+class InstanceCapability(Base):
+    """每实例每能力一行台账：desired ↔ observed。"""
+
+    __tablename__ = "instance_capabilities"
+    __table_args__ = (
+        _in("desired_state", CAP_DESIRED_STATES),
+        _in("health", CAP_HEALTH),
+        UniqueConstraint("instance_id", "capability_id"),
+        {"comment": "能力台账：期望版本 ↔ 引擎探针采回的观测态"},
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, comment="主键")
+    instance_id: Mapped[int] = mapped_column(BigInteger, index=True,
+                                             comment="逻辑指向 instances.id，无外键")
+    capability_id: Mapped[str] = mapped_column(String(64), index=True,
+                                               comment="逻辑指向 capabilities.capability_id，无外键")
+    desired_state: Mapped[str] = mapped_column(
+        String(16), default="present",
+        comment="期望：present=要装；absent=要卸（卸载工单先翻这列再发命令）")
+    desired_version: Mapped[str] = mapped_column(String(64), default="",
+                                                 comment="期望版本；空串=跟随目录的 current 行")
+    params: Mapped[dict[str, Any]] = mapped_column(
+        JsonType, default=dict,
+        comment="下发给引擎的非敏感参数；secret 参数不进这列（密钥只住 credentials，"
+                "工单执行时现取现塞 stdin）")
+    installed: Mapped[bool] = mapped_column(default=False,
+                                            comment="观测：装没装（status 探针的结果）")
+    enabled: Mapped[bool] = mapped_column(default=True,
+                                          comment="观测：启没启；disable 之后资产还在，只是不生效")
+    observed_version: Mapped[str] = mapped_column(
+        String(64), default="",
+        comment="观测版本；空串=版本未知（不按漂移算，按黄标提示），与期望不等即漂移")
+    marker_present: Mapped[bool] = mapped_column(
+        default=False, comment="观测：铺设记号在不在——文件被人手删过的证据")
+    health: Mapped[str] = mapped_column(
+        String(16), default="unknown", index=True,
+        comment="健康探针结果：unknown/ok/failed（failed 只黄标，不自动重启实例）")
+    health_detail: Mapped[str] = mapped_column(Text, default="",
+                                               comment="健康探针输出摘要（已脱敏）")
+    reason: Mapped[str] = mapped_column(
+        Text, default="",
+        comment="上次动作的说明：skipped 原因 / 失败尾日志（已脱敏），详情页直接显示")
+    last_job_id: Mapped[int] = mapped_column(
+        BigInteger, default=0,
+        comment="最近一次动作的工单 id，逻辑指向 deploy_jobs.id，无外键；0=没走过工单")
+    observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), comment="本行观测态采集时间（UTC）；空=从没采过")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                                 comment="创建时间（UTC）")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, comment="更新时间（UTC）")

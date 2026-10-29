@@ -213,10 +213,11 @@ Word→PDF 在实例里有两条转换路，各自认各自的字体目录：
 ```toml
 [site]
 font_library = "/srv/dsh-fonts"   # 可选：站点字体库目录（实例宿主机上的绝对路径），留空则跳过
+font_library_source = "nas-1"     # 可选：字体库来源主机（hosts.name 或 ssh_host）；新机器没库时自动中转复制
 ```
 
-`.env` 侧是 `DSHC_FONT_LIBRARY`（形态示例；真实路径放不提交的 `deploy/site.toml`）。
-行为都在第 67 步「铺字体」里，四条规矩：
+`.env` 侧是 `DSHC_FONT_LIBRARY` / `DSHC_FONT_LIBRARY_SOURCE`（形态示例；真实路径放不提交的 `deploy/site.toml`）。
+行为都在第 67 步「铺字体」里，五条规矩：
 
 - **只 cp，不挂载**：bind 挂载 `/usr/share/fonts` 要改每一台的 compose，而且字体
   不随数据目录备份搬家；真字体不进镜像（镜像里只有同度量的开源替代），cp 是字体
@@ -224,12 +225,48 @@ font_library = "/srv/dsh-fonts"   # 可选：站点字体库目录（实例宿�
 - **`cp -n` 不覆盖**：目标目录里已有的同名文件一律不动——数据卷归用户，她自己
   放进去的字体她自管。本次新增 0 个文件也算正常完成。
 - **权限**：落地后文件 644、目录 755，保证容器内 uid 读得到。
-- **跳过条件**：`font_library` 未配置，或该目录在实例宿主机上不存在 → 步骤记一行
-  warning 并标 `skipped`，绝不失败工单（与生图技能同口径：可选能力没配，不该挡住开通）。
+- **新机器自动带库（中转）**：库目录不在实例宿主机上、且配了 `font_library_source`
+  → 先从来源主机经**控制台内存管道**复制一份到同样的路径（源机 `tar|gzip` → 控制台 →
+  目标机解包，形态同 `cli images ship`：两台机器之间不需要任何互信，中转不落盘），
+  然后照常铺。目标先解到 `${lib}.install.$$` 临时目录、成功后才 `cp` 进正式目录——
+  半路断线时正式库原封不动。来源主机就是实例宿主机自己、或中转失败 → 步骤标
+  error（配了来源还缺字体是真故障，重跑工单即续）。
+- **跳过条件**：`font_library` 未配置，或该目录在实例宿主机上不存在**且没配来源**
+  → 步骤记一行 warning 并标 `skipped`，绝不失败工单（与生图技能同口径：可选能力
+  没配，不该挡住开通）。
 
 一个坑：Office 的缺字体提示**按字体名匹配**，不按文件内容。库里放 `simfang.ttf`
 （仿宋）消不掉文档里写「仿宋_GB2312」的名字——要消掉提示，库里字体的内部名必须与
 文档引用的名字逐字一致（放真正的仿宋_GB2312，而不是名字相近的仿宋）。
+
+## 资产分发（镜像、配置、kit、字体）
+
+架构口径：**能进控制台的都进控制台**——开通时目标机什么都不要求预装
+（Docker 除外），镜像、配置、脚本、字体全部由 dshctl 持有并下发。
+存储位置按体量分两层，下发只有一条管道：
+
+| 资产 | 存在哪 | 怎么到目标机 |
+| --- | --- | --- |
+| 镜像（数百 MB） | 制品库目录 `image_store` + `image_artifacts` 账本 | 20 步缺就搬：download 渠道或 ship 流式直传（§6.1.5） |
+| 配置（每实例） | DB（生成于 60 步，回读于 65 步） | ssh 写实例 `.env` |
+| kit 脚本（~100KB 文本） | **DB `kit_releases.files`**（小文本进库：发布是事务、取用一条查询） | 20 步对账 `kit/.dshctl-kit-version`，不符整包下发 |
+| 字体库（~370MB 二进制） | 制品库目录 + `fontlib_releases` 账本 | 67 步缺库目录时优先下发现行版；`font_library_source` 中转兜底 |
+
+下发统一是**控制台内存 → ssh stdin → 目标机脚本解包**（`images._relay` 同一族）：
+不落盘、不经 HTTP——NAT 机器拨自家公网域是 hairpin 黑洞，而 ssh 永远可达。
+两边写入都讲究**断线不污染**：kit 只增盖清单内文件；字体先解 `${lib}.install.$$`
+临时目录、成功后才 `cp -a` 进正式库。
+
+入库命令（发布后全站立即生效，不用重开控制台）：
+
+```bash
+dsh-control kit publish --dir ~/src/dsh-family --note "git c7ac13f"  # kit 仓库根
+dsh-control fontlib publish --host nas-8 --lib /srv/dsh-fonts        # 从来源主机流式拉
+dsh-control kit ls && dsh-control fontlib ls                          # 账目
+```
+
+新机器开通因此只剩两个前提：**SSH 可达 + 有 Docker**（局域网机器再加 frpc 客户端
+挂门，见 §6.1.4 直连例外）。
 
 ## 安全门（不通过就不算开通成功）
 

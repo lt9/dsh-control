@@ -1,0 +1,20 @@
+flowchart LR
+  subgraph CON["控制台（=dshctl）：目录 + 台账 + 按钮 + 能力引擎，决策记账动手一体"]
+    A["能力目录<br/>id@version · kind · 兼容 dsh 区间<br/>入册：技能文件/补丁模板/插件包/服务 compose tag"]
+    B["实例能力台账<br/>desired vs observed"]
+    W["watcher 定期对账<br/>manifest 探针经 docker exec 采 observed<br/>漂移 ⇒ 标『可升级/配置漂移』"]
+    U["一键动作（全部走工单）<br/>启用 · 禁用 · 升级 · 卸载 · 重试"]
+    J["capability 工单<br/>dry-run 计划 → 应用 → 回读校验<br/>步骤/日志/events 留痕 · skipped 不算失败"]
+    K["capability 引擎<br/>执行 manifest 声明的命令 · 幂等 · 逆操作内置"]
+  end
+  subgraph HOST["被管主机 / 实例容器：文件落点"]
+    P["manifest + 资产<br/>skill · patch · cordis-plugin · service<br/>参数/兼容区间/健康判据随『货』下发"]
+  end
+  A -->|"站点默认版本"| J
+  U --> J
+  J --> K
+  A -.->|"入册 → 换装通道发货（kit publish 同款）"| P
+  K -->|"SSH + docker exec：铺/摘/探针"| P
+  P -->|"探针回传：装了啥/版本/健康"| B
+  W --> B
+  B -->|"running 实例出现新版 ⇒ 详情页黄标"| U

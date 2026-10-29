@@ -1,7 +1,8 @@
 // 时间与状态语义。所有时间一律按 Asia/Shanghai 显示（§9）。
 
 import type {
-  ChannelState, InstanceState, JobKind, JobPurpose, JobState, ShipChannel, ShipMode, StepState,
+  ChannelState, InstanceCapability, InstanceState, JobKind, JobPurpose, JobState, MemoryStatus,
+  ShipChannel, ShipMode, StepState,
 } from "../api/client";
 
 const TZ = "Asia/Shanghai";
@@ -91,13 +92,58 @@ export const STATE_META: Record<InstanceState, { zh: string; tone: Tone; glyph: 
   pending:    { zh: "待部署", tone: "wait", glyph: "hollow" },
 };
 
+/** 详情页「记忆」小块的状态点：一台只给一个事实，解释全部在 tips 里（IV-8）。
+ *  优先级：栈故障 > legacy > 已接 > 未接。wired=null 是宿主机够不着
+ *  （容器侧事实未知），不能冒充「未接」——给「未确认」，点一下刷新就是重测。 */
+export function memoryDot(m: MemoryStatus | null): { zh: string; tone: Tone; glyph: string } {
+  if (!m) return { zh: "未确认", tone: "wait", glyph: "hollow" };
+  if (!m.enabled) return { zh: "未接", tone: "off", glyph: "hollow" };
+  if (m.hub && m.hub.core_ok === false) return { zh: "栈故障", tone: "err", glyph: "cross" };
+  if (m.wired === true) {
+    return m.legacy_p0 === true
+      ? { zh: "legacy 手工", tone: "warn", glyph: "triangle" }
+      : { zh: "已接", tone: "ok", glyph: "round" };
+  }
+  if (m.wired === false) return { zh: "未接", tone: "off", glyph: "hollow" };
+  return { zh: "未确认", tone: "wait", glyph: "hollow" };
+}
+
 export const JOB_META: Record<JobKind, { zh: string }> = {
   deploy: { zh: "开通部署" },
   restart: { zh: "重启" },
   release: { zh: "释放" },
   purge: { zh: "彻底释放" },
   publish: { zh: "发布制品" },
+  memory: { zh: "记忆启停" },
+  capability: { zh: "能力操作" },
 };
+
+/** 能力 kind 的中文名（目录与详情小块共用）。 */
+export const CAP_KIND_META: Record<string, { zh: string }> = {
+  skill: { zh: "技能" },
+  patch: { zh: "补丁" },
+  plugin: { zh: "插件" },
+  service: { zh: "服务" },
+};
+
+export const capKindZh = (kind: string) => CAP_KIND_META[kind]?.zh ?? (kind || "未知");
+
+/** 实例能力块的状态点：对账结论后端已算好（drift/unknown_version/health），
+ *  前端照字段渲染不自己推。优先级：drift > health down > degraded > unknown_version > 正常。 */
+export function capabilityDot(c: InstanceCapability): { zh: string; tone: Tone; glyph: string } {
+  if (c.desired_state === "absent") {
+    return c.drift
+      ? { zh: "说好卸载，还装着", tone: "warn", glyph: "triangle" }
+      : { zh: "已卸载", tone: "off", glyph: "hollow" };
+  }
+  if (c.drift) return { zh: "没对上", tone: "err", glyph: "cross" };
+  if (c.health === "down") return { zh: "健康故障", tone: "err", glyph: "cross" };
+  if (c.health === "degraded") return { zh: "健康降级", tone: "warn", glyph: "triangle" };
+  if (c.unknown_version) return { zh: "版本未知", tone: "warn", glyph: "triangle" };
+  if (!c.installed) return { zh: "没装上", tone: "err", glyph: "cross" };
+  if (!c.enabled) return { zh: "已禁用", tone: "off", glyph: "hollow" };
+  return { zh: "正常", tone: "ok", glyph: "round" };
+}
 
 /** §6.1.5 两种分发方式。名字照契约，说明写清各自吃谁的带宽——选错方向的代价
  *  只有传过一次 GB 级镜像的人才知道，所以这一句必须写在按钮上而不是文档里。 */

@@ -8,8 +8,12 @@ frp_port_start = 20000
 dsh_image = "dsh-family:local"
 # 可选：站点字体库目录（**实例宿主机上**的绝对路径，此处仅为形态示例）。
 # 开通第 67 步把里面的文件 cp -n 进实例 DATA_DIR 的 home/.fonts（同名不覆盖）；
-# 留空或目录不存在 = 跳过铺字体，不影响开通。
+# 留空 = 跳过铺字体，不影响开通。
 font_library = "/srv/dsh-fonts"
+# 可选：字体库来源主机（hosts.name 或 ssh_host）。新机器上没有 font_library 目录时，
+# 第 67 步先从这台经控制台内存中转复制一份过去再铺（两台机器之间不需要互信）。
+# 留空 = 老行为：目标机没有库目录就跳过。对应 DSHC_FONT_LIBRARY_SOURCE。
+font_library_source = "nas-1"
 # 可选：释放后数据保留天数（默认 15）。到期 watcher 自动入队彻底释放（purge）：
 # 删容器、删数据目录，不可恢复。对应 DSHC_PURGE_AFTER_DAYS，库里的站点值优先。
 purge_after_days = 15

@@ -529,7 +529,8 @@ async def purge_instance(request: Request, instance_id: int,
                             "message": f"该实例已有 {j.kind} 任务在跑（job {j.id}），"
                                        "等它结束再彻底释放"})
         job = await repo.create_job(s, inst.id, "purge",
-                                    {"source": "manual", "confirm": inst.slug})
+                                    {"source": "manual", "confirm": inst.slug,
+                                     "memory_disposal": body.memory_disposal or "keep"})
         await repo.add_event(s, "purge_queued", message=f"彻底释放 {inst.slug} 已确认",
                              instance_id=inst.id, job_id=job.id, data={"slug": inst.slug})
     state.runner.spawn(job.id)

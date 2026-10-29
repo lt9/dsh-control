@@ -108,6 +108,8 @@ export default function App() {
         <nav className="topnav" aria-label="主导航">
           <a href="/" className={loc.pathname === "/" ? "on" : ""}>台账</a>
           <a href="/instances/new" className={loc.pathname === "/instances/new" ? "on" : ""}>新建</a>
+          <a href="/memory" className={loc.pathname === "/memory" ? "on" : ""}>记忆</a>
+          <a href="/capabilities" className={loc.pathname === "/capabilities" ? "on" : ""}>能力</a>
         </nav>
         <div className="topbar-right">
           <AccountMenu expires={expires} onLogout={() => void signOut()} />

@@ -239,7 +239,6 @@ a { color: var(--accent-700); text-underline-offset: 3px; text-decoration-thickn
   background: none; border: 0; color: var(--shell-mut); cursor: pointer; padding: 6px; border-radius: var(--r-1); }
 .gate-input .eye:hover { color: var(--shell-ink); }
 .gate-card .btn-primary { width: 100%; justify-content: center; margin-top: 12px; }
-.gate-hint { margin-top: 14px; font-size: 12.5px; color: var(--shell-mut); }
 .alert {
   display: flex; gap: 8px; padding: 9px 12px; margin-top: 14px;
   border: 1px solid; border-radius: var(--r-2); font-size: 13px;
@@ -636,6 +635,26 @@ dialog.modal::backdrop { background: rgba(10, 28, 36, .45); }
 }
 .toast svg { flex: none; }
 @keyframes toast-in { from { transform: translate(-50%, 6px); opacity: 0; } }
+
+/* ————— 记忆页 / 能力页（§vendor 界面） ————— */
+/* 选中态的普通按钮（purge 记忆处置二选一、目录版本开关等共用这一条；
+   .host-pick/.log-foot 原有的深色作用域规则照旧生效）。 */
+.btn.on { border-color: var(--accent); color: var(--accent-700);
+  box-shadow: inset 0 0 0 1px var(--accent); background: var(--accent-tint); }
+
+/* Panel 同源 iframe（api/memory_proxy.py 反代）：给足高度，少一层滚动套滚。 */
+.panel-frame { display: block; width: 100%; height: min(78vh, 900px);
+  border: 1px solid var(--line); border-radius: var(--r-2); background: #fff; }
+
+/* 详情页能力小块：一行一个能力，点 + 名 + 版本 + 动作，与健康详情。 */
+.cap-list { list-style: none; margin: 0; padding: 0; }
+.cap-list > li { padding: 8px 0; border-bottom: 1px dotted var(--line); }
+.cap-list > li:last-child { border-bottom: 0; }
+.cap-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-row .cap-name { font-weight: 550; }
+.cap-row .spacer { margin-left: auto; }
+.cap-detail { margin-top: 4px; padding-left: 2px; }
+.cap-detail b { color: var(--ink-2); font-weight: 600; }
 
 /* ————— 响应式：只做结构收纳，不花屏 ————— */
 @media (max-width: 1020px) {

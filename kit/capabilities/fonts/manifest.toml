@@ -1,0 +1,34 @@
+# 站点字体库能力包（ADR U-5 定案的第五类 kind=asset：文件投递语义——
+# 「喂给系统的文件」，不是「喂给 agent 的知识」）。
+#
+# P3 收编边界（按任务口径）：**只在 manifest 与目录层收编**——引擎 asset
+# 槽位现状是「解析过、执行拒」（run_action 直接 failed），开通第 67 步的
+# 执行路径（制品库取货 + cp -n 铺进 DATA_DIR/home/.fonts）保持不变，
+# 等引擎实装 asset 执行后第 67 步再改调它。
+id = "fonts"
+version = "1.0.0"                        # 首次发布定；字体库本身的版本在 fontlib_releases 账本
+kind = "asset"
+title = "站点字体库"
+compatible_dsh = ">=0.2.0-rc.1"          # 与 kit 最低版本口径一致；字体内容与 DSH 版本无关
+
+# default_on=false：登记归目录、执行归第 67 步。true 会让第 69 步对它
+# run_action 并撞「asset 类执行未实装」的 failed，白白脏化工单详情。
+default_on = false
+
+marker = "# dsh-control: fonts 由控制台铺设（asset 类占位，执行归第 67 步）"
+
+# 探针（容器内视角）：DATA_DIR 挂进容器就是 ${DSH_HOME}，落点相对它固定。
+status = 'test -d "${DSH_HOME}/home/.fonts"'
+healthcheck = 'test -n "$(ls -A "${DSH_HOME}/home/.fonts" 2>/dev/null)"'
+
+uninstall = "reverse"
+restart_required = false                 # 字体是文件投递，无重启语义（U-5）
+
+# 文件不随包发货：字体库约 370MB，远超 U-3 的整包 8MB 阈值，走制品库
+# 文件账本（fontlib_releases，行存在即文件已完整落库）；这里 files 留空，
+# target 记投递落点（相对实例数据目录，等价第 67 步的 DATA_DIR/home/.fonts）。
+files = []
+target = "home/.fonts"
+
+[params]
+on_missing = "skipped"                   # 站点没配字体库 → 跳过并警告（第 67 步现行为）

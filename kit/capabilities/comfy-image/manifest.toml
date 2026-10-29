@@ -1,0 +1,51 @@
+# 生图技能能力包（ADR-0001 决策二 kind=skill 的落货品；P3 从
+# jobs/capabilities.py 的 _push_skill_script heredoc 收编而来）。
+# 技能正文（SKILL.md / comfy_generate.py）原样搬进本目录，一个字不改；
+# config.env 从「heredoc 里拼 shell」改为本包的 config.env.tmpl 模板渲染。
+id = "comfy-image"
+version = "1.0.0"                        # 首次发布定（现网能力此前没有版本概念）
+kind = "skill"
+title = "生图技能"
+compatible_dsh = ">=0.2.1-rc.2"          # ADR 决策二示例口径
+
+# 默认开：站点没配开关时 desired=present；关停走 site.toml
+# credentials(kind=site) 的 secret capabilities = { comfy-image = false }。
+# 注意「默认开」不等于「必铺」：站点没配生图地址/token 时第 66 步照旧
+# skipped（见 params.on_missing 与 jobs/capabilities.apply_capabilities）。
+default_on = true
+
+marker = "# dsh-control: comfy-image 由控制台铺设"
+
+# 观测（决策三）：装判 = 技能正文在位；健康判 = 带密钥的 config.env 在位
+# （与 heredoc 时代的第 66 步回读同一判据）。
+status = 'test -f "${DSH_HOME}/skills/comfy-image/SKILL.md"'
+healthcheck = 'test -f "${DSH_HOME}/skills/comfy-image/config.env"'
+
+uninstall = "reverse"
+restart_required = false                 # 技能是文件，DSH 即时发现，不占重启窗口
+
+files = ["SKILL.md", "comfy_generate.py"]
+config_template = "config.env.tmpl"      # 渲染出 COMFY_URL / COMFY_BACKUP_URL / COMFY_TOKEN / COMFY_TIMEOUT
+secret_target = { file = "config.env", mode = "0600" }
+
+[params]
+on_missing = "skipped"                   # 站点没配生图就跳过，不挡开通（capabilities.py 现行为）
+
+# 三个参数全部 secret=true 是引擎现状决定的：config_template 渲染只对
+# secret 参数做 stdin 注入与占位替换，非敏感参数不替换（capability_engine
+# _render_config_env）。地址走 stdin 无害——值本身不含引号/$，resolve 校验通过。
+# 待引擎补上非敏感 {{param}} 渲染后，url/backup_url 可改回 secret=false。
+[params.url]
+type = "string"
+required = true
+secret = true
+
+[params.backup_url]
+type = "string"
+required = false
+secret = true
+
+[params.token]
+type = "string"
+required = true
+secret = true

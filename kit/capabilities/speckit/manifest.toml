@@ -1,0 +1,46 @@
+# speckit 能力包（ADR-0001 首个能力包；vendor §5 第 3 行「铺给每个实例」）
+#
+# 十个技能各成目录：DSH 的技能发现只扫一层 `<root>/<dir>/SKILL.md`，所以
+# files 带子路径的条目按规则落 `$DSH_HOME/skills/<条目>`（见 capability_engine
+# 模块注释），聊天里 `/speckit-specify` 直接可用。正文来自 github/spec-kit
+# （MIT）经 `specify init --integration dsh` 生成，原样入库、一个字不改。
+id = "speckit"
+version = "1.0.0"
+kind = "skill"
+title = "Spec Kit 规格驱动开发（十技能包）"
+
+# 镜像闸门（决策五）：低于 0.2.0-rc.1 的镜像没有官方 dsh 集成，铺了也不认。
+compatible_dsh = ">=0.2.0-rc.1"
+
+# 「默认开」的载体（vendor §3.3 / 拍板 U-8）：站点没配开关时，站点默认
+# desired=present——新实例开通即入台账（第 66 步挂点调 provision_default_ledger）。
+# 实例级可关：uninstall 或站点 capabilities.speckit = false。
+default_on = true
+
+# 幂等与卸载的凭据（决策二）：skill 类以文件在位为判，marker 作为目录契约保留。
+marker = "# dsh-control: speckit 技能包由控制台铺设"
+
+# 观测（决策三）：只认这两行探针，判据 = 十个文件全在位（计数语义）。
+status = 'for s in analyze checklist clarify constitution converge implement plan specify tasks taskstoissues; do test -f "${DSH_HOME}/skills/speckit-$s/SKILL.md" || exit 1; done'
+healthcheck = 'test -f "${DSH_HOME}/.dshctl-capabilities/speckit/version"'
+
+uninstall = "reverse"
+# 技能是文件、DSH 有 watcher 即时发现，不占重启窗口（comfy-image 先例同值）。
+restart_required = false
+
+files = [
+  "speckit-analyze/SKILL.md",
+  "speckit-checklist/SKILL.md",
+  "speckit-clarify/SKILL.md",
+  "speckit-constitution/SKILL.md",
+  "speckit-converge/SKILL.md",
+  "speckit-implement/SKILL.md",
+  "speckit-plan/SKILL.md",
+  "speckit-specify/SKILL.md",
+  "speckit-tasks/SKILL.md",
+  "speckit-taskstoissues/SKILL.md",
+]
+
+[params]
+# 包文件永远在货里：缺了属于安装问题（failed），不是站点缺料。
+on_missing = "failed"

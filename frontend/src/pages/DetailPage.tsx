@@ -1,12 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, type DshConfig, type TokenResp } from "../api/client";
-import { fmtBytes, fmtDate, fmtFull, fmtDaysLeft, fmtRel, maskMiddle, maskUrlToken } from "../lib/format";
+import {
+  capKindZh, capabilityDot, fmtBytes, fmtDate, fmtFull, fmtDaysLeft, fmtRel,
+  maskMiddle, maskUrlToken, memoryDot,
+} from "../lib/format";
 import { useAsync } from "../lib/hooks";
-import { ConsequenceCard, CopyButton, Icon, Modal, StateChip } from "../components/ui";
+import { ConsequenceCard, CopyButton, HelpTip, Icon, Modal, StateChip, ToneChip } from "../components/ui";
 
 /** 详情页四种「有后果的动作」，同一时刻只摊开一张后果卡。 */
 type Op = "release" | "purge" | "upgrade" | "restore";
+
+// 后端 actions[] 给人话标签，这里翻成 API 动作；升级＝apply 带目录现行版本（lead 契约）。
+const CAP_ACTION_OF: Record<string, { action: "apply" | "enable" | "disable" | "uninstall"; useVersion?: boolean }> = {
+  升级: { action: "apply", useVersion: true },
+  重试: { action: "apply" },
+  启用: { action: "enable" },
+  禁用: { action: "disable" },
+  卸载: { action: "uninstall" },
+};
+
+// 记忆小块的三句解释全部进 tips（IV-8：正文零说明书）。
+const MEM_TIP_WIRE = "启用＝控制台把这台实例的记忆账户和记忆中枢地址写进容器里的 DSH 配置，"
+  + "并重启一次 DSH；停用＝把那一段拆下来。记忆数据本身永远存在记忆中枢的卷里，"
+  + "这个控制台从不删记忆。";
+const MEM_TIP_LEGACY = "legacy 手工＝P0 试运行那阵子手写的接线段：接线是有效的，"
+  + "但控制台还没接管这一段本身。点一次「启用」就交回控制台管——他的记忆一个字不动。";
+const CAP_TIP = "能力＝给这台实例装的技能/补丁/插件/服务。这里显示的是控制台记录里"
+  + "这台应有的能力：每个动作（启用、禁用、卸载、升级到新版）都排一张工单去跑，"
+  + "进度去工单页看。「没对上」＝记录说该装好、探针在容器里没对上，点重试让它再铺一遍。";
+const CAP_TIP_DRIFT = "对账＝拿「这台该有什么版本」和「容器里探针实际读到的版本」比：";
 
 export default function DetailPage() {
   const { id } = useParams();
@@ -20,6 +43,14 @@ export default function DetailPage() {
 
   const det = useAsync(() => api.instance(id!), [id]);
   const events = useAsync(() => api.events(id!), [id]);
+  // 记忆状态：路径参数是 slug（api/memory.py 的口径），所以等详情先回来才敲这一枪。
+  // 进页一次 + 手动刷新，没有轮询——这个接口要 ssh 进宿主机现测，不能auto勤敲。
+  const memSlug = det.data?.slug ?? null;
+  const mem = useAsync(async () => (memSlug ? await api.memoryStatus(memSlug) : null), [memSlug]);
+  // purge 确认卡上的记忆处置二选一：默认保留，前端填给服务端，零打字（§9）。
+  const [memDisposal, setMemDisposal] = useState<"keep" | "revoke">("keep");
+  // 能力台账：路径参数是数字 id（api/capabilities.py 的口径），进页一次 + 手动刷新。
+  const caps = useAsync(() => api.instanceCapabilities(id!), [id]);
   const [tok, setTok] = useState<TokenResp | null>(null);
   const [tokErr, setTokErr] = useState<string | null>(null);
   const [tokBusy, setTokBusy] = useState(false);
@@ -71,7 +102,7 @@ export default function DetailPage() {
   // 手动「刷新」= 用户主动要一份最新的，这一次才再 reveal 一次（§9：不自动轮询）。
   // 容器已经不在了的状态没什么可现取的，别去敲那一下。
   const refreshAll = () => {
-    void det.reload(); void events.reload();
+    void det.reload(); void events.reload(); void mem.reload(); void caps.reload();
     if (!containerGone) void fetchToken();
   };
   const d = det.data;
@@ -103,12 +134,44 @@ export default function DetailPage() {
     try { const r = await api.release(d.id, d.slug); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=release`); }
     catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); setOp(null); }
   };
-  /** 彻底释放：confirm=slug 由前端填（§4），用户不打字，防误靠按住 1.5 秒。 */
+  /** 彻底释放：confirm=slug 由前端填（§4），用户不打字，防误靠按住 1.5 秒。
+   *  记忆处置按确认卡上的选择传给工单（缺省 keep——记忆永远留在 Hub 卷里）。 */
   const doPurge = async () => {
     if (!d) return;
     setBusy(true); setOpError(null);
-    try { const r = await api.purge(d.id, d.slug); nav(`/jobs/${r.job_id}?instance=${d.id}&kind=purge`); }
+    try {
+      const r = await api.purge(d.id, d.slug, memDisposal);
+      nav(`/jobs/${r.job_id}?instance=${d.id}&kind=purge`);
+    }
     catch (e) { setOpError(e instanceof Error ? e.message : String(e)); setBusy(false); setOp(null); }
+  };
+  /** 能力一键：动作全走工单（kind=capability），进度照工单页看。
+   *  「升级」带的版本是后端算好的 want_version（目录现行）；「重试」=apply 不带版本。 */
+  const doCap = async (capId: string, wantVersion: string, label: string) => {
+    if (!d) return;
+    const spec = CAP_ACTION_OF[label];
+    if (!spec) return;
+    setBusy(true); setOpError(null);
+    try {
+      const r = await api.capabilityAction(d.id, {
+        action: spec.action, capability: capId,
+        ...(spec.useVersion && wantVersion ? { version: wantVersion } : {}),
+      });
+      nav(`/jobs/${r.job_id}?instance=${d.id}&kind=capability`);
+    } catch (e) {
+      setOpError(e instanceof Error ? e.message : String(e));
+    } finally { setBusy(false); }
+  };
+  /** 记忆启停：一次点击 = 一张 kind=memory 工单（§9 零打字；重跑=再点一次）。 */
+  const doMemory = async (action: "enable" | "disable") => {
+    if (!d || !memSlug) return;
+    setBusy(true); setOpError(null);
+    try {
+      const r = await api.memoryAction(memSlug, action);
+      nav(`/jobs/${r.job_id}?instance=${d.id}&kind=memory&op=${action}`);
+    }
+    catch (e) { setOpError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
 
   if (det.loading && !d) {
@@ -149,6 +212,11 @@ export default function DetailPage() {
   const port = d.network?.frp_remote_port ?? null;
   const dueDate = fmtDate(d.purge_after);
   const dueLeft = fmtDaysLeft(d.purge_after);
+  const m = mem.data;
+  const mDot = memoryDot(m);
+  // 工单进行中：enable/disable 都只入队一张 kind=memory 工单，pending/running 期间锁动作。
+  const memJob = m?.last_job && (m.last_job.state === "pending" || m.last_job.state === "running")
+    ? m.last_job : null;
 
   return (
     <main className="shell">
@@ -437,6 +505,21 @@ export default function DetailPage() {
                       { cap: "删除数据目录", val: <span>这台的全部用户数据，<b>含备份归档与全部历史</b>，一起删掉</span> },
                       { cap: "补删外部对象", val: <span>解析 / 隧道 / 反代站点，凡是还挂着记录的逐个补删干净</span> },
                       { cap: "保留的东西", val: <span>只有台账这一条：它的工单与事件照常可看</span> },
+                      {
+                        cap: "记忆处置",
+                        val: (
+                          <span className="actions" role="radiogroup" aria-label="记忆处置">
+                            <button type="button" role="radio" aria-checked={memDisposal === "keep"}
+                              className={`btn btn-sm${memDisposal === "keep" ? " on" : ""}`}
+                              disabled={busy} onClick={() => setMemDisposal("keep")}>保留记忆（默认）</button>
+                            <button type="button" role="radio" aria-checked={memDisposal === "revoke"}
+                              className={`btn btn-sm${memDisposal === "revoke" ? " on" : ""}`}
+                              disabled={busy} onClick={() => setMemDisposal("revoke")}>停用业务用户</button>
+                            <HelpTip label="记忆处置怎么选"
+                              text="记忆数据永远存在记忆中枢的卷里，这里两个选项都不删它：「保留」连业务用户带 key 原样留着，将来新建同名实例启用即接回；「停用业务用户」只吊销这台的凭据——它不再能读写记忆，历史仍留在原处。" />
+                          </span>
+                        ),
+                      },
                     ]}
                     due={<><b>不可恢复。</b>要再用只能新建一台，数据不会回来。</>}
                     hold confirmLabel="按住签字彻底释放" holdAriaLabel="按住 1.5 秒确认彻底释放"
@@ -478,6 +561,153 @@ export default function DetailPage() {
                   />
                 )}
               </>)}
+            </div>
+          </section>
+
+          {/* —— 记忆小块：一个状态点 + 启用/停用 + 工单进行中；
+              注入原理、legacy、purge 语义全部进 HelpTip（IV-8，正文零说明书）。 —— */}
+          <section className="card" aria-label="记忆">
+            <div className="card-head"><h2>记忆</h2>
+              <ToneChip tone={mDot.tone}><Icon name={mDot.glyph} size={10} />{mDot.zh}</ToneChip>
+              <span className="spacer" />
+              <button type="button" className="btn btn-icon" aria-label="重测记忆状态"
+                onClick={() => void mem.reload()} disabled={mem.loading}
+                title="现测一次：宿主机接线事实 + 记忆栈探活">
+                <Icon name="refresh" size={14} />
+              </button>
+              <HelpTip label="接记忆是怎么回事" text={MEM_TIP_WIRE} />
+              {m?.legacy_p0 === true && <HelpTip label="legacy 手工是什么" text={MEM_TIP_LEGACY} />}
+            </div>
+            <div className="card-body">
+              {mem.loading && !m ? (
+                <div className="skeleton sk-line" style={{ height: 44 }} />
+              ) : mem.error && !m ? (
+                <p className="mut small" role="status">记忆状态拉不起来：{mem.error}</p>
+              ) : (<>
+                {m && !m.enabled && (
+                  <p className="mut small">站点没配记忆栈：{m.missing || "没配这一套，实例谈不上接。"}</p>
+                )}
+                {m?.hub && m.hub.core_ok === false && (
+                  <div className="alert alert-warn" style={{ margin: "0 0 8px" }}>
+                    <Icon name="triangle" /><span>记忆栈故障：{m.hub.error ?? "core 没响应"}——等栈恢复后重试这里的动作。</span>
+                  </div>
+                )}
+                {m?.user && (
+                  <div className="secret-row">
+                    <span className="cap">记忆账户</span>
+                    <span className="val mono">
+                      {m.user.user_id}
+                      {m.user.key_masked ? <span className="mut"> · {m.user.key_masked}</span> : null}
+                      {m.user.key_status === "invalid"
+                        ? <span className="chip tone-warn chip-sm" style={{ marginLeft: 8 }}>key 已失效</span>
+                        : null}
+                    </span>
+                    <span className="ops">
+                      <HelpTip label="这一行是什么"
+                        text="每台实例在记忆中枢有一枚自己的业务 key（屏上只露前 12 位）。显示 key 已失效时：去「记忆」页回收这台的业务用户，再回来点启用，系统会重新发一枚。" />
+                    </span>
+                  </div>
+                )}
+                {memJob ? (
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <ToneChip tone="live"><Icon name="half" size={10} />记忆任务进行中</ToneChip>
+                    <button type="button" className="btn"
+                      onClick={() => nav(`/jobs/${memJob.id}?instance=${d.id}&kind=memory`)}>看工单</button>
+                  </div>
+                ) : d.state === "running" ? (
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button type="button" className="btn btn-lg"
+                      disabled={busy || (m?.wired === true && m?.legacy_p0 !== true)}
+                      onClick={() => void doMemory("enable")}>
+                      <Icon name="plus" />{m?.legacy_p0 === true ? "接管启用" : "启用记忆"}
+                    </button>
+                    <button type="button" className="btn btn-lg"
+                      disabled={busy || m?.wired !== true}
+                      onClick={() => void doMemory("disable")}>
+                      <Icon name="power" />停用记忆
+                    </button>
+                  </div>
+                ) : (released || purged) ? (
+                  <p className="mut small">
+                    {purged
+                      ? "已彻底释放：记忆按释放时的处置处理（默认保留），数据一直留在 Hub 卷里。"
+                      : "已释放的实例不读写记忆；记忆原样留在 Hub，恢复这台之后再启用就接上。"}
+                  </p>
+                ) : (
+                  <p className="mut small">当前状态不能动记忆，等实例进入运行中再来。</p>
+                )}
+              </>)}
+            </div>
+          </section>
+
+          {/* —— 能力小块：与记忆小块同款结构（状态点 + 动作 + 解释进 tips）。 —— */}
+          <section className="card" aria-label="能力">
+            <div className="card-head"><h2>能力</h2>
+              <span className="mut small">{(caps.data ?? []).length} 项</span>
+              <span className="spacer" />
+              <button type="button" className="btn btn-icon" aria-label="重读能力台账"
+                onClick={() => void caps.reload()} disabled={caps.loading}
+                title="从台账重读这台应有的能力与探针结论">
+                <Icon name="refresh" size={14} />
+              </button>
+              <HelpTip label="能力是什么" text={CAP_TIP} />
+            </div>
+            <div className="card-body">
+              {caps.loading && !caps.data ? (
+                <div className="skeleton sk-line" style={{ height: 44 }} />
+              ) : caps.error && !caps.data ? (
+                <p className="mut small" role="status">能力台账拉不起来：{caps.error}</p>
+              ) : (caps.data ?? []).length === 0 ? (
+                <p className="mut small">这台还没登记任何能力。<a href="/capabilities">去能力目录看有什么可装。</a></p>
+              ) : (
+                <ul className="cap-list">
+                  {(caps.data ?? []).map((c) => {
+                    const dot = capabilityDot(c);
+                    return (
+                      <li key={c.capability_id}>
+                        <div className="cap-row">
+                          <ToneChip tone={dot.tone}><Icon name={dot.glyph} size={10} />{dot.zh}</ToneChip>
+                          <span className="cap-name">
+                            {c.title}
+                            <span className="mut small"> · {capKindZh(c.kind)}</span>
+                          </span>
+                          <span className="mut small mono">
+                            {c.installed
+                              ? <span title={c.observed_at ? `探针读到于 ${c.observed_at}` : undefined}>
+                                  {c.observed_version || "版本未知"}</span>
+                              : <span title={`期望 ${c.want_version || "—"}，装好后由探针对账`}>未装</span>}
+                          </span>
+                          <span className="spacer" />
+                          <span className="actions">
+                            {c.actions.map((label) => (
+                              <button key={label} type="button"
+                                className={`btn btn-sm${label === "卸载" ? " btn-danger" : ""}`}
+                                disabled={busy || containerGone
+                                  || (c.desired_state === "absent" && label !== "重试")}
+                                title={containerGone ? "容器不在，动作要等实例回来才跑得动" : undefined}
+                                onClick={() => void doCap(c.capability_id, c.want_version, label)}>
+                                {label}
+                              </button>
+                            ))}
+                          </span>
+                        </div>
+                        {c.health !== "ok" && c.health_detail && (
+                          <div className="mut small cap-detail">{c.health_detail}</div>
+                        )}
+                        {(c.drift || c.unknown_version) && (
+                          <div className="mut small cap-detail">
+                            <HelpTip label="为什么算没对上" text={CAP_TIP_DRIFT} />
+                            {" "}
+                            {c.drift
+                              ? <>期望 <b className="mono">{c.want_version || "已装"}</b>，实际 <b className="mono">{c.observed_version || "没读到"}</b>。</>
+                              : <>探针读到了，但版本号对不上目录里的任何一条。</>}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
           </section>
 

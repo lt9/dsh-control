@@ -31,9 +31,33 @@ class ReleaseRequest(BaseModel):
 
 
 class PurgeRequest(BaseModel):
-    """§4 POST /instances/{id}/purge：confirm 由前端填（长按确认），逐字等于 slug。"""
+    """§4 POST /instances/{id}/purge：confirm 由前端填（长按确认），逐字等于 slug。
+
+    memory_disposal（P1 记忆处置，可选）："keep"（默认，缺省即它）或 "revoke"
+    （停用业务用户＝回收 key；记忆数据两种选择下都留在 Hub 卷里，本控制台从不删）。
+    把它传进 purge 工单 params 的接线在 routes.py（lead），这里只是入参形状。
+    """
 
     confirm: str = ""
+    memory_disposal: str | None = None
+
+
+class MemoryActionRequest(BaseModel):
+    """POST /instances/{slug}/memory：action 只认 "enable" / "disable"。
+
+    取值校验在路由里做（要走 §4.1 的 invalid_action 机器码，不用 FastAPI 原生 422）。
+    """
+
+    action: str = ""
+
+
+class MemberActionRequest(BaseModel):
+    """POST /memory/members/{user_id}/action：action 只认 "disable" / "reclaim"。
+
+    校验同样在路由里走 invalid_action 机器码。
+    """
+
+    action: str = ""
 
 
 class DeployRequest(BaseModel):

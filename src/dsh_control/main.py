@@ -25,7 +25,8 @@ from .api.routes import dl_router, public_router, router
 from .db import repo
 from .db.models import Credential, DeployJob, utcnow
 from .db.session import Db, make_db
-from .jobs.deploy import run_deploy
+from .jobs.capabilities import CAPABILITY_FLOWS
+from .jobs.deploy import run_deploy, run_memory
 from .jobs.publish import run_publish
 from .jobs.purge import run_purge
 from .jobs.release import run_release
@@ -106,7 +107,8 @@ def create_app(db: Db | None = None, providers: Any | None = None,
             st.runner = JobRunner(st.db, st.providers, st.settings)
             st.runner.register_flows({"deploy": run_deploy, "restart": run_restart,
                                       "release": run_release, "purge": run_purge,
-                                      "publish": run_publish})
+                                      "publish": run_publish, "memory": run_memory,
+                                      **CAPABILITY_FLOWS})
         interrupted = await fail_interrupted_jobs(st.db)
         if interrupted:
             log.warning("中断了 %s 个遗留任务", interrupted)
@@ -137,8 +139,19 @@ def create_app(db: Db | None = None, providers: Any | None = None,
     runner = JobRunner(app.state.db, providers or _LazyProviders(app), settings)
     runner.register_flows({"deploy": run_deploy, "restart": run_restart,
                            "release": run_release, "purge": run_purge,
-                           "publish": run_publish})
+                           "publish": run_publish, "memory": run_memory,
+                           **CAPABILITY_FLOWS})
     app.state.runner = runner
+
+    # 安全响应头（MEMORY-PANEL-EMBED.md ③-D）：frame-ancestors 护住主控台
+    # 与后续经同源反代嵌入的记忆面板；nosniff/referrer 顺手补齐。
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'self'")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        return response
 
     # /dl 是公开前缀（§6.1.5：token 即门票），单独 router，不挂会话依赖；
     # 必须注册在 SPA 兜底路由之前，否则会被前端 catch-all 吃掉。
@@ -146,6 +159,20 @@ def create_app(db: Db | None = None, providers: Any | None = None,
     app.include_router(public_router, prefix="/api")
     app.include_router(router, prefix="/api",
                        dependencies=[Depends(_require_session)])
+    # 记忆中枢状态/启停（§vendor P1；memory_hub 适配器的界面入口）
+    from .api.memory import router as memory_router
+    app.include_router(memory_router, prefix="/api",
+                       dependencies=[Depends(_require_session)])
+    # 能力目录与实例能力（ADR-0001；路由自带会话+XRW 双闸，这里只再过总会话）
+    from .api.capabilities import router as cap_router
+    app.include_router(cap_router, prefix="/api",
+                       dependencies=[Depends(_require_session)])
+    # Panel 同源反代壳（MEMORY-PANEL-EMBED ③-B：/panel 静态 + /api/v1 转发）。
+    # 必须早于 /assets 挂载与 SPA 兜底：/assets 由它做「控制台优先、Panel 兜底」
+    # 的唯一仲裁（Panel 的 index 用根绝对 /assets，晚挂则它的资源全 404）。
+    # 会话闸在路由自己身上（/panel 与 /api/v1 闸、/assets 公开）——这里不再叠。
+    from .api.memory_proxy import router as memory_proxy_router
+    app.include_router(memory_proxy_router)
 
     sdir = static_dir if static_dir is not None else _default_static_dir()
     if sdir.is_dir():

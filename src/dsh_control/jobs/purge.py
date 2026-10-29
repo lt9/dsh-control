@@ -6,15 +6,17 @@
 | seq | key               | 做什么                                                     |
 |-----|-------------------|------------------------------------------------------------|
 |  10 | confirm_guard     | 手动核确认词==slug；自动核 source=auto 且保留期确实已过     |
+|  15 | memory_disposal   | 记忆处置（params.memory_disposal，默认 keep）：keep=中枢一字不动并留痕；revoke=回收业务用户全部 active key（停用＝回收，U-7）。**都不删 Hub 卷里的记忆数据**；中枢不可达时 revoke 标 skipped 留人工回收（终态化不卡死） |
 |  20 | external_cleanup  | 库里还挂着的 dns/frp/ng id 逐个补删，404/查无视为已删       |
 |  30 | container_remove  | docker rm 容器（还活着先 stop）；镜像不动                   |
 |  40 | data_delete       | 删数据目录：路径过护栏才 rm -rf，不满足宁可不删直接失败     |
 |  50 | mark_purged       | state=purged、purged_at=now、清外部 id、记 instance_purged   |
 
-params：{"source": "manual", "confirm": "<slug>"} 或 {"source": "auto",
-"purge_after_days": <watcher 现读值>}。手动确认词在 routes 层已逐字核过
-（422 confirm_mismatch）；这里再核一遍 params——工单表里躺着的参数才是
-执行时的事实，别信"入队时是对的"。
+params：{"source": "manual", "confirm": "<slug>", "memory_disposal": "keep|revoke"}
+或 {"source": "auto", "purge_after_days": <watcher 现读值>}。memory_disposal 缺省
+= keep：不带这个参数的老工单与引入本功能之前的行为逐字节一致。手动确认词在
+routes 层已逐字核过（422 confirm_mismatch）；这里再核一遍 params——工单表里
+躺着的参数才是执行时的事实，别信"入队时是对的"。
 
 数据目录是用户数据，护栏（§6.4 宁可不删，绝不删错）逐条硬核对，任何一条
 不满足直接 StepFailed：非空、绝对路径、normpath 后严格位于 hosts.data_root
@@ -31,6 +33,8 @@ from typing import Any
 from ..db import repo
 from ..db.models import utcnow
 from ..domain.slug import derive
+from ..integrations import memory_hub as memhub
+from ..integrations.base import IntegrationError
 from .release import (
     EXTERNAL_ID_FIELDS,
     _manual,
@@ -134,6 +138,64 @@ async def run_purge(ctx: JobCtx) -> None:
         else:
             raise StepFailed('purge 工单 params 缺少合法的 source（"auto"/"manual"），拒绝')
         await ctx.s.commit()
+
+    # ---- 15 memory_disposal：记忆处置（U-7 口径：默认保留，可选停用业务用户）
+    # 无论选哪个，记忆数据本身都永远留在 Hub 的卷里——本步骤最多回收 key，
+    # 从不删数据。purge 删的是容器与数据目录，Hub 侧的用户/key 是另一张账。
+    async with ctx.step(15, "memory_disposal", "记忆处置") as st:
+        disposal = str(params.get("memory_disposal") or "keep").strip()
+        if disposal not in ("keep", "revoke"):
+            raise StepFailed(f"purge 工单 params.memory_disposal={disposal!r}，"
+                             '只认 "keep"（保留记忆，默认）/"revoke"（停用业务用户）')
+        if disposal == "keep":
+            st.state = "skipped"
+            st.detail = ("保留记忆（默认）：不动记忆中枢——用户与 key 原样留在 Hub，"
+                         "记忆数据本来就在 Hub 卷里，本控制台从不删；"
+                         "以后同名重建实例还能接上这段记忆")
+            await ctx.event("purge_memory_kept",
+                            f"实例 {slug} 彻底释放：按默认策略保留记忆"
+                            "（中枢侧一字未动，记忆数据在 Hub 卷里）",
+                            {"slug": slug, "disposal": "keep"})
+            await ctx.s.commit()
+        else:
+            hub, missing = await memhub.build_memory_hub(
+                ctx.s, ctx.settings,
+                recorder=getattr(ctx.providers, "recorder", None))
+            uid = memhub.user_id_for(slug)
+            if hub is None or getattr(hub, "manual_required", False):
+                # 中枢不可达不该把终态化卡死：说破「没停用成」，留人工回收的口子
+                st.state = "skipped"
+                st.detail = (f"要停用业务用户 {uid}，但记忆中枢不可达"
+                             f"（{missing or getattr(hub, 'reason', '')}）："
+                             f"本次没停用成，用户与 key 原样留在 Hub——"
+                             f"要回收请到 Hub 侧人工处理 {uid}")
+                await ctx.event("purge_memory_revoke_manual",
+                                f"实例 {slug} 彻底释放：要求停用业务用户，但中枢不可达，"
+                                f"需人工回收 {uid}",
+                                {"slug": slug, "user_id": uid, "reason": missing})
+                await ctx.s.commit()
+            else:
+                try:
+                    rv = await hub.revoke_user_keys(uid)
+                except IntegrationError as exc:
+                    raise StepFailed(f"停用业务用户 {uid} 失败：{exc}"
+                                     "（purge 工单可重跑，已回收的 key 不会重复回收）"
+                                     ) from exc
+                if rv["failed"]:
+                    raise StepFailed(
+                        f"停用业务用户 {uid} 不完整："
+                        + "；".join(f"{f['key_id']}: {f['why']}" for f in rv["failed"])
+                        + "（purge 未继续，工单可重跑；last_key_cannot_revoke 是 core"
+                          "「至少留一把 key」的保护，需去 Hub 人工处理该用户）")
+                st.detail = (f"业务用户 {uid} 已停用：回收 {len(rv['revoked'])} 把 "
+                             "active key；记忆数据留在 Hub 卷里，没有删除")
+                await ctx.event("purge_memory_revoked",
+                                f"实例 {slug} 彻底释放：业务用户 {uid} 已停用"
+                                f"（回收 {len(rv['revoked'])} 把 key），记忆保留在 Hub 卷",
+                                {"slug": slug, "user_id": uid,
+                                 "revoked": rv["revoked"], "disposal": "revoke"})
+                await ctx.s.commit()
+
 
     # ---- 20 external_cleanup：库里残留的 id 逐个补删（404/查无视为已删）
     async with ctx.step(20, "external_cleanup", "补删残留外部对象") as st:

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview --port 13302",
-    "mock": "node mock/server.mjs"
+    "mock": "node mock/server.mjs",
+    "test": "node --experimental-strip-types tests/frontend.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
