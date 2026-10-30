@@ -177,7 +177,9 @@ def _home_patch_lay(f: str, base_url: str, model_id: str, display_name: str) -> 
         "  config:",
         f"    apiKeyEnv: {REFS_KEY_NAME}",
         f"    baseURL: {base_url}",
-        "    reasoningEffort: xhigh",
+        # 0.2.1-rc.5 起 llm-deepseek 的枚举收紧为 off|low|high|max，
+        # rc.2 时代的 xhigh 会被 ValidationError 整条拒激活（2026-10-30 现网实见）。
+        "    reasoningEffort: max",
         "    models:",
         f"      - id: {model_id}",
         f"        name: {display_name}",
@@ -188,7 +190,7 @@ def _home_patch_lay(f: str, base_url: str, model_id: str, display_name: str) -> 
         "  config:",
         "    provider: deepseek-official",
         f"    model: {model_id}",
-        "    reasoningEffort: xhigh",
+        "    reasoningEffort: max",
         MEMORY_MARKER_END,
     ])
     return [
