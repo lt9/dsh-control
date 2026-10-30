@@ -137,10 +137,15 @@ async def seed_into(db: Db, site: dict[str, Any]) -> tuple[int, int]:
         site_secret: dict[str, Any] = dict(site.get("site") or {})
         if site.get("providers"):
             site_secret["providers"] = dict(site["providers"])
+        # [memory] 独立段也要进 site 镜像：apply_site_overrides 认 secret["memory"]，
+        # 只镜像 [site]+[providers] 的话，用 [memory] 正写的站点一重灌就丢记忆配置
+        # （2026-10-30 现网踩过）。flat 写法（[site].memory_*）不受影响。
+        if site.get("memory"):
+            site_secret["memory"] = dict(site["memory"])
         if site_secret:
             await repo.upsert_credential(
                 s, kind="site", name="site", secret=site_secret,
-                note="站点描述文件 [site]+[providers] 段的落库镜像",
+                note="站点描述文件 [site]+[memory]+[providers] 段的落库镜像",
             )
         n_cred = 0
         for entry in site.get("credentials") or []:
