@@ -454,6 +454,9 @@ class MemoryHub:
         # 业务用户的 Agent（资产按 Agent 隔离的载体），控制台新开通漏建了——
         # dsh-07 接线成功却在 Agents 管理里缺席。建用户顺手续 Agent，幂等。
         agent = "skipped"
+        task = "skipped"
+        default = "skipped"
+        agent_id = ""
         if team_id and not self.dry_run:
             try:
                 lst = await self._meta("/agent/list", {"team_id": team_id,
@@ -462,19 +465,54 @@ class MemoryHub:
                         if str(it.get("owner_user_id") or "") == uid]
                 if mine:
                     agent = "exists"
+                    agent_id = str(mine[0].get("agent_id") or "")
                 else:
-                    await self._meta("/agent/create", {
+                    made = await self._meta("/agent/create", {
                         "team_id": team_id, "owner_user_id": uid,
                         "name": agent_name or f"{uid}（dsh-control）",
                         "description": "dsh-control 自动接线",
                         "visibility": "team"},
                         write=True, action="agent/create")
                     agent = "created"
+                    agent_id = str(made.get("agent_id") or "")
             except IntegrationError as exc:
                 # 与拉群同口径：Agent 没建成不毁接线，事实里说破
                 agent = f"failed: {exc.detail or exc.code}"
+        # 默认 task + 账户默认绑定（2026-10-30 现网实证的断点）：
+        # 代理 session-init 对无表单客户端（dsh 适配器）按
+        # header 身份 → user-session-default 兜底解析 team/agent/task；
+        # 三者缺一，首轮就永久写死 bypassed=true 绑定（L2a 缓存跟着毒），
+        # 注入与 L0 喂料全被跳过——记忆看似开着，实为空转。必须在
+        # 该用户第一次聊天前配齐。task 用 list 幂等查重。
+        if team_id and agent_id and not self.dry_run:
+            task_id = ""
+            try:
+                tl = await self._meta("/task/list", {"team_id": team_id,
+                                                     "page": 1, "page_size": 100})
+                tids = [str(it.get("task_id") or "") for it in (tl.get("items") or [])
+                        if str(it.get("creator_user_id") or "") == uid
+                        and str(it.get("title") or "") == "日常对话"]
+                if tids:
+                    task = "exists"
+                    task_id = tids[0]
+                else:
+                    made = await self._meta("/task/create", {
+                        "team_id": team_id, "creator_user_id": uid,
+                        "title": "日常对话",
+                        "description": "dsh-control 默认任务（单一路径）"},
+                        write=True, action="task/create")
+                    task = "created"
+                    task_id = str(made.get("task_id") or "")
+                if task_id:
+                    await self._meta("/user-session-default/set",
+                                     {"user_id": uid, "team_id": team_id,
+                                      "agent_id": agent_id, "task_id": task_id},
+                                     write=True, action="user-session-default/set")
+                    default = "set"
+            except IntegrationError as exc:
+                task = default = f"failed: {exc.detail or exc.code}"
         return {"user_id": uid, "user_key": user_key, "created": created,
-                "team": team, "agent": agent}
+                "team": team, "agent": agent, "task": task, "default": default}
 
     async def verify_key(self, user_key: str) -> dict[str, Any]:
         """auth/verify：判据是 data.valid，非法 key 也回 200/code=0（不能按 401 分支）。"""

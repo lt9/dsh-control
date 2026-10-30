@@ -61,7 +61,8 @@ async def test_新建用户一步拿到默认_key():
     hub = mk_hub(handler)
     out = await hub.ensure_instance_user("dsh-07")
     assert out == {"user_id": "dshctl-dsh-07", "user_key": "sk-mem-newuserkey123",
-                   "created": True, "team": "skipped", "agent": "skipped"}
+                   "created": True, "team": "skipped", "agent": "skipped",
+                   "task": "skipped", "default": "skipped"}
 
 
 async def test_同名用户先查后建_不靠错误形状认已存在():
@@ -138,6 +139,46 @@ async def test_成员已存在算成功():
     hub = mk_hub(handler)
     out = await hub.ensure_instance_user("dsh-07", team_id="team-fam")
     assert out["team"] == "already"
+
+
+async def test_接线补齐_task_与账户默认否则记忆空转():
+    """2026-10-30 现网根因：无表单客户端（dsh 适配器）的 session-init 靠
+    user-session-default 兜底绑 team/agent/task；缺一个，首轮永久写死
+    bypassed 绑定，注入与 L0 喂料全跳过。接线必须一次配齐。"""
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        seen.append(path)
+        body = json.loads(req.content)
+        if path == "/v3/meta/user/get":
+            return env({"user_id": "dshctl-dsh-07"})
+        if path == "/v3/meta/user-key/create":
+            return env({"key_value": "sk-mem-k9k9k9k9k9"})
+        if path == "/v3/meta/team-member/add":
+            return env({})
+        if path == "/v3/meta/agent/list":
+            return env({"items": [{"agent_id": "agt-a1",
+                                   "owner_user_id": "dshctl-dsh-07"}]})
+        if path == "/v3/meta/task/list":
+            return env({"items": []})
+        if path == "/v3/meta/task/create":
+            assert body == {"team_id": "team-fam",
+                            "creator_user_id": "dshctl-dsh-07",
+                            "title": "日常对话",
+                            "description": "dsh-control 默认任务（单一路径）"}
+            return env({"task_id": "task-t1"})
+        if path == "/v3/meta/user-session-default/set":
+            assert body == {"user_id": "dshctl-dsh-07", "team_id": "team-fam",
+                            "agent_id": "agt-a1", "task_id": "task-t1"}
+            return env({"user_id": "dshctl-dsh-07"})
+        raise AssertionError(f"不该请求 {path}")
+
+    hub = mk_hub(handler)
+    out = await hub.ensure_instance_user("dsh-07", team_id="team-fam")
+    assert out["agent"] == "exists" and out["task"] == "created"
+    assert out["default"] == "set"
+    assert "/v3/meta/user-session-default/set" in seen
 
 
 # ------------------------------------------------------------------ verify / 回收
