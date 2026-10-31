@@ -81,22 +81,36 @@ def main():
     print("LastUsed:", json.dumps(r, ensure_ascii=False)[:400])
 
     now = dt.datetime.now(dt.UTC)
-    r = call("actiontrail.cn-hangzhou.aliyuncs.com", "2020-07-06", "LookupEvents",
-             {"StartTime": (now - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "EndTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "MaxResults": "50"}, ak, sk)
-    if "_http_error" in r:
-        print("ActionTrail 报错:", r)
-        return 1
-    evs = r.get("Events") or []
-    if isinstance(evs, str):
-        evs = json.loads(evs)
+    # Access Analyzer 轮询能把 24h 撑到 200+ 条——单页 50 会漏掉白天大半窗口
+    # （2026-10-31 现测），必须翻到 NextToken 穷尽。
+    evs, tok, pages = [], None, 0
+    while pages < 20:
+        extra = {"StartTime": (now - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "EndTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "MaxResults": "50"}
+        if tok:
+            extra["NextToken"] = tok
+        r = call("actiontrail.cn-hangzhou.aliyuncs.com", "2020-07-06", "LookupEvents",
+                 extra, ak, sk)
+        if "_http_error" in r:
+            print("ActionTrail 报错:", r)
+            return 1
+        page = r.get("Events") or []
+        if isinstance(page, str):
+            page = json.loads(page)
+        evs.extend(page)
+        tok = r.get("NextToken")
+        pages += 1
+        if not tok:
+            break
+    if tok:
+        print("!! 20 页没翻完，窗口后段未覆盖")
     rows = []
     for ev in evs:
         e = json.loads(ev) if isinstance(ev, str) else ev
         rows.append((e.get("eventName"), e.get("sourceIpAddress"),
                      (e.get("errorCode") or ""), e.get("eventTime")))
-    print(f"过去 24h 共 {len(rows)} 条事件：")
+    print(f"过去 24h 共 {len(rows)} 条事件（{pages} 页翻尽）：")
     unknown = []
     for name, ip, code, t in sorted(rows, key=lambda x: x[3] or ""):
         ip_base = ip or ""
