@@ -186,6 +186,12 @@ def _home_patch_lay(f: str, base_url: str, model_id: str, display_name: str) -> 
         # 窗口/上限/推理档与 kit 现值对齐（P0 接线当日实测值）
         "        contextWindow: 262144",
         "        maxTokens: 32768",
+        # 不声明 input 时 rc.5 按纯文本模型处理，输入框直接拦图
+        # （"当前模型不支持图片"，2026-10-31 现网实见）；radiance 视觉可用，
+        # 经记忆代理透传实测通过。
+        "        input:",
+        "          - text",
+        "          - image",
         "- id: agent-default-model",
         "  config:",
         "    provider: deepseek-official",
