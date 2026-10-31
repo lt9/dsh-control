@@ -32,3 +32,6 @@
 - 控制台代码热更目标 = 容器 `dsh-control`（本机），两处都要 cp：
   `/usr/local/lib/python3.12/site-packages/dsh_control/...` 与 `/app/src/dsh_control/...`。
   别碰 tierai-prod-* 容器（同机跑的另一个产品）。
+- llm provider 模型能力字段名是 `inputModalities`（deepseek 共享库 zod），写
+  `input:` 会被 zod 当未知键静默剥掉并按 text 处理——配置 dump 里看着在、运行时
+  已丢（2026-10-31 连踩两坑）。判"修好"的唯一标准：消息真的从 UI 发出去并拿到回答。
